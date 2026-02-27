@@ -1,6 +1,8 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::{Entity, EntityAllocator};
+use crate::query::fetch::WorldQuery;
+use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
 
@@ -140,6 +142,20 @@ impl World {
             let ptr = archetype.columns[col_idx].get_ptr(location.row) as *mut T;
             Some(&mut *ptr)
         }
+    }
+
+    pub fn query<Q: WorldQuery>(&self) -> QueryIter<'_, Q> {
+        let required = Q::required_ids(&self.components);
+        let fetches: Vec<_> = self.archetypes.archetypes.iter()
+            .filter(|arch| {
+                !arch.is_empty() && required.is_subset(&arch.component_ids)
+            })
+            .map(|arch| {
+                let fetch = Q::init_fetch(arch, &self.components);
+                (fetch, arch.len())
+            })
+            .collect();
+        QueryIter::new(fetches)
     }
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
