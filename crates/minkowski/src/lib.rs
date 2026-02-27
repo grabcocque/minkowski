@@ -2,6 +2,10 @@
 // Proper fix is to make the public API facade consistent; suppress for now.
 #![allow(private_interfaces)]
 
+// Allow the derive macro's generated code (which references `::minkowski::*`)
+// to resolve when used inside this crate's own tests.
+extern crate self as minkowski;
+
 pub mod bundle;
 pub mod command;
 pub mod component;
