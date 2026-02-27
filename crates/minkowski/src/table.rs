@@ -526,4 +526,72 @@ mod tests {
             Some(&Pos { x: 101.0, y: 2.0 })
         );
     }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn typed_query_table_empty() {
+        let mut world = crate::world::World::new();
+        assert_eq!(world.query_table::<Transform>().count(), 0);
+        assert_eq!(world.query_table_mut::<Transform>().count(), 0);
+    }
+
+    #[test]
+    fn multiple_table_types_coexist() {
+        #[derive(Clone, Copy, Debug, PartialEq, minkowski_derive::Table)]
+        struct JustPos {
+            pos: Pos,
+        }
+
+        let mut world = crate::world::World::new();
+        world.spawn(Transform {
+            pos: Pos { x: 1.0, y: 0.0 },
+            vel: Vel { dx: 0.0, dy: 0.0 },
+        });
+        world.spawn(JustPos {
+            pos: Pos { x: 2.0, y: 0.0 },
+        });
+
+        // Each table query only sees its own archetype
+        assert_eq!(world.query_table::<Transform>().count(), 1);
+        assert_eq!(world.query_table::<JustPos>().count(), 1);
+
+        // Dynamic query sees both (both have Pos)
+        assert_eq!(world.query::<&Pos>().count(), 2);
+    }
+
+    #[test]
+    fn query_table_many_rows() {
+        let mut world = crate::world::World::new();
+        for i in 0..1000 {
+            world.spawn(Transform {
+                pos: Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                vel: Vel { dx: 1.0, dy: 0.0 },
+            });
+        }
+
+        let sum: f32 = world
+            .query_table::<Transform>()
+            .map(|row| row.pos.x)
+            .sum();
+        // Sum of 0..1000 = 999*1000/2 = 499500
+        assert_eq!(sum, 499500.0);
+    }
+
+    #[test]
+    fn query_table_size_hint() {
+        let mut world = crate::world::World::new();
+        for _ in 0..5 {
+            world.spawn(Transform {
+                pos: Pos { x: 0.0, y: 0.0 },
+                vel: Vel { dx: 0.0, dy: 0.0 },
+            });
+        }
+
+        let iter = world.query_table::<Transform>();
+        assert_eq!(iter.size_hint(), (5, Some(5)));
+    }
 }
