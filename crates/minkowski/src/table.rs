@@ -26,6 +26,11 @@ pub struct TableDescriptor {
 pub unsafe trait Table: Bundle + Sized {
     const FIELD_COUNT: usize;
 
+    /// The immutable row reference type (e.g. `TransformRef<'w>`).
+    type Ref<'w>: TableRow<'w>;
+    /// The mutable row reference type (e.g. `TransformMut<'w>`).
+    type Mut<'w>: TableRow<'w>;
+
     /// Register all field components. Returns ComponentIds in field declaration order.
     fn register(registry: &mut ComponentRegistry) -> Vec<ComponentId>;
 }
@@ -148,6 +153,47 @@ impl<'w> Iterator for TableIter<'w> {
     }
 }
 
+/// Typed iterator over rows of a table, yielding `R: TableRow` per row.
+pub struct TableTypedIter<'w, R: TableRow<'w>> {
+    col_ptrs: Vec<(*mut u8, usize)>,
+    len: usize,
+    current_row: usize,
+    _marker: std::marker::PhantomData<&'w R>,
+}
+
+// Safety: column pointers come from BlobVec which stores Send+Sync component data.
+unsafe impl<'w, R: TableRow<'w>> Send for TableTypedIter<'w, R> {}
+unsafe impl<'w, R: TableRow<'w>> Sync for TableTypedIter<'w, R> {}
+
+impl<'w, R: TableRow<'w>> TableTypedIter<'w, R> {
+    pub(crate) fn new(col_ptrs: Vec<(*mut u8, usize)>, len: usize) -> Self {
+        Self {
+            col_ptrs,
+            len,
+            current_row: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'w, R: TableRow<'w>> Iterator for TableTypedIter<'w, R> {
+    type Item = R;
+
+    fn next(&mut self) -> Option<R> {
+        if self.current_row >= self.len {
+            return None;
+        }
+        let row = self.current_row;
+        self.current_row += 1;
+        Some(unsafe { R::from_row(&self.col_ptrs, row) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.current_row;
+        (remaining, Some(remaining))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,8 +246,37 @@ mod tests {
         }
     }
 
+    // Manual Ref/Mut types for PosVel (mirroring what derive generates)
+    struct PosVelRef<'w> {
+        pos: &'w Pos,
+        vel: &'w Vel,
+    }
+    struct PosVelMut<'w> {
+        pos: &'w mut Pos,
+        #[allow(dead_code)]
+        vel: &'w mut Vel,
+    }
+    unsafe impl<'w> TableRow<'w> for PosVelRef<'w> {
+        unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
+            Self {
+                pos: &*(col_ptrs[0].0.add(row * col_ptrs[0].1) as *const Pos),
+                vel: &*(col_ptrs[1].0.add(row * col_ptrs[1].1) as *const Vel),
+            }
+        }
+    }
+    unsafe impl<'w> TableRow<'w> for PosVelMut<'w> {
+        unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
+            Self {
+                pos: &mut *(col_ptrs[0].0.add(row * col_ptrs[0].1) as *mut Pos),
+                vel: &mut *(col_ptrs[1].0.add(row * col_ptrs[1].1) as *mut Vel),
+            }
+        }
+    }
+
     unsafe impl Table for PosVel {
         const FIELD_COUNT: usize = 2;
+        type Ref<'w> = PosVelRef<'w>;
+        type Mut<'w> = PosVelMut<'w>;
 
         fn register(registry: &mut ComponentRegistry) -> Vec<ComponentId> {
             vec![registry.register::<Pos>(), registry.register::<Vel>()]
@@ -247,7 +322,7 @@ mod tests {
         });
 
         let rows: Vec<(Pos, Vel)> = world
-            .query_table::<PosVel>()
+            .query_table_raw::<PosVel>()
             .map(|ptrs| unsafe {
                 (
                     std::ptr::read(ptrs[0] as *const Pos),
@@ -263,14 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn query_table_mut_allows_mutation() {
+    fn query_table_raw_allows_mutation() {
         let mut world = crate::world::World::new();
         let e = world.spawn(PosVel {
             pos: Pos { x: 1.0, y: 2.0 },
             vel: Vel { dx: 3.0, dy: 4.0 },
         });
 
-        for ptrs in world.query_table_mut::<PosVel>() {
+        for ptrs in world.query_table_raw::<PosVel>() {
             unsafe {
                 let pos = &mut *(ptrs[0] as *mut Pos);
                 pos.x += 10.0;
@@ -302,7 +377,7 @@ mod tests {
     #[test]
     fn query_table_empty() {
         let mut world = crate::world::World::new();
-        let count = world.query_table::<PosVel>().count();
+        let count = world.query_table_raw::<PosVel>().count();
         assert_eq!(count, 0);
     }
 
@@ -376,7 +451,7 @@ mod tests {
         });
 
         let mut count = 0;
-        for ptrs in world.query_table::<Transform>() {
+        for ptrs in world.query_table_raw::<Transform>() {
             unsafe {
                 let pos = &*(ptrs[0] as *const Pos);
                 assert!(pos.x == 1.0 || pos.x == 5.0);
@@ -384,5 +459,71 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    // --- Typed query_table tests ---
+
+    #[test]
+    fn typed_query_table_ref() {
+        let mut world = crate::world::World::new();
+        world.spawn(Transform {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+
+        for row in world.query_table::<Transform>() {
+            assert_eq!(row.pos.x, 1.0);
+            assert_eq!(row.vel.dx, 3.0);
+        }
+    }
+
+    #[test]
+    fn typed_query_table_mut() {
+        let mut world = crate::world::World::new();
+        let e = world.spawn(Transform {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+
+        for row in world.query_table_mut::<Transform>() {
+            row.pos.x += 10.0;
+        }
+
+        assert_eq!(
+            world.get::<Pos>(e),
+            Some(&Pos { x: 11.0, y: 2.0 })
+        );
+    }
+
+    #[test]
+    fn typed_query_table_manual_impl() {
+        let mut world = crate::world::World::new();
+        world.spawn(PosVel {
+            pos: Pos { x: 7.0, y: 8.0 },
+            vel: Vel { dx: 9.0, dy: 10.0 },
+        });
+
+        for row in world.query_table::<PosVel>() {
+            assert_eq!(row.pos.x, 7.0);
+            assert_eq!(row.vel.dx, 9.0);
+        }
+    }
+
+    #[test]
+    fn typed_query_table_mut_manual() {
+        let mut world = crate::world::World::new();
+        let e = world.spawn(PosVel {
+            pos: Pos { x: 1.0, y: 2.0 },
+            vel: Vel { dx: 3.0, dy: 4.0 },
+        });
+
+        for row in world.query_table_mut::<PosVel>() {
+            row.pos.x += 100.0;
+        }
+
+        assert_eq!(
+            world.get::<Pos>(e),
+            Some(&Pos { x: 101.0, y: 2.0 })
+        );
     }
 }

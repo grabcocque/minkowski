@@ -65,10 +65,16 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Ref and Mut type names
+    let ref_name = syn::Ident::new(&format!("{}Ref", name), name.span());
+    let mut_name = syn::Ident::new(&format!("{}Mut", name), name.span());
+
     // Generate Table impl
     let table_impl = quote! {
         unsafe impl ::minkowski::table::Table for #name {
             const FIELD_COUNT: usize = #field_count;
+            type Ref<'w> = #ref_name<'w>;
+            type Mut<'w> = #mut_name<'w>;
 
             fn register(
                 registry: &mut ::minkowski::component::ComponentRegistry,
@@ -79,10 +85,6 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
             }
         }
     };
-
-    // Generate Ref and Mut row types
-    let ref_name = syn::Ident::new(&format!("{}Ref", name), name.span());
-    let mut_name = syn::Ident::new(&format!("{}Mut", name), name.span());
 
     let ref_struct = quote! {
         pub struct #ref_name<'w> {

@@ -166,9 +166,10 @@ impl World {
         QueryIter::new(fetches)
     }
 
-    /// Iterate all rows of a table's archetype with raw column pointers.
-    /// Skips archetype matching — goes directly to the table's cached archetype.
-    pub fn query_table<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+    /// Resolve column pointers for a table's archetype.
+    fn resolve_table_ptrs<T: crate::table::Table>(
+        &mut self,
+    ) -> (Vec<(*mut u8, usize)>, usize) {
         let desc = self
             .table_cache
             .get_or_create::<T>(&mut self.components, &mut self.archetypes);
@@ -178,7 +179,7 @@ impl World {
 
         let archetype = &self.archetypes.archetypes[arch_id.0];
         if archetype.is_empty() {
-            return crate::table::TableIter::new(vec![], 0);
+            return (vec![], 0);
         }
 
         let col_ptrs: Vec<(*mut u8, usize)> = col_indices
@@ -187,12 +188,30 @@ impl World {
             .map(|(&col_idx, &size)| unsafe { (archetype.columns[col_idx].get_ptr(0), size) })
             .collect();
 
-        crate::table::TableIter::new(col_ptrs, archetype.len())
+        (col_ptrs, archetype.len())
     }
 
-    /// Mutable variant of `query_table`. Mutability enforced by `&mut self`.
-    pub fn query_table_mut<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
-        self.query_table::<T>()
+    /// Iterate all rows of a table's archetype with raw column pointers.
+    /// Skips archetype matching — goes directly to the table's cached archetype.
+    pub fn query_table_raw<T: crate::table::Table>(&mut self) -> crate::table::TableIter<'_> {
+        let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
+        crate::table::TableIter::new(col_ptrs, len)
+    }
+
+    /// Iterate all rows with typed immutable field access.
+    pub fn query_table<T: crate::table::Table>(
+        &mut self,
+    ) -> crate::table::TableTypedIter<'_, T::Ref<'_>> {
+        let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
+        crate::table::TableTypedIter::new(col_ptrs, len)
+    }
+
+    /// Iterate all rows with typed mutable field access.
+    pub fn query_table_mut<T: crate::table::Table>(
+        &mut self,
+    ) -> crate::table::TableTypedIter<'_, T::Mut<'_>> {
+        let (col_ptrs, len) = self.resolve_table_ptrs::<T>();
+        crate::table::TableTypedIter::new(col_ptrs, len)
     }
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
