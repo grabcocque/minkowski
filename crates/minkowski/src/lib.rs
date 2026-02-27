@@ -12,4 +12,5 @@ pub mod world;
 
 pub use command::CommandBuffer;
 pub use entity::Entity;
+pub use minkowski_derive::Table;
 pub use world::World;
