@@ -151,7 +151,7 @@ impl World {
         }
     }
 
-    pub fn query<Q: WorldQuery>(&self) -> QueryIter<'_, Q> {
+    pub fn query<Q: WorldQuery>(&mut self) -> QueryIter<'_, Q> {
         let required = Q::required_ids(&self.components);
         let fetches: Vec<_> = self
             .archetypes
@@ -167,9 +167,7 @@ impl World {
     }
 
     /// Resolve column pointers for a table's archetype.
-    fn resolve_table_ptrs<T: crate::table::Table>(
-        &mut self,
-    ) -> (Vec<(*mut u8, usize)>, usize) {
+    fn resolve_table_ptrs<T: crate::table::Table>(&mut self) -> (Vec<(*mut u8, usize)>, usize) {
         let desc = self
             .table_cache
             .get_or_create::<T>(&mut self.components, &mut self.archetypes);
