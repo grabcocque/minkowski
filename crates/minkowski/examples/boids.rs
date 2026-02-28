@@ -189,6 +189,19 @@ fn spawn_boid(world: &mut World, params: &BoidParams) -> Entity {
     ))
 }
 
+/// Minimum-image distance on a toroidal world.
+/// Returns the shortest signed difference between `a` and `b` wrapping at `world_size`.
+fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
+    let d = a - b;
+    if d > world_size * 0.5 {
+        d - world_size
+    } else if d < -world_size * 0.5 {
+        d + world_size
+    } else {
+        d
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
