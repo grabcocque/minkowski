@@ -1,18 +1,30 @@
-use std::alloc::Layout;
+use std::alloc::{self, Layout};
+use std::ptr::NonNull;
 
 use crate::component::ComponentId;
 use crate::entity::Entity;
 use crate::world::{get_pair_mut, EntityLocation, World};
 
+const ARENA_ALIGN: usize = 16;
+
 /// Contiguous byte arena for component data. Mutations store integer offsets
 /// into this arena, avoiding per-mutation heap allocation.
+///
+/// Backing memory is allocated with alignment 16 to satisfy alignment
+/// requirements of any component type stored within.
 pub(crate) struct Arena {
-    data: Vec<u8>,
+    data: NonNull<u8>,
+    len: usize,
+    capacity: usize,
 }
 
 impl Arena {
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        Self {
+            data: NonNull::dangling(),
+            len: 0,
+            capacity: 0,
+        }
     }
 
     /// Copy `layout.size()` bytes from `src` into the arena.
@@ -22,18 +34,52 @@ impl Arena {
             return 0;
         }
         let align = layout.align();
-        let offset = (self.data.len() + align - 1) & !(align - 1);
-        self.data.resize(offset + layout.size(), 0);
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, self.data.as_mut_ptr().add(offset), layout.size());
+        let offset = (self.len + align - 1) & !(align - 1);
+        let new_len = offset + layout.size();
+
+        if new_len > self.capacity {
+            self.grow(new_len);
         }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, self.data.as_ptr().add(offset), layout.size());
+        }
+        self.len = new_len;
         offset
     }
 
     /// Get a raw pointer to data at the given offset.
-    #[allow(dead_code)]
     pub fn get(&self, offset: usize) -> *const u8 {
         unsafe { self.data.as_ptr().add(offset) }
+    }
+
+    fn grow(&mut self, min_capacity: usize) {
+        let new_capacity = (min_capacity * 2).max(64);
+        let new_layout =
+            Layout::from_size_align(new_capacity, ARENA_ALIGN).expect("invalid arena layout");
+
+        let new_ptr = if self.capacity == 0 {
+            unsafe { alloc::alloc(new_layout) }
+        } else {
+            let old_layout =
+                Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("invalid arena layout");
+            unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_capacity) }
+        };
+
+        self.data = NonNull::new(new_ptr).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        self.capacity = new_capacity;
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        if self.capacity > 0 {
+            let layout =
+                Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("invalid arena layout");
+            unsafe {
+                alloc::dealloc(self.data.as_ptr(), layout);
+            }
+        }
     }
 }
 
