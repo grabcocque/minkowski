@@ -177,10 +177,12 @@ fn main() {
     for frame in 0..FRAME_COUNT {
         let frame_start = Instant::now();
 
-        // Step 1: Zero accelerations
-        for acc in world.query::<&mut Acceleration>() {
-            acc.0 = Vec2::ZERO;
-        }
+        // Step 1: Zero accelerations (chunk — enables vectorization)
+        world.query::<&mut Acceleration>().for_each_chunk(|accs| {
+            for acc in accs.iter_mut() {
+                acc.0 = Vec2::ZERO;
+            }
+        });
 
         // Step 2: Snapshot for neighbor queries
         let snapshot: Vec<(Entity, Vec2, Vec2)> = world
@@ -251,15 +253,23 @@ fn main() {
         }
 
         // Step 5: Integration
-        for (vel, acc) in world.query::<(&mut Velocity, &Acceleration)>() {
-            vel.0 += acc.0 * DT;
-            vel.0 = vel.0.clamped(params.max_speed);
-        }
-        for (pos, vel) in world.query::<(&mut Position, &Velocity)>() {
-            pos.0 += vel.0 * DT;
-            pos.0.x = pos.0.x.rem_euclid(params.world_size);
-            pos.0.y = pos.0.y.rem_euclid(params.world_size);
-        }
+        world
+            .query::<(&mut Velocity, &Acceleration)>()
+            .for_each_chunk(|(vels, accs)| {
+                for i in 0..vels.len() {
+                    vels[i].0.x += accs[i].0.x * DT;
+                    vels[i].0.y += accs[i].0.y * DT;
+                    vels[i].0 = vels[i].0.clamped(params.max_speed);
+                }
+            });
+        world
+            .query::<(&mut Position, &Velocity)>()
+            .for_each_chunk(|(poss, vels)| {
+                for i in 0..poss.len() {
+                    poss[i].0.x = (poss[i].0.x + vels[i].0.x * DT).rem_euclid(params.world_size);
+                    poss[i].0.y = (poss[i].0.y + vels[i].0.y * DT).rem_euclid(params.world_size);
+                }
+            });
 
         // Step 6: Spawn/despawn churn
         if frame > 0 && frame % CHURN_INTERVAL == 0 {
