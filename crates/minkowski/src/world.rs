@@ -6,6 +6,7 @@ use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
 use crate::table::TableCache;
+use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
 use std::alloc::Layout;
 use std::any::TypeId;
@@ -49,6 +50,7 @@ pub struct World {
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
+    pub(crate) current_tick: Tick,
 }
 
 impl World {
@@ -61,7 +63,16 @@ impl World {
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
+            current_tick: Tick::default(),
         }
+    }
+
+    pub fn tick(&mut self) {
+        self.current_tick.advance();
+    }
+
+    pub fn current_tick(&self) -> Tick {
+        self.current_tick
     }
 
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
@@ -82,6 +93,9 @@ impl World {
                 let col = archetype.component_index[&comp_id];
                 archetype.columns[col].push(ptr as *mut u8);
             });
+        }
+        for col in &mut archetype.columns {
+            col.mark_changed(self.current_tick);
         }
         let row = archetype.entities.len();
         archetype.entities.push(entity);
@@ -164,6 +178,7 @@ impl World {
 
         let archetype = &mut self.archetypes.archetypes[location.archetype_id.0];
         let col_idx = *archetype.component_index.get(&comp_id)?;
+        archetype.columns[col_idx].mark_changed(self.current_tick);
         unsafe {
             let ptr = archetype.columns[col_idx].get_ptr(location.row) as *mut T;
             Some(&mut *ptr)
@@ -271,15 +286,18 @@ impl World {
         let comp_id = self.components.register::<T>();
 
         // If entity already has this component, overwrite in-place
-        let src_arch = &self.archetypes.archetypes[location.archetype_id.0];
-        if src_arch.component_ids.contains(comp_id) {
-            let col_idx = src_arch.component_index[&comp_id];
-            unsafe {
-                let ptr = src_arch.columns[col_idx].get_ptr(location.row) as *mut T;
-                std::ptr::drop_in_place(ptr);
-                std::ptr::write(ptr, component);
+        {
+            let src_arch = &mut self.archetypes.archetypes[location.archetype_id.0];
+            if src_arch.component_ids.contains(comp_id) {
+                let col_idx = src_arch.component_index[&comp_id];
+                unsafe {
+                    let ptr = src_arch.columns[col_idx].get_ptr(location.row) as *mut T;
+                    std::ptr::drop_in_place(ptr);
+                    std::ptr::write(ptr, component);
+                }
+                src_arch.columns[col_idx].mark_changed(self.current_tick);
+                return;
             }
-            return;
         }
 
         // Compute target archetype: source components + new component
@@ -314,6 +332,9 @@ impl World {
         unsafe {
             let comp = std::mem::ManuallyDrop::new(component);
             target_arch.columns[tgt_col].push(&*comp as *const T as *mut u8);
+        }
+        for col in &mut target_arch.columns {
+            col.mark_changed(self.current_tick);
         }
 
         // Move entity tracking
@@ -663,5 +684,33 @@ mod tests {
         for &(_, _, layout) in &components {
             assert!(layout.size() > 0);
         }
+    }
+
+    #[test]
+    fn spawn_marks_column_ticks() {
+        use crate::tick::Tick;
+        let mut world = World::new();
+        world.tick(); // tick to 1
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        let arch = &world.archetypes.archetypes[0];
+        for col in &arch.columns {
+            assert_eq!(col.changed_tick, Tick::new(1));
+        }
+    }
+
+    #[test]
+    fn get_mut_marks_column_tick() {
+        use crate::tick::Tick;
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.tick(); // tick to 1
+        let _ = world.get_mut::<Pos>(e);
+
+        let loc = world.entity_locations[e.index() as usize].unwrap();
+        let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+        let comp_id = world.components.id::<Pos>().unwrap();
+        let col_idx = arch.component_index[&comp_id];
+        assert_eq!(arch.columns[col_idx].changed_tick, Tick::new(1));
     }
 }
