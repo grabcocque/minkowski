@@ -109,6 +109,7 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 | Phase | Feature | Why |
 |---|---|---|
 | 3 | Change detection ticks | Systems only process entities that actually changed |
+| 3 | Secondary index hooks | Observer API for user-defined spatial indices (grids, BVH, k-d trees) that update on component change |
 | 3 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
 | 4 | Transaction semantics | Atomic multi-entity mutations with rollback |
