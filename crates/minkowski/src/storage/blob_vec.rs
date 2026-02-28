@@ -178,10 +178,19 @@ impl BlobVec {
         // Always use alloc + copy + dealloc instead of realloc.
         // realloc may not preserve alignment > max_align_t (typically 16 bytes),
         // and we require 64-byte alignment for cache line / SIMD guarantees.
-        let new_data = unsafe {
-            let new_ptr = alloc::alloc(new_layout);
-            if self.capacity > 0 {
-                std::ptr::copy_nonoverlapping(self.data.as_ptr(), new_ptr, size * self.len);
+        //
+        // Check the allocation result BEFORE copying — alloc can return null
+        // under memory pressure, and copy_nonoverlapping on a null dst is UB.
+        let new_ptr = unsafe { alloc::alloc(new_layout) };
+        let new_data =
+            NonNull::new(new_ptr).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        if self.capacity > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.data.as_ptr(),
+                    new_data.as_ptr(),
+                    size * self.len,
+                );
                 let old_layout = Layout::from_size_align(
                     size * self.capacity,
                     Self::alloc_align(&self.item_layout),
@@ -189,10 +198,8 @@ impl BlobVec {
                 .unwrap();
                 alloc::dealloc(self.data.as_ptr(), old_layout);
             }
-            new_ptr
-        };
-
-        self.data = NonNull::new(new_data).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
+        }
+        self.data = new_data;
         self.capacity = new_capacity;
     }
 }
