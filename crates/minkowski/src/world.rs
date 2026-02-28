@@ -6,6 +6,9 @@ use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
 use crate::table::TableCache;
+use fixedbitset::FixedBitSet;
+use std::any::TypeId;
+use std::collections::HashMap;
 
 fn get_pair_mut(v: &mut [Archetype], a: usize, b: usize) -> (&mut Archetype, &mut Archetype) {
     assert_ne!(a, b, "cannot get mutable references to the same archetype");
@@ -24,6 +27,16 @@ pub(crate) struct EntityLocation {
     pub row: usize,
 }
 
+#[allow(dead_code)]
+pub(crate) struct QueryCacheEntry {
+    /// Archetypes whose component_ids are a superset of the query's required_ids.
+    matched_ids: Vec<ArchetypeId>,
+    /// Precomputed required component bitset for incremental scans.
+    required: FixedBitSet,
+    /// Number of archetypes when cache was last updated.
+    last_archetype_count: usize,
+}
+
 pub struct World {
     pub(crate) entities: EntityAllocator,
     pub(crate) archetypes: Archetypes,
@@ -31,6 +44,8 @@ pub struct World {
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
+    #[allow(dead_code)]
+    pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
 }
 
 impl World {
@@ -42,6 +57,7 @@ impl World {
             sparse: SparseStorage::new(),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
+            query_cache: HashMap::new(),
         }
     }
 
