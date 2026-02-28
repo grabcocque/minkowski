@@ -623,26 +623,12 @@ mod tests {
     fn apply_spawn_and_reverse_despawns() {
         let mut world = World::new();
         let entity = world.entities.alloc();
-        let pos_id = world.components.register::<Pos>();
-        let vel_id = world.components.register::<Vel>();
 
-        let pos = Pos { x: 1.0, y: 2.0 };
-        let vel = Vel { dx: 3.0, dy: 4.0 };
         let mut cs = EnumChangeSet::new();
-        cs.record_spawn(
+        cs.spawn_bundle(
+            &mut world,
             entity,
-            &[
-                (
-                    pos_id,
-                    &pos as *const Pos as *const u8,
-                    Layout::new::<Pos>(),
-                ),
-                (
-                    vel_id,
-                    &vel as *const Vel as *const u8,
-                    Layout::new::<Vel>(),
-                ),
-            ],
+            (Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }),
         );
 
         let reverse = cs.apply(&mut world);
@@ -674,16 +660,9 @@ mod tests {
     fn apply_insert_new_and_reverse_removes() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let vel_id = world.components.register::<Vel>();
 
-        let vel = Vel { dx: 3.0, dy: 4.0 };
         let mut cs = EnumChangeSet::new();
-        cs.record_insert(
-            e,
-            vel_id,
-            &vel as *const Vel as *const u8,
-            Layout::new::<Vel>(),
-        );
+        cs.insert::<Vel>(&mut world, e, Vel { dx: 3.0, dy: 4.0 });
 
         let reverse = cs.apply(&mut world);
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
@@ -697,16 +676,9 @@ mod tests {
     fn apply_insert_overwrite_and_reverse_restores() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let pos_id = world.components.register::<Pos>();
 
-        let new_pos = Pos { x: 99.0, y: 99.0 };
         let mut cs = EnumChangeSet::new();
-        cs.record_insert(
-            e,
-            pos_id,
-            &new_pos as *const Pos as *const u8,
-            Layout::new::<Pos>(),
-        );
+        cs.insert::<Pos>(&mut world, e, Pos { x: 99.0, y: 99.0 });
 
         let reverse = cs.apply(&mut world);
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 99.0, y: 99.0 }));
@@ -719,10 +691,9 @@ mod tests {
     fn apply_remove_and_reverse_reinserts() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
-        let vel_id = world.components.register::<Vel>();
 
         let mut cs = EnumChangeSet::new();
-        cs.record_remove(e, vel_id);
+        cs.remove::<Vel>(&mut world, e);
 
         let reverse = cs.apply(&mut world);
         assert_eq!(world.get::<Vel>(e), None);
@@ -746,16 +717,9 @@ mod tests {
     fn round_trip_forward_reverse_forward() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
-        let vel_id = world.components.register::<Vel>();
 
-        let vel = Vel { dx: 10.0, dy: 20.0 };
         let mut cs = EnumChangeSet::new();
-        cs.record_insert(
-            e,
-            vel_id,
-            &vel as *const Vel as *const u8,
-            Layout::new::<Vel>(),
-        );
+        cs.insert::<Vel>(&mut world, e, Vel { dx: 10.0, dy: 20.0 });
 
         let reverse = cs.apply(&mut world);
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
