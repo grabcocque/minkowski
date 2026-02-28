@@ -87,6 +87,19 @@ impl World {
         self.components.register::<T>()
     }
 
+    /// Allocate a fresh entity ID without placing it in any archetype.
+    /// Use this to obtain an unplaced handle for `EnumChangeSet::spawn_bundle`.
+    pub fn alloc_entity(&mut self) -> Entity {
+        self.entities.alloc()
+    }
+
+    /// Returns true if the entity has been placed in an archetype (has a row).
+    /// Entities from `alloc_entity()` return false until they are spawned.
+    pub fn is_placed(&self, entity: Entity) -> bool {
+        let idx = entity.index() as usize;
+        idx < self.entity_locations.len() && self.entity_locations[idx].is_some()
+    }
+
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         let component_ids = B::component_ids(&mut self.components);
         let arch_id = self
@@ -978,5 +991,14 @@ mod tests {
         let a = world.register_component::<Pos>();
         let b = world.register_component::<Pos>();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn alloc_entity_is_not_placed_until_spawned() {
+        let mut world = World::new();
+        let e = world.alloc_entity();
+        // Allocated but not yet placed in any archetype
+        assert!(world.is_alive(e)); // allocator considers it alive
+        assert!(!world.is_placed(e)); // but no archetype row yet
     }
 }

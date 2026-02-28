@@ -131,6 +131,11 @@ impl EnumChangeSet {
     }
 
     /// Record a spawn: entity + raw component data.
+    ///
+    /// The entity must not be placed (`World::is_placed` returns false) when
+    /// the changeset is applied — passing an already-placed entity corrupts
+    /// archetype storage. Use `World::alloc_entity()` to obtain an unplaced
+    /// handle. The `apply` method will panic if this precondition is violated.
     pub fn record_spawn(
         &mut self,
         entity: Entity,
@@ -201,7 +206,17 @@ impl EnumChangeSet {
 
     /// Record spawning an entity with a bundle of components. Auto-registers
     /// all component types in the bundle.
+    ///
+    /// # Panics
+    /// Panics if `entity` is already alive. Use `World::alloc_entity()` to
+    /// obtain an unplaced entity handle.
     pub fn spawn_bundle<B: Bundle>(&mut self, world: &mut World, entity: Entity, bundle: B) {
+        assert!(
+            !world.is_placed(entity),
+            "spawn_bundle: entity {:?} is already placed in an archetype — \
+             use World::alloc_entity() to obtain an unplaced handle",
+            entity,
+        );
         let _ids = B::component_ids(&mut world.components);
         let mut components = Vec::new();
         unsafe {
@@ -229,6 +244,12 @@ impl EnumChangeSet {
         for mutation in &self.mutations {
             match mutation {
                 Mutation::Spawn { entity, components } => {
+                    assert!(
+                        !world.is_placed(*entity),
+                        "EnumChangeSet::apply: cannot spawn entity {:?} — \
+                         already placed in an archetype",
+                        entity,
+                    );
                     // --- Apply: push raw component data into the right archetype ---
                     let sorted_ids: Vec<ComponentId> = {
                         let mut ids: Vec<_> = components.iter().map(|&(id, _, _)| id).collect();
@@ -622,7 +643,7 @@ mod tests {
     #[test]
     fn apply_spawn_and_reverse_despawns() {
         let mut world = World::new();
-        let entity = world.entities.alloc();
+        let entity = world.alloc_entity();
 
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(
@@ -764,7 +785,7 @@ mod tests {
     #[test]
     fn typed_spawn_and_reverse() {
         let mut world = World::new();
-        let entity = world.entities.alloc();
+        let entity = world.alloc_entity();
 
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(
@@ -796,5 +817,37 @@ mod tests {
 
         let _ = reverse.apply(&mut world);
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+    }
+
+    #[test]
+    #[should_panic(expected = "already placed")]
+    fn spawn_bundle_panics_on_live_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Vel { dx: 3.0, dy: 4.0 },));
+    }
+
+    #[test]
+    #[should_panic(expected = "already placed")]
+    fn apply_spawn_panics_on_live_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        // Use raw record_spawn to bypass the spawn_bundle guard,
+        // then verify apply() catches it.
+        let pos_id = world.register_component::<Vel>();
+        let vel = Vel { dx: 3.0, dy: 4.0 };
+        let mut cs = EnumChangeSet::new();
+        cs.record_spawn(
+            e,
+            &[(
+                pos_id,
+                &vel as *const Vel as *const u8,
+                Layout::new::<Vel>(),
+            )],
+        );
+        let _ = cs.apply(&mut world);
     }
 }
