@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (86 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (105 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -70,9 +70,11 @@ Build with `-C target-cpu=native` (configured in `.cargo/config.toml`) to enable
 
 `CommandBuffer` stores `Vec<Box<dyn FnOnce(&mut World) + Send>>`. Used during query iteration when structural changes (spawn/despawn/insert/remove) must be deferred. Applied via `cmds.apply(&mut world)`.
 
+`EnumChangeSet` is the data-driven alternative: mutations are recorded as a `Vec<Mutation>` enum with component bytes in a contiguous `Arena`. `apply()` returns a reverse `EnumChangeSet` for rollback — applying the reverse undoes the original changes. Useful for persistence (WAL serialization) and transactions.
+
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`).
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`).
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
