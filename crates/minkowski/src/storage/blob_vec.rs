@@ -88,7 +88,16 @@ impl BlobVec {
         self.len += 1;
     }
 
-    /// Returns a raw pointer to the element at `row` (read path).
+    /// Returns a raw pointer to the element at `row`.
+    ///
+    /// # Change detection invariant
+    /// This returns `*mut u8` for internal mechanics (migration, reverse capture)
+    /// but **does not mark the column changed**. Writing through this pointer
+    /// bypasses change detection — `Changed<T>` queries will miss the mutation.
+    ///
+    /// For mutable access that respects change detection, use [`get_ptr_mut`]
+    /// or ensure the caller marks the column via [`mark_changed`] or the
+    /// entry-point methods (`query_table_mut`, `World::query` for `&mut T`).
     ///
     /// # Safety
     /// `row` must be in bounds (`row < len`).
@@ -99,7 +108,11 @@ impl BlobVec {
     }
 
     /// Returns a raw pointer to the element at `row` and marks the column
-    /// changed at the given tick (write path).
+    /// changed at the given tick.
+    ///
+    /// This is the correct write-path accessor — use this (or ensure the
+    /// caller marks via entry-point methods) for any mutation that should
+    /// be visible to `Changed<T>` queries.
     ///
     /// # Safety
     /// `row` must be in bounds (`row < len`).
