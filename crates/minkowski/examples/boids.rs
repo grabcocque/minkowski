@@ -4,6 +4,32 @@
 //!
 //! Exercises: spawn, despawn, multi-component queries, mutation,
 //! parallel iteration, deferred commands, archetype stability under churn.
+//!
+//! # Vectorization
+//!
+//! The integration loops (Steps 1 and 5) are designed to auto-vectorize.
+//! LLVM generates branchless AVX-512 masked ops for the position/velocity
+//! updates. Every link in this chain is required — remove any one and the
+//! loop falls back to scalar:
+//!
+//! 1. **64-byte aligned columns** — BlobVec allocates with cache-line alignment.
+//!    Without this, LLVM may not emit aligned loads or may add peel loops.
+//! 2. **`for_each_chunk` yields `&[T]`/`&mut [T]` slices** — LLVM needs to see
+//!    a contiguous slice with a known length to engage its loop vectorizer.
+//!    Per-element `fetch(ptr, row)` across a trait boundary is opaque.
+//! 3. **Index loop `for i in 0..len`** — iterating by index over the slice
+//!    gives LLVM the simple induction variable it needs. Iterator adaptors
+//!    can obscure the access pattern.
+//! 4. **No opaque function calls in the loop body** — `rem_euclid` compiles
+//!    to `fmodf` (scalar libm), which is an optimization barrier. The
+//!    branchless conditional subtract wraps identically for bounded velocity
+//!    and is fully inlineable.
+//! 5. **`-C target-cpu=native`** (in `.cargo/config.toml`) — without this,
+//!    rustc targets a baseline x86-64 that lacks AVX2/AVX-512.
+//!
+//! Verify with: `objdump -d -M intel target/release/examples/boids | grep vmulps`
+//! You should see packed float ops (vaddps, vmulps, vblendmps), not scalar
+//! (vaddss, vmulss).
 
 use minkowski::{CommandBuffer, Entity, World};
 use std::time::Instant;
@@ -177,10 +203,12 @@ fn main() {
     for frame in 0..FRAME_COUNT {
         let frame_start = Instant::now();
 
-        // Step 1: Zero accelerations
-        for acc in world.query::<&mut Acceleration>() {
-            acc.0 = Vec2::ZERO;
-        }
+        // Step 1: Zero accelerations (chunk — enables vectorization)
+        world.query::<&mut Acceleration>().for_each_chunk(|accs| {
+            for acc in accs.iter_mut() {
+                acc.0 = Vec2::ZERO;
+            }
+        });
 
         // Step 2: Snapshot for neighbor queries
         let snapshot: Vec<(Entity, Vec2, Vec2)> = world
@@ -251,15 +279,40 @@ fn main() {
         }
 
         // Step 5: Integration
-        for (vel, acc) in world.query::<(&mut Velocity, &Acceleration)>() {
-            vel.0 += acc.0 * DT;
-            vel.0 = vel.0.clamped(params.max_speed);
-        }
-        for (pos, vel) in world.query::<(&mut Position, &Velocity)>() {
-            pos.0 += vel.0 * DT;
-            pos.0.x = pos.0.x.rem_euclid(params.world_size);
-            pos.0.y = pos.0.y.rem_euclid(params.world_size);
-        }
+        world
+            .query::<(&mut Velocity, &Acceleration)>()
+            .for_each_chunk(|(vels, accs)| {
+                for i in 0..vels.len() {
+                    vels[i].0.x += accs[i].0.x * DT;
+                    vels[i].0.y += accs[i].0.y * DT;
+                    vels[i].0 = vels[i].0.clamped(params.max_speed);
+                }
+            });
+        // Position integration with branchless world wrapping.
+        // Velocity is bounded by max_speed, so positions are never more than
+        // one world_size out of range — conditional subtract replaces rem_euclid
+        // (which compiles to scalar fmodf and kills vectorization).
+        let ws = params.world_size;
+        world
+            .query::<(&mut Position, &Velocity)>()
+            .for_each_chunk(|(poss, vels)| {
+                for i in 0..poss.len() {
+                    let mut x = poss[i].0.x + vels[i].0.x * DT;
+                    let mut y = poss[i].0.y + vels[i].0.y * DT;
+                    if x >= ws {
+                        x -= ws;
+                    } else if x < 0.0 {
+                        x += ws;
+                    }
+                    if y >= ws {
+                        y -= ws;
+                    } else if y < 0.0 {
+                        y += ws;
+                    }
+                    poss[i].0.x = x;
+                    poss[i].0.y = y;
+                }
+            });
 
         // Step 6: Spawn/despawn churn
         if frame > 0 && frame % CHURN_INTERVAL == 0 {
