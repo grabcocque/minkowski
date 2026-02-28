@@ -1,6 +1,8 @@
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 
+use crate::tick::Tick;
+
 /// Type-erased growable array. Stores raw bytes with a known `Layout`.
 /// Used as the column storage inside archetypes.
 pub(crate) struct BlobVec {
@@ -9,6 +11,7 @@ pub(crate) struct BlobVec {
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
+    pub(crate) changed_tick: Tick,
 }
 
 // Safety: BlobVec stores Component data which requires Send + Sync.
@@ -24,6 +27,12 @@ impl BlobVec {
     /// Compute the allocation alignment for a BlobVec column.
     fn alloc_align(item: &Layout) -> usize {
         item.align().max(Self::MIN_COLUMN_ALIGN)
+    }
+
+    /// Mark this column as changed at the given tick.
+    #[inline]
+    pub(crate) fn mark_changed(&mut self, tick: Tick) {
+        self.changed_tick = tick;
     }
 
     /// Creates a new `BlobVec` for items with the given layout and optional drop function.
@@ -48,6 +57,7 @@ impl BlobVec {
             data,
             len: 0,
             capacity,
+            changed_tick: Tick::default(),
         }
     }
 
@@ -447,5 +457,14 @@ mod tests {
             assert_eq!(read_val::<u32>(&bv, 0), 0);
             assert_eq!(read_val::<u32>(&bv, 15), 15);
         }
+    }
+
+    #[test]
+    fn changed_tick_default_and_mark() {
+        use crate::tick::Tick;
+        let mut bv = bv_for::<u32>();
+        assert_eq!(bv.changed_tick, Tick::default());
+        bv.mark_changed(Tick::new(42));
+        assert_eq!(bv.changed_tick, Tick::new(42));
     }
 }
