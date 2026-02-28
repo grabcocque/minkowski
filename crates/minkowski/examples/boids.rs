@@ -262,12 +262,29 @@ fn main() {
                     vels[i].0 = vels[i].0.clamped(params.max_speed);
                 }
             });
+        // Position integration with branchless world wrapping.
+        // Velocity is bounded by max_speed, so positions are never more than
+        // one world_size out of range — conditional subtract replaces rem_euclid
+        // (which compiles to scalar fmodf and kills vectorization).
+        let ws = params.world_size;
         world
             .query::<(&mut Position, &Velocity)>()
             .for_each_chunk(|(poss, vels)| {
                 for i in 0..poss.len() {
-                    poss[i].0.x = (poss[i].0.x + vels[i].0.x * DT).rem_euclid(params.world_size);
-                    poss[i].0.y = (poss[i].0.y + vels[i].0.y * DT).rem_euclid(params.world_size);
+                    let mut x = poss[i].0.x + vels[i].0.x * DT;
+                    let mut y = poss[i].0.y + vels[i].0.y * DT;
+                    if x >= ws {
+                        x -= ws;
+                    } else if x < 0.0 {
+                        x += ws;
+                    }
+                    if y >= ws {
+                        y -= ws;
+                    } else if y < 0.0 {
+                        y += ws;
+                    }
+                    poss[i].0.x = x;
+                    poss[i].0.y = y;
                 }
             });
 
