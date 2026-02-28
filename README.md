@@ -4,14 +4,16 @@ A column-oriented archetype ECS built from scratch in Rust. Game workloads first
 
 ## What's here
 
-The foundational storage layer, compile-time schema support, cached queries, and SIMD-friendly iteration.
+The foundational storage layer, compile-time schema support, cached queries, SIMD-friendly iteration, and change detection.
 
 **Phase 1** — type-erased BlobVec columns packed into archetypes, generational entity IDs, parallel query iteration via rayon, deferred mutation through CommandBuffer.
 
 **Phase 2** — `#[derive(Table)]` proc macro for compile-time schema declarations with typed row accessors, transparent query caching with incremental archetype scanning, data-driven `EnumChangeSet` with reversible apply for rollback, 64-byte aligned columns with `for_each_chunk` yielding typed slices for SIMD auto-vectorization.
 
+**Phase 3** — per-column change detection ticks with `Changed<T>` query filter. Queries skip entire archetypes whose data hasn't been mutably accessed since the last read.
+
 ```rust
-use minkowski::{World, Entity, CommandBuffer, Table};
+use minkowski::{World, Entity, CommandBuffer, Table, Changed};
 
 #[derive(Table)]
 struct Transform {
@@ -58,6 +60,12 @@ for row in world.query_table::<Transform>() {
 // Archetype migration
 world.insert(e, Health(100));   // moves entity to new archetype
 world.remove::<Health>(e);      // moves it back
+
+// Change detection — skip unchanged archetypes
+world.tick(); // advance the world tick (once per frame)
+for pos in world.query::<(&mut Position, Changed<Velocity>)>() {
+    // only runs for entities whose Velocity column was mutably accessed
+}
 
 // Deferred mutation during iteration
 let mut cmds = CommandBuffer::new();
@@ -108,7 +116,6 @@ Suites: `spawn` (10K entities), `iterate` (10K), `parallel` (100K vs sequential)
 
 | Phase | Feature | Why |
 |---|---|---|
-| 3 | Change detection ticks | Systems only process entities that actually changed |
 | 3 | Secondary index hooks | Observer API for user-defined spatial indices (grids, BVH, k-d trees) that update on component change |
 | 3 | Automatic system scheduling | Conflict detection, parallel system execution |
 | 4 | Persistence — WAL + snapshots | Durable state via BlobVec memcpy to disk |
