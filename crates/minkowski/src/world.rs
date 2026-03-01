@@ -12,7 +12,22 @@ use parking_lot::Mutex;
 use std::alloc::Layout;
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Unique identity for a World instance. Strategies capture this at
+/// construction and assert it matches in begin/commit to prevent
+/// cross-world corruption.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorldId(u64);
+
+static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
+
+impl WorldId {
+    fn next() -> Self {
+        Self(NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 pub(crate) fn get_pair_mut(
     v: &mut [Archetype],
@@ -58,6 +73,7 @@ impl OrphanQueue {
 }
 
 pub struct World {
+    pub(crate) id: WorldId,
     pub(crate) entities: EntityAllocator,
     pub(crate) archetypes: Archetypes,
     pub(crate) components: ComponentRegistry,
@@ -72,6 +88,7 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         Self {
+            id: WorldId::next(),
             entities: EntityAllocator::new(),
             archetypes: Archetypes::new(),
             components: ComponentRegistry::new(),
@@ -101,9 +118,14 @@ impl World {
 
     /// Clone the orphan queue handle. Strategies capture this at construction
     /// so that transaction Drop can push orphaned entity IDs without &mut World.
-    #[allow(dead_code)]
     pub(crate) fn orphan_queue(&self) -> OrphanQueue {
         self.orphan_queue.clone()
+    }
+
+    /// Return this World's unique identity. Strategies capture this at
+    /// construction and assert it matches in begin/commit.
+    pub(crate) fn world_id(&self) -> WorldId {
+        self.id
     }
 
     /// Look up the ComponentId for a type. Returns None if the type has

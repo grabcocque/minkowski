@@ -10,7 +10,7 @@ use crate::entity::Entity;
 use crate::lock_table::{ColumnLockSet, ColumnLockTable};
 use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
 use crate::query::iter::QueryIter;
-use crate::world::World;
+use crate::world::{World, WorldId};
 
 /// Unique transaction identifier, monotonically increasing per strategy.
 pub type TxId = u64;
@@ -115,6 +115,7 @@ impl SequentialTx {
 ///
 /// Best for read-heavy workloads where conflicts are rare.
 pub struct Optimistic {
+    world_id: WorldId,
     next_tx_id: AtomicU64,
     orphan_queue: crate::world::OrphanQueue,
 }
@@ -122,6 +123,7 @@ pub struct Optimistic {
 impl Optimistic {
     pub fn new(world: &World) -> Self {
         Self {
+            world_id: world.world_id(),
             next_tx_id: AtomicU64::new(1),
             orphan_queue: world.orphan_queue(),
         }
@@ -132,6 +134,11 @@ impl TransactionStrategy for Optimistic {
     type Tx<'s> = OptimisticTx<'s>;
 
     fn begin<'s>(&'s self, world: &mut World, access: &Access) -> OptimisticTx<'s> {
+        assert_eq!(
+            self.world_id,
+            world.world_id(),
+            "strategy used with a different World than it was created from"
+        );
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         let mut accessed = access.reads().clone();
         accessed.union_with(access.writes());
@@ -198,6 +205,11 @@ impl<'s> OptimisticTx<'s> {
     /// Validate and commit. Checks that no read column was modified since
     /// begin. On conflict, spawned entity IDs are immediately deallocated.
     pub fn commit(mut self, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+        assert_eq!(
+            self.strategy.world_id,
+            world.world_id(),
+            "transaction committed to a different World than it was created from"
+        );
         let conflicts = world.check_column_conflicts(&self.read_ticks);
         if !conflicts.is_empty() {
             for &entity in &self.spawned_entities {
@@ -240,6 +252,7 @@ impl<'s> Drop for OptimisticTx<'s> {
 /// Best for write-heavy workloads or expensive computations where
 /// optimistic retry would waste work.
 pub struct Pessimistic {
+    world_id: WorldId,
     lock_table: Mutex<ColumnLockTable>,
     next_tx_id: AtomicU64,
     orphan_queue: crate::world::OrphanQueue,
@@ -248,6 +261,7 @@ pub struct Pessimistic {
 impl Pessimistic {
     pub fn new(world: &World) -> Self {
         Self {
+            world_id: world.world_id(),
             lock_table: Mutex::new(ColumnLockTable::new()),
             next_tx_id: AtomicU64::new(1),
             orphan_queue: world.orphan_queue(),
@@ -259,6 +273,11 @@ impl TransactionStrategy for Pessimistic {
     type Tx<'s> = PessimisticTx<'s>;
 
     fn begin<'s>(&'s self, world: &mut World, access: &Access) -> PessimisticTx<'s> {
+        assert_eq!(
+            self.world_id,
+            world.world_id(),
+            "strategy used with a different World than it was created from"
+        );
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         let lock_result = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
@@ -332,6 +351,11 @@ impl<'s> PessimisticTx<'s> {
     /// Err(Conflict) if locks were not acquired — spawned entity IDs
     /// are immediately deallocated.
     pub fn commit(mut self, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+        assert_eq!(
+            self.strategy.world_id,
+            world.world_id(),
+            "transaction committed to a different World than it was created from"
+        );
         if self.locks.is_none() {
             for &entity in &self.spawned_entities {
                 world.dealloc_entity(entity);
@@ -634,5 +658,38 @@ mod tests {
         assert!(result.is_err());
         // Spawned entity was deallocated immediately by commit
         assert!(!world.is_alive(spawned));
+    }
+
+    // ── Cross-world safety tests ─────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "different World")]
+    fn optimistic_begin_panics_on_wrong_world() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world_a);
+        let strategy = Optimistic::new(&world_a);
+        let _tx = strategy.begin(&mut world_b, &access);
+    }
+
+    #[test]
+    #[should_panic(expected = "different World")]
+    fn pessimistic_begin_panics_on_wrong_world() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world_a);
+        let strategy = Pessimistic::new(&world_a);
+        let _tx = strategy.begin(&mut world_b, &access);
+    }
+
+    #[test]
+    #[should_panic(expected = "different World")]
+    fn optimistic_commit_panics_on_wrong_world() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world_a);
+        let strategy = Optimistic::new(&world_a);
+        let tx = strategy.begin(&mut world_a, &access);
+        let _ = tx.commit(&mut world_b);
     }
 }
