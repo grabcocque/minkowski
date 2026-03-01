@@ -45,11 +45,11 @@ impl Access {
     /// (same as `world.query::<Q>()`).
     pub fn of<Q: WorldQuery + 'static>(world: &mut World) -> Self {
         Q::register(&mut world.components);
-        let required = Q::required_ids(&world.components);
+        let accessed = Q::accessed_ids(&world.components);
         let writes = Q::mutable_ids(&world.components);
 
-        // reads = required - writes (components read but not written)
-        let mut reads = required;
+        // reads = accessed - writes (components read but not written)
+        let mut reads = accessed;
         reads.difference_with(&writes);
 
         // Normalize: replace zero-count bitsets with truly empty ones so that
@@ -186,6 +186,31 @@ mod tests {
         let a = Access::of::<(Entity,)>(&mut world);
         let b = Access::of::<(&mut Pos,)>(&mut world);
         assert!(!a.conflicts_with(&b));
+    }
+
+    #[test]
+    fn conflict_optional_read_vs_write() {
+        let mut world = World::new();
+        // Option<&Pos> reads Pos when present — must conflict with &mut Pos
+        let a = Access::of::<(Option<&Pos>,)>(&mut world);
+        let b = Access::of::<(&mut Pos,)>(&mut world);
+        assert!(!a.reads().is_empty(), "Option<&T> should report a read");
+        assert!(
+            a.conflicts_with(&b),
+            "optional read must conflict with write"
+        );
+        assert!(
+            b.conflicts_with(&a),
+            "write must conflict with optional read"
+        );
+    }
+
+    #[test]
+    fn no_conflict_optional_read_vs_read() {
+        let mut world = World::new();
+        let a = Access::of::<(Option<&Pos>,)>(&mut world);
+        let b = Access::of::<(&Pos,)>(&mut world);
+        assert!(!a.conflicts_with(&b), "two readers never conflict");
     }
 
     #[test]

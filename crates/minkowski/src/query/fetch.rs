@@ -58,6 +58,16 @@ pub unsafe trait WorldQuery {
     /// `required_ids` / `mutable_ids` are queried.
     fn register(_registry: &mut ComponentRegistry) {}
 
+    /// Returns ComponentIds that this query accesses in any way (read or write),
+    /// including optional components. Used by `Access` for conflict detection.
+    ///
+    /// Defaults to `required_ids` — correct for non-optional query terms.
+    /// `Option<&T>` overrides to include T even though it's not required for
+    /// archetype matching.
+    fn accessed_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        Self::required_ids(registry)
+    }
+
     /// Returns ComponentIds that this query accesses mutably.
     /// Used by change detection to mark columns as changed before iteration.
     fn mutable_ids(_registry: &ComponentRegistry) -> FixedBitSet {
@@ -181,6 +191,12 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
         FixedBitSet::new() // optional — does not filter archetypes
     }
 
+    fn accessed_ids(registry: &ComponentRegistry) -> FixedBitSet {
+        // Option<&T> reads T when the archetype contains it.
+        // Not required for matching, but accessed for conflict detection.
+        <&T>::required_ids(registry)
+    }
+
     fn init_fetch(archetype: &Archetype, registry: &ComponentRegistry) -> Option<ThinSlicePtr<T>> {
         let id = registry.id::<T>()?;
         let col_idx = archetype.component_index.get(&id)?;
@@ -259,6 +275,16 @@ macro_rules! impl_world_query_tuple {
                 let mut bits = FixedBitSet::new();
                 $(
                     let sub = $name::required_ids(registry);
+                    bits.grow(sub.len());
+                    bits.union_with(&sub);
+                )*
+                bits
+            }
+
+            fn accessed_ids(registry: &ComponentRegistry) -> FixedBitSet {
+                let mut bits = FixedBitSet::new();
+                $(
+                    let sub = $name::accessed_ids(registry);
                     bits.grow(sub.len());
                     bits.union_with(&sub);
                 )*
