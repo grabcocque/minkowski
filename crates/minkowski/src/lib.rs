@@ -29,5 +29,7 @@ pub use entity::Entity;
 pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
 pub use query::fetch::Changed;
-pub use transaction::{Conflict, Sequential, SequentialTx, TransactionStrategy};
+pub use transaction::{
+    Conflict, Optimistic, OptimisticTx, Sequential, SequentialTx, TransactionStrategy,
+};
 pub use world::World;

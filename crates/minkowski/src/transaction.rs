@@ -2,7 +2,7 @@ use fixedbitset::FixedBitSet;
 
 use crate::access::Access;
 use crate::changeset::EnumChangeSet;
-use crate::component::Component;
+use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
@@ -88,6 +88,74 @@ impl<'w> SequentialTx<'w> {
     }
 }
 
+// ── Optimistic ──────────────────────────────────────────────────────
+
+/// Optimistic transaction strategy. Reads go directly to World (zero-copy).
+/// Writes buffer into an EnumChangeSet. At commit, validates that no read
+/// column was modified since begin — if conflict detected, returns Err.
+///
+/// Best for read-heavy workloads where conflicts are rare.
+pub struct Optimistic;
+
+impl TransactionStrategy for Optimistic {
+    type Tx<'w> = OptimisticTx<'w>;
+
+    fn begin<'w>(&mut self, world: &'w mut World, access: &Access) -> OptimisticTx<'w> {
+        let read_ticks = world.snapshot_column_ticks(access.reads());
+        OptimisticTx {
+            world,
+            read_ticks,
+            changeset: EnumChangeSet::new(),
+        }
+    }
+}
+
+/// Transaction object for the [`Optimistic`] strategy.
+///
+/// Reads are live (direct World access). Writes are buffered in an
+/// `EnumChangeSet` and applied atomically at commit. If any column
+/// that was read at begin has been modified by the time commit runs,
+/// the transaction aborts with a [`Conflict`].
+///
+/// Drop without commit discards the buffered changeset (abort).
+pub struct OptimisticTx<'w> {
+    world: &'w mut World,
+    read_ticks: Vec<(usize, ComponentId, crate::tick::Tick)>,
+    changeset: EnumChangeSet,
+}
+
+impl<'w> OptimisticTx<'w> {
+    pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
+        self.world.query::<Q>()
+    }
+
+    pub fn insert<T: Component>(&mut self, entity: Entity, value: T) {
+        self.changeset.insert::<T>(self.world, entity, value);
+    }
+
+    pub fn remove<T: Component>(&mut self, entity: Entity) {
+        self.changeset.remove::<T>(self.world, entity);
+    }
+
+    pub fn spawn<B: crate::bundle::Bundle>(&mut self, bundle: B) -> Entity {
+        let entity = self.world.alloc_entity();
+        self.changeset.spawn_bundle(self.world, entity, bundle);
+        entity
+    }
+
+    /// Validate and commit. Checks that no read column was modified since
+    /// begin. Returns reverse changeset on success, Conflict on failure.
+    pub fn commit(self) -> Result<EnumChangeSet, Conflict> {
+        let conflicts = self.world.check_column_conflicts(&self.read_ticks);
+        if !conflicts.is_empty() {
+            return Err(Conflict {
+                component_ids: conflicts,
+            });
+        }
+        Ok(self.changeset.apply(self.world))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +217,89 @@ mod tests {
             // drop without commit — but mutations already applied
         }
         assert_eq!(world.query::<(&Pos,)>().count(), 1);
+    }
+
+    #[test]
+    fn optimistic_commit_succeeds_without_conflict() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
+
+        let mut strategy = Optimistic;
+        let mut tx = strategy.begin(&mut world, &access);
+        let count = tx.query::<(&Pos,)>().count();
+        assert_eq!(count, 1);
+        tx.insert::<Vel>(e, Vel(99.0));
+        let result = tx.commit();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn optimistic_buffered_writes_not_visible_until_commit() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let mut strategy = Optimistic;
+        let mut tx = strategy.begin(&mut world, &access);
+        tx.insert::<Pos>(e, Pos(99.0));
+        // Query still sees old value (write is buffered)
+        let pos = tx.query::<(&Pos,)>().next().unwrap();
+        assert_eq!(pos.0 .0, 1.0);
+        let _ = tx.commit();
+        // After commit, world has new value
+        let pos = world.query::<(&Pos,)>().next().unwrap();
+        assert_eq!(pos.0 .0, 99.0);
+    }
+
+    #[test]
+    fn optimistic_drop_aborts_changeset() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let mut strategy = Optimistic;
+        {
+            let mut tx = strategy.begin(&mut world, &access);
+            tx.insert::<Pos>(e, Pos(99.0));
+            // drop without commit — changeset discarded
+        }
+        let pos = world.query::<(&Pos,)>().next().unwrap();
+        assert_eq!(pos.0 .0, 1.0); // unchanged
+    }
+
+    #[test]
+    fn optimistic_conflict_detected_on_read_column_mutation() {
+        use fixedbitset::FixedBitSet;
+
+        let mut world = World::new();
+        world.spawn((Pos(1.0), Vel(2.0)));
+
+        // Test via the lower-level helpers since tx borrows world exclusively
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let mut read_bits = FixedBitSet::with_capacity(pos_id + 1);
+        read_bits.insert(pos_id);
+        let snap = world.snapshot_column_ticks(&read_bits);
+
+        // Mutate the read column
+        for pos in world.query::<(&mut Pos,)>() {
+            pos.0 .0 = 99.0;
+        }
+
+        let conflicts = world.check_column_conflicts(&snap);
+        assert!(conflicts.contains(pos_id));
+    }
+
+    #[test]
+    fn optimistic_spawn_allocates_entity() {
+        let mut world = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let mut strategy = Optimistic;
+        let mut tx = strategy.begin(&mut world, &access);
+        let e = tx.spawn((Pos(42.0),));
+        let result = tx.commit();
+        assert!(result.is_ok());
+        assert!(world.get::<Pos>(e).is_some());
     }
 }
