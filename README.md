@@ -99,7 +99,7 @@ Each unique combination of component types gets an **archetype** — a struct of
 A flocking simulation that exercises every ECS code path — spawn, despawn, multi-component queries, mutation, parallel iteration, chunk-based SIMD iteration, deferred commands, and archetype stability under entity churn.
 
 ```
-$ cargo run -p minkowski --example boids --release
+$ cargo run -p minkowski-examples --example boids --release
 
 frame 0000 | entities:  5000 | avg_vel: 2.00 | dt: 6.5ms
 frame 0100 | entities:  5000 | avg_vel: 1.93 | dt: 3.7ms
@@ -116,7 +116,7 @@ Done.
 A 64×64 Conway's Game of Life that exercises the features boids doesn't cover — `Changed<T>`, `EnumChangeSet` typed API for reversible mutations, and time-travel via undo/replay.
 
 ```
-$ cargo run -p minkowski --example life --release
+$ cargo run -p minkowski-examples --example life --release
 
 Game of Life: 64x64 grid, 4096 cells, 500 generations
 Initial alive: 1843
@@ -141,7 +141,7 @@ Verification passed: alive counts match.
 A Barnes-Hut gravity simulation that exercises the `SpatialIndex` trait with a quadtree — a fundamentally different spatial structure from the uniform grid used in boids.
 
 ```
-$ cargo run -p minkowski --example nbody --release
+$ cargo run -p minkowski-examples --example nbody --release
 
 N-body: 2000 entities, 1000 frames, theta=0.50
 frame 0000 | entities:  2000 | dt: 4.2ms
