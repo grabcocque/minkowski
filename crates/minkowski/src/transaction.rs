@@ -113,7 +113,12 @@ impl TransactionStrategy for Optimistic {
     type Tx<'s> = OptimisticTx;
 
     fn begin(&mut self, world: &mut World, access: &Access) -> OptimisticTx {
-        let read_ticks = world.snapshot_column_ticks(access.reads());
+        // Snapshot ticks for ALL accessed columns (reads + writes).
+        // If another transaction modifies a column we read OR write,
+        // our computed values may be stale (read-modify-write pattern).
+        let mut accessed = access.reads().clone();
+        accessed.union_with(access.writes());
+        let read_ticks = world.snapshot_column_ticks(&accessed);
         OptimisticTx {
             read_ticks,
             changeset: EnumChangeSet::new(),
