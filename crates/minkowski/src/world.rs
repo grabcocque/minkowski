@@ -90,7 +90,12 @@ impl World {
     /// Allocate a fresh entity ID without placing it in any archetype.
     /// Use this to obtain an unplaced handle for `EnumChangeSet::spawn_bundle`.
     pub fn alloc_entity(&mut self) -> Entity {
-        self.entities.alloc()
+        let entity = self.entities.alloc();
+        let index = entity.index() as usize;
+        if index >= self.entity_locations.len() {
+            self.entity_locations.resize(index + 1, None);
+        }
+        entity
     }
 
     /// Returns true if the entity has been placed in an archetype (has a row).
@@ -1000,5 +1005,15 @@ mod tests {
         // Allocated but not yet placed in any archetype
         assert!(world.is_alive(e)); // allocator considers it alive
         assert!(!world.is_placed(e)); // but no archetype row yet
+    }
+
+    #[test]
+    fn alloc_entity_safe_with_get_and_despawn() {
+        let mut world = World::new();
+        let e = world.alloc_entity();
+        // These must not panic — entity_locations slot exists (set to None).
+        assert_eq!(world.get::<Pos>(e), None);
+        assert_eq!(world.get_mut::<Pos>(e), None);
+        assert!(!world.despawn(e));
     }
 }
