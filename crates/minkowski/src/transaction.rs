@@ -4,6 +4,7 @@ use crate::access::Access;
 use crate::changeset::EnumChangeSet;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
+use crate::lock_table::ColumnLockSet;
 use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::world::World;
@@ -156,6 +157,88 @@ impl<'w> OptimisticTx<'w> {
     }
 }
 
+// ── Pessimistic ─────────────────────────────────────────────────────
+
+/// Pessimistic transaction strategy. Acquires cooperative column locks
+/// at begin. Reads and writes are guaranteed conflict-free. Commit
+/// always succeeds.
+///
+/// Best for write-heavy workloads or expensive computations where
+/// optimistic retry would waste work.
+pub struct Pessimistic;
+
+impl TransactionStrategy for Pessimistic {
+    type Tx<'w> = PessimisticTx<'w>;
+
+    fn begin<'w>(&mut self, world: &'w mut World, access: &Access) -> PessimisticTx<'w> {
+        let locks = world
+            .lock_table
+            .acquire(
+                &world.archetypes.archetypes,
+                access.reads(),
+                access.writes(),
+            )
+            .expect("pessimistic begin: lock acquisition failed (held by another transaction)");
+        PessimisticTx {
+            world,
+            locks: Some(locks),
+            changeset: EnumChangeSet::new(),
+        }
+    }
+}
+
+/// Transaction object for the [`Pessimistic`] strategy.
+///
+/// Column locks are held for the transaction's lifetime. Reads go
+/// through World (protected by shared locks). Writes buffer into
+/// an `EnumChangeSet`. Commit applies the changeset and releases locks.
+///
+/// Drop without commit releases locks and discards the changeset (abort).
+pub struct PessimisticTx<'w> {
+    world: &'w mut World,
+    locks: Option<ColumnLockSet>,
+    changeset: EnumChangeSet,
+}
+
+impl<'w> PessimisticTx<'w> {
+    pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
+        self.world.query::<Q>()
+    }
+
+    pub fn insert<T: Component>(&mut self, entity: Entity, value: T) {
+        self.changeset.insert::<T>(self.world, entity, value);
+    }
+
+    pub fn remove<T: Component>(&mut self, entity: Entity) {
+        self.changeset.remove::<T>(self.world, entity);
+    }
+
+    pub fn spawn<B: crate::bundle::Bundle>(&mut self, bundle: B) -> Entity {
+        let entity = self.world.alloc_entity();
+        self.changeset.spawn_bundle(self.world, entity, bundle);
+        entity
+    }
+
+    /// Commit the transaction. Always succeeds (locks guarantee isolation).
+    /// Applies the buffered changeset and releases locks.
+    pub fn commit(mut self) -> Result<EnumChangeSet, Conflict> {
+        let changeset = std::mem::take(&mut self.changeset);
+        let reverse = changeset.apply(self.world);
+        if let Some(locks) = self.locks.take() {
+            self.world.lock_table.release(locks);
+        }
+        Ok(reverse)
+    }
+}
+
+impl<'w> Drop for PessimisticTx<'w> {
+    fn drop(&mut self) {
+        if let Some(locks) = self.locks.take() {
+            self.world.lock_table.release(locks);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +384,62 @@ mod tests {
         let result = tx.commit();
         assert!(result.is_ok());
         assert!(world.get::<Pos>(e).is_some());
+    }
+
+    #[test]
+    fn pessimistic_commit_always_succeeds() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
+
+        let mut strategy = Pessimistic;
+        let mut tx = strategy.begin(&mut world, &access);
+        let _ = tx.query::<(&Pos,)>().count();
+        tx.insert::<Vel>(e, Vel(99.0));
+        assert!(tx.commit().is_ok());
+    }
+
+    #[test]
+    fn pessimistic_buffered_writes_applied_at_commit() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let mut strategy = Pessimistic;
+        let mut tx = strategy.begin(&mut world, &access);
+        tx.insert::<Pos>(e, Pos(42.0));
+        let pos = tx.query::<(&Pos,)>().next().unwrap();
+        assert_eq!(pos.0 .0, 1.0);
+        let _ = tx.commit();
+        let pos = world.query::<(&Pos,)>().next().unwrap();
+        assert_eq!(pos.0 .0, 42.0);
+    }
+
+    #[test]
+    fn pessimistic_drop_releases_locks() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let mut strategy = Pessimistic;
+        {
+            let _tx = strategy.begin(&mut world, &access);
+        }
+        // Locks released — can begin another transaction
+        let tx2 = strategy.begin(&mut world, &access);
+        let _ = tx2.commit();
+    }
+
+    #[test]
+    fn pessimistic_spawn_visible_after_commit() {
+        let mut world = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+
+        let mut strategy = Pessimistic;
+        let mut tx = strategy.begin(&mut world, &access);
+        let e = tx.spawn((Pos(77.0),));
+        let _ = tx.commit();
+        assert!(world.get::<Pos>(e).is_some());
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 77.0);
     }
 }

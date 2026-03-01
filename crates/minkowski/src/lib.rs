@@ -31,6 +31,7 @@ pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
 pub use query::fetch::Changed;
 pub use transaction::{
-    Conflict, Optimistic, OptimisticTx, Sequential, SequentialTx, TransactionStrategy,
+    Conflict, Optimistic, OptimisticTx, Pessimistic, PessimisticTx, Sequential, SequentialTx,
+    TransactionStrategy,
 };
 pub use world::World;
