@@ -145,7 +145,7 @@ fn run_frame_optimistic(
     let frame_start = Instant::now();
 
     // 1. Begin phase (sequential -- needs &mut World).
-    let strategy = Optimistic::new();
+    let strategy = Optimistic::new(world);
     let mut tx_combat = strategy.begin(world, combat_access);
     let mut tx_healing = strategy.begin(world, healing_access);
 
@@ -223,7 +223,7 @@ fn run_frame_pessimistic(
 
     // Single strategy instance — both transactions share the same lock table,
     // so conflicting locks are correctly detected across concurrent systems.
-    let strategy = Pessimistic::new();
+    let strategy = Pessimistic::new(world);
 
     // 1. Begin phase (sequential).
     let mut tx_combat = strategy.begin(world, combat_access);
