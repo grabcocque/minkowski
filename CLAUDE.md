@@ -15,9 +15,9 @@ cargo fmt --all                                          # Format
 cargo bench -p minkowski               # All criterion benchmarks
 cargo bench -p minkowski -- spawn      # Single benchmark
 
-cargo run -p minkowski --example boids --release   # Boids simulation (5K entities, 1K frames)
-cargo run -p minkowski --example life --release    # Game of Life with undo (64x64 grid, 500 gens)
-cargo run -p minkowski --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
+cargo run -p minkowski-examples --example boids --release   # Boids simulation (5K entities, 1K frames)
+cargo run -p minkowski-examples --example life --release    # Game of Life with undo + derive(Table) (64x64 grid, 500 gens)
+cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -42,7 +42,7 @@ Sequential chain: fmt failure skips all downstream jobs. A `ci-pass` aggregator 
 
 ## Architecture
 
-Minkowski is a **column-oriented archetype ECS**. Two crates: `minkowski` (core) and `minkowski-derive` (`#[derive(Table)]` proc macro).
+Minkowski is a **column-oriented archetype ECS**. Three crates: `minkowski` (core), `minkowski-derive` (`#[derive(Table)]` proc macro), and `minkowski-examples` (examples as external API consumers).
 
 ### Storage Model
 
@@ -100,7 +100,7 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `ComponentRegistry`, `EntityAllocator`, `QueryCacheEntry`, `Tick`).
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ComponentId`, `SpatialIndex`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
@@ -116,4 +116,4 @@ Each BlobVec column stores a `changed_tick: Tick` — the tick at which it was l
 | `minkowski-derive` | `#[derive(Table)]` proc macro (syn/quote/proc-macro2) |
 | `criterion` (dev) | Benchmark harness |
 | `hecs` (dev) | Benchmark comparison target |
-| `fastrand` (dev) | Boids example RNG |
+| `fastrand` (examples) | Example RNG |
