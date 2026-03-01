@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - run: cargo test -p minkowski
+
+  miri:
+    name: Miri
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly
+      - name: Miri tests (skip par_for_each)
+        run: cargo +nightly miri test -p minkowski --lib -- --skip par_for_each
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows"
+      - name: Miri par_for_each (ignore leaks)
+        run: cargo +nightly miri test -p minkowski --lib par_for_each
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
+
+  # Aggregator job — the single required status check for branch protection.
+  # Runs even when upstream jobs are skipped/failed and explicitly checks
+  # that every dependency succeeded, avoiding the GitHub "skipped = passed"
+  # loophole with required checks on chained jobs.
+  ci-pass:
+    name: CI
+    needs: [fmt, clippy, test, miri]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any dependency did not succeed
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ||
+                "${{ needs.clippy.result }}" != "success" ||
+                "${{ needs.test.result }}" != "success" ||
+                "${{ needs.miri.result }}" != "success" ]]; then
+            echo "One or more CI jobs failed or were skipped."
+            echo "  fmt:    ${{ needs.fmt.result }}"
+            echo "  clippy: ${{ needs.clippy.result }}"
+            echo "  test:   ${{ needs.test.result }}"
+            echo "  miri:   ${{ needs.miri.result }}"
+            exit 1
+          fi
