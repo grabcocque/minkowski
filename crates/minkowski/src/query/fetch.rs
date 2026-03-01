@@ -53,6 +53,11 @@ pub unsafe trait WorldQuery {
     /// `len` must equal the archetype length. Caller must ensure no aliasing violations.
     unsafe fn as_slice<'w>(fetch: &Self::Fetch<'w>, len: usize) -> Self::Slice<'w>;
 
+    /// Register all component types referenced by this query.
+    /// Called by `Access::of` to ensure components have stable IDs before
+    /// `required_ids` / `mutable_ids` are queried.
+    fn register(_registry: &mut ComponentRegistry) {}
+
     /// Returns ComponentIds that this query accesses mutably.
     /// Used by change detection to mark columns as changed before iteration.
     fn mutable_ids(_registry: &ComponentRegistry) -> FixedBitSet {
@@ -75,6 +80,10 @@ unsafe impl<T: Component> WorldQuery for &T {
     type Item<'w> = &'w T;
     type Fetch<'w> = ThinSlicePtr<T>;
     type Slice<'w> = &'w [T];
+
+    fn register(registry: &mut ComponentRegistry) {
+        registry.register::<T>();
+    }
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
         let mut bits = FixedBitSet::new();
@@ -109,6 +118,10 @@ unsafe impl<T: Component> WorldQuery for &mut T {
     type Item<'w> = &'w mut T;
     type Fetch<'w> = ThinSlicePtr<T>;
     type Slice<'w> = &'w mut [T];
+
+    fn register(registry: &mut ComponentRegistry) {
+        registry.register::<T>();
+    }
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
         <&T>::required_ids(registry)
@@ -160,6 +173,10 @@ unsafe impl<T: Component> WorldQuery for Option<&T> {
     type Fetch<'w> = Option<ThinSlicePtr<T>>;
     type Slice<'w> = Option<&'w [T]>;
 
+    fn register(registry: &mut ComponentRegistry) {
+        registry.register::<T>();
+    }
+
     fn required_ids(_registry: &ComponentRegistry) -> FixedBitSet {
         FixedBitSet::new() // optional — does not filter archetypes
     }
@@ -191,6 +208,10 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
     type Item<'w> = ();
     type Fetch<'w> = ();
     type Slice<'w> = ();
+
+    fn register(registry: &mut ComponentRegistry) {
+        registry.register::<T>();
+    }
 
     fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
         <&T>::required_ids(registry)
@@ -229,6 +250,10 @@ macro_rules! impl_world_query_tuple {
             type Item<'w> = ($($name::Item<'w>,)*);
             type Fetch<'w> = ($($name::Fetch<'w>,)*);
             type Slice<'w> = ($($name::Slice<'w>,)*);
+
+            fn register(registry: &mut ComponentRegistry) {
+                $($name::register(registry);)*
+            }
 
             fn required_ids(registry: &ComponentRegistry) -> FixedBitSet {
                 let mut bits = FixedBitSet::new();
