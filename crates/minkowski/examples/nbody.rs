@@ -229,8 +229,26 @@ impl BarnesHutTree {
         );
 
         if depth >= MAX_DEPTH {
-            // At max depth, just overwrite — handles coincident positions
-            self.nodes[node_idx].entity = Some((entity, clamped, mass));
+            // At max depth, accumulate mass and center of mass directly
+            // instead of subdividing further. This handles coincident or
+            // near-coincident positions without losing any bodies.
+            let node = &mut self.nodes[node_idx];
+            let ws = self.world_size;
+            if node.total_mass > 0.0 {
+                // Weighted merge using wrapped offset from existing center
+                let offset = wrapped_offset(clamped, node.center_of_mass, ws);
+                let new_mass = node.total_mass + mass;
+                let shift = offset * (mass / new_mass);
+                node.center_of_mass.x = (node.center_of_mass.x + shift.x).rem_euclid(ws);
+                node.center_of_mass.y = (node.center_of_mass.y + shift.y).rem_euclid(ws);
+                node.total_mass = new_mass;
+            } else {
+                node.center_of_mass = clamped;
+                node.total_mass = mass;
+            }
+            // Clear entity — this node is now an aggregate bucket, not a
+            // single-entity leaf. compute_force will use total_mass/center_of_mass.
+            node.entity = None;
             return;
         }
 
@@ -324,18 +342,19 @@ impl BarnesHutTree {
             return Vec2::ZERO;
         }
 
-        if let Some((_, leaf_pos, leaf_mass)) = node.entity {
-            if node.children.is_none() {
-                // Leaf node — compute direct force using minimum-image distance
-                let diff = wrapped_offset(leaf_pos, pos, ws);
-                let dist_sq = diff.length_sq();
-                if dist_sq < 1e-6 {
-                    // Same entity or coincident — skip
-                    return Vec2::ZERO;
-                }
-                let force_mag = G * mass * leaf_mass / (dist_sq + SOFTENING * SOFTENING);
-                return diff.normalized() * force_mag;
+        if node.children.is_none() {
+            // Leaf or max-depth aggregate bucket — use center_of_mass/total_mass
+            // directly. For single-entity leaves these equal the entity's
+            // position and mass (set during aggregate). For max-depth buckets
+            // they hold the accumulated values from all coincident bodies.
+            let diff = wrapped_offset(node.center_of_mass, pos, ws);
+            let dist_sq = diff.length_sq();
+            if dist_sq < 1e-6 {
+                // Same position (self-interaction or coincident) — skip
+                return Vec2::ZERO;
             }
+            let force_mag = G * mass * node.total_mass / (dist_sq + SOFTENING * SOFTENING);
+            return diff.normalized() * force_mag;
         }
 
         if let Some(children) = node.children {
