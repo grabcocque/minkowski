@@ -65,3 +65,27 @@ jobs:
         run: cargo +nightly miri test -p minkowski --lib par_for_each
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
+
+  # Aggregator job — the single required status check for branch protection.
+  # Runs even when upstream jobs are skipped/failed and explicitly checks
+  # that every dependency succeeded, avoiding the GitHub "skipped = passed"
+  # loophole with required checks on chained jobs.
+  ci-pass:
+    name: CI
+    needs: [fmt, clippy, test, miri]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any dependency did not succeed
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ||
+                "${{ needs.clippy.result }}" != "success" ||
+                "${{ needs.test.result }}" != "success" ||
+                "${{ needs.miri.result }}" != "success" ]]; then
+            echo "One or more CI jobs failed or were skipped."
+            echo "  fmt:    ${{ needs.fmt.result }}"
+            echo "  clippy: ${{ needs.clippy.result }}"
+            echo "  test:   ${{ needs.test.result }}"
+            echo "  miri:   ${{ needs.miri.result }}"
+            exit 1
+          fi

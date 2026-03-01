@@ -37,7 +37,7 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every PR and push t
 | test | stable | `cargo test -p minkowski` | clippy |
 | miri | nightly | Two-step Miri run (see Build & Test Commands) | test |
 
-Sequential chain: fmt failure skips all downstream jobs. The `miri` job is the required status check for branch protection (implicitly requires all upstream jobs).
+Sequential chain: fmt failure skips all downstream jobs. A `ci-pass` aggregator job (runs with `if: always()`) is the single required status check for branch protection — it explicitly verifies all four jobs succeeded, avoiding GitHub's "skipped = passed" loophole with chained `needs:`.
 
 ## Architecture
 
