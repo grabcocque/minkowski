@@ -53,8 +53,6 @@ pub struct World {
     pub(crate) table_cache: TableCache,
     pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
     pub(crate) current_tick: Tick,
-    #[allow(dead_code)]
-    pub(crate) lock_table: crate::lock_table::ColumnLockTable,
 }
 
 impl World {
@@ -68,7 +66,6 @@ impl World {
             table_cache: TableCache::new(),
             query_cache: HashMap::new(),
             current_tick: Tick::default(),
-            lock_table: crate::lock_table::ColumnLockTable::new(),
         }
     }
 
