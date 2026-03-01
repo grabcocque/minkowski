@@ -63,7 +63,7 @@ impl ColumnLockTable {
         reads: &FixedBitSet,
         writes: &FixedBitSet,
     ) -> Result<ColumnLockSet, LockConflict> {
-        // Build sorted list of (arch_id, comp_id, mode) for deterministic ordering
+        // Build sorted list of (arch_id, comp_id, mode) for deterministic ordering.
         let mut requests: Vec<(usize, ComponentId, LockMode)> = Vec::new();
         for arch in archetypes {
             for comp_id in reads.ones() {
@@ -78,7 +78,18 @@ impl ColumnLockTable {
             }
         }
         requests.sort_by_key(|&(a, c, _)| (a, c));
-        requests.dedup_by_key(|r| (r.0, r.1)); // write supersedes read on same column
+        // Merge duplicates, upgrading to Exclusive if either entry is Exclusive.
+        // A component in both reads and writes needs an exclusive lock.
+        requests.dedup_by(|next, kept| {
+            if (next.0, next.1) == (kept.0, kept.1) {
+                if matches!(next.2, LockMode::Exclusive) {
+                    kept.2 = LockMode::Exclusive;
+                }
+                true
+            } else {
+                false
+            }
+        });
 
         // Try to acquire all locks
         let mut acquired = Vec::new();
@@ -242,5 +253,37 @@ mod tests {
 
         table.release(vel_lock);
         table.release(pos_lock.unwrap());
+    }
+
+    #[test]
+    fn read_write_same_column_acquires_exclusive() {
+        // Regression: when a transaction both reads and writes the same column,
+        // the dedup must upgrade to Exclusive. A Shared lock would let a
+        // concurrent writer proceed and violate pessimistic isolation.
+        let (archs, pos_id, _) = setup();
+        let mut table = ColumnLockTable::new();
+
+        // Transaction 1: reads AND writes pos (e.g. Access::of::<(&Pos, &mut Pos)>)
+        let mut reads = FixedBitSet::with_capacity(pos_id + 1);
+        reads.insert(pos_id);
+        let mut writes = FixedBitSet::with_capacity(pos_id + 1);
+        writes.insert(pos_id);
+        let lock1 = table.acquire(&archs, &reads, &writes).unwrap();
+
+        // Transaction 2: tries to write pos — must be blocked
+        let empty = FixedBitSet::new();
+        let lock2 = table.acquire(&archs, &empty, &writes);
+        assert!(lock2.is_err(), "concurrent writer must be blocked");
+
+        // Transaction 3: tries to read pos — must also be blocked (exclusive held)
+        let lock3 = table.acquire(&archs, &reads, &empty);
+        assert!(lock3.is_err(), "concurrent reader must be blocked");
+
+        table.release(lock1);
+
+        // After release, both should succeed
+        let lock4 = table.acquire(&archs, &empty, &writes);
+        assert!(lock4.is_ok());
+        table.release(lock4.unwrap());
     }
 }
