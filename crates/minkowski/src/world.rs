@@ -631,7 +631,9 @@ impl World {
     /// Skips empty archetypes. Does not apply Changed<T> filters (transactions
     /// have their own tick-based conflict model).
     #[allow(dead_code)]
-    pub(crate) fn query_raw<Q: WorldQuery + 'static>(&self) -> QueryIter<'_, Q> {
+    pub(crate) fn query_raw<Q: crate::query::fetch::ReadOnlyWorldQuery + 'static>(
+        &self,
+    ) -> QueryIter<'_, Q> {
         let required = Q::required_ids(&self.components);
         let fetches: Vec<_> = self
             .archetypes

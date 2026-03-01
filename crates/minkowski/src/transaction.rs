@@ -5,7 +5,7 @@ use crate::changeset::EnumChangeSet;
 use crate::component::Component;
 use crate::entity::Entity;
 use crate::lock_table::{ColumnLockSet, ColumnLockTable};
-use crate::query::fetch::WorldQuery;
+use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
 use crate::query::iter::QueryIter;
 use crate::world::World;
 
@@ -141,7 +141,10 @@ pub struct OptimisticTx {
 impl OptimisticTx {
     /// Read through the transaction via shared World reference.
     /// No tick advancement, no cache mutation. Safe for concurrent reads.
-    pub fn query<'a, Q: WorldQuery + 'static>(&self, world: &'a World) -> QueryIter<'a, Q> {
+    ///
+    /// Requires `ReadOnlyWorldQuery` — `&mut T` queries are rejected at
+    /// compile time. Writes go through `insert`/`remove`/`spawn` instead.
+    pub fn query<'a, Q: ReadOnlyWorldQuery + 'static>(&self, world: &'a World) -> QueryIter<'a, Q> {
         world.query_raw::<Q>()
     }
 
@@ -235,7 +238,10 @@ pub struct PessimisticTx<'s> {
 
 impl<'s> PessimisticTx<'s> {
     /// Read through the transaction via shared World reference.
-    pub fn query<'a, Q: WorldQuery + 'static>(&self, world: &'a World) -> QueryIter<'a, Q> {
+    ///
+    /// Requires `ReadOnlyWorldQuery` — `&mut T` queries are rejected at
+    /// compile time. Writes go through `insert`/`remove`/`spawn` instead.
+    pub fn query<'a, Q: ReadOnlyWorldQuery + 'static>(&self, world: &'a World) -> QueryIter<'a, Q> {
         world.query_raw::<Q>()
     }
 
