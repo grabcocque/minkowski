@@ -99,6 +99,29 @@ impl std::ops::Div<f32> for Vec2 {
     }
 }
 
+// ── Toroidal helpers ─────────────────────────────────────────────────
+
+/// Minimum-image signed difference on a toroidal domain of size `world_size`.
+/// Returns the shortest path from `b` to `a` wrapping at boundaries.
+fn wrapped_diff(a: f32, b: f32, world_size: f32) -> f32 {
+    let d = a - b;
+    if d > world_size * 0.5 {
+        d - world_size
+    } else if d < -world_size * 0.5 {
+        d + world_size
+    } else {
+        d
+    }
+}
+
+/// Minimum-image vector from `from` to `to` on a toroidal world.
+fn wrapped_offset(to: Vec2, from: Vec2, world_size: f32) -> Vec2 {
+    Vec2::new(
+        wrapped_diff(to.x, from.x, world_size),
+        wrapped_diff(to.y, from.y, world_size),
+    )
+}
+
 // ── Rect (axis-aligned bounding box) ────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -174,16 +197,18 @@ struct BarnesHutTree {
     nodes: Vec<QuadNode>,
     bounds: Rect,
     theta: f32,
+    world_size: f32,
 }
 
 const MAX_DEPTH: usize = 20;
 
 impl BarnesHutTree {
-    fn new(bounds: Rect, theta: f32) -> Self {
+    fn new(bounds: Rect, theta: f32, world_size: f32) -> Self {
         Self {
             nodes: vec![QuadNode::new(bounds)],
             bounds,
             theta,
+            world_size,
         }
     }
 
@@ -244,25 +269,44 @@ impl BarnesHutTree {
     }
 
     fn aggregate(&mut self, node_idx: usize) {
+        let ws = self.world_size;
+
         if let Some(children) = self.nodes[node_idx].children {
             // Internal node — recurse into children first
             for &child_idx in &children {
                 self.aggregate(child_idx);
             }
 
+            // Compute center of mass using a reference-point technique to
+            // handle toroidal wrapping. Pick the first non-empty child's
+            // center as the reference, compute wrapped offsets from it,
+            // average, then shift back.
             let mut total_mass = 0.0f32;
-            let mut weighted_pos = Vec2::ZERO;
+            let mut ref_pos = Vec2::ZERO;
+            let mut have_ref = false;
+            let mut weighted_offset = Vec2::ZERO;
+
             for &child_idx in &children {
                 let child = &self.nodes[child_idx];
                 if child.total_mass > 0.0 {
-                    weighted_pos += child.center_of_mass * child.total_mass;
+                    if !have_ref {
+                        ref_pos = child.center_of_mass;
+                        have_ref = true;
+                    }
+                    let offset = wrapped_offset(child.center_of_mass, ref_pos, ws);
+                    weighted_offset += offset * child.total_mass;
                     total_mass += child.total_mass;
                 }
             }
 
             self.nodes[node_idx].total_mass = total_mass;
             if total_mass > 0.0 {
-                self.nodes[node_idx].center_of_mass = weighted_pos / total_mass;
+                let avg_offset = weighted_offset / total_mass;
+                let mut com = ref_pos + avg_offset;
+                // Re-wrap into [0, world_size)
+                com.x = com.x.rem_euclid(ws);
+                com.y = com.y.rem_euclid(ws);
+                self.nodes[node_idx].center_of_mass = com;
             }
         } else if let Some((_, pos, mass)) = self.nodes[node_idx].entity {
             // Leaf with entity
@@ -274,6 +318,7 @@ impl BarnesHutTree {
 
     fn compute_force(&self, pos: Vec2, mass: f32, node_idx: usize) -> Vec2 {
         let node = &self.nodes[node_idx];
+        let ws = self.world_size;
 
         if node.total_mass <= 0.0 {
             return Vec2::ZERO;
@@ -281,8 +326,8 @@ impl BarnesHutTree {
 
         if let Some((_, leaf_pos, leaf_mass)) = node.entity {
             if node.children.is_none() {
-                // Leaf node — compute direct force
-                let diff = leaf_pos - pos;
+                // Leaf node — compute direct force using minimum-image distance
+                let diff = wrapped_offset(leaf_pos, pos, ws);
                 let dist_sq = diff.length_sq();
                 if dist_sq < 1e-6 {
                     // Same entity or coincident — skip
@@ -294,9 +339,9 @@ impl BarnesHutTree {
         }
 
         if let Some(children) = node.children {
-            // Internal node — check Barnes-Hut criterion
+            // Internal node — check Barnes-Hut criterion using wrapped distance
             let s = node.bounds.w.max(node.bounds.h);
-            let diff = node.center_of_mass - pos;
+            let diff = wrapped_offset(node.center_of_mass, pos, ws);
             let d = diff.length();
 
             if d > 0.0 && s / d < self.theta {
@@ -410,7 +455,7 @@ fn main() {
     }
 
     let initial_bounds = Rect::new(0.0, 0.0, WORLD_SIZE, WORLD_SIZE);
-    let mut tree = BarnesHutTree::new(initial_bounds, THETA);
+    let mut tree = BarnesHutTree::new(initial_bounds, THETA, WORLD_SIZE);
 
     for frame in 0..FRAME_COUNT {
         let frame_start = Instant::now();
