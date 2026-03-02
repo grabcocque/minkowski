@@ -124,6 +124,7 @@ struct SnapshotData {
     schema: Vec<ComponentSchema>,
     allocator: AllocatorState,
     archetypes: Vec<ArchetypeData>,
+    sparse: Vec<SparseComponentData>,
 }
 
 struct ComponentSchema {
@@ -148,18 +149,27 @@ struct ColumnData {
     component_id: ComponentId,
     values: Vec<Vec<u8>>,  // one encoded blob per row
 }
+
+/// Sparse components live in HashMap<Entity, T>, not archetype columns.
+/// Without this section, they silently vanish on save and restore.
+struct SparseComponentData {
+    component_id: ComponentId,
+    entries: Vec<(u64, Vec<u8>)>,  // (entity_raw, serialized_value)
+}
 ```
 
 Recovery: `Snapshot::load(path, codecs)` → `Wal::replay_from(header.wal_seq, &mut world, codecs)`.
 
 ### Core changes
 
-Minimal. `query_raw` already provides the component data read path. Two small additions:
+Minimal. `query_raw` already provides the component data read path for archetype columns. Small additions:
 
 1. **`World::entity_allocator_state(&self)`** — returns a read-only view of generations vec and free list for snapshot serialization.
 2. **`World::archetype_layouts(&self)`** — returns iterator over archetype metadata (component IDs, entity list, column count) for snapshot structure. Or expose through existing `query_raw` machinery if sufficient.
+3. **`World::sparse_component_ids(&self)`** — returns which ComponentIds are sparse-registered. The persist crate needs this to know which codecs to use for the sparse section.
+4. **`World::read_sparse<T: Component>(&self, comp_id) -> impl Iterator<Item = (Entity, &T)>`** — typed read-only iteration over a sparse component's HashMap. The CodecRegistry knows the concrete type (it was registered with `register::<T>()`), so it can call this accessor with the right type parameter.
 
-Both are `&self` methods — pure reads, no mutation. These may already be reachable through `pub(crate)` fields; if so, the persist crate can use them through a small accessor rather than making internals `pub`.
+All are `&self` methods — pure reads, no mutation.
 
 ### What the persist crate does NOT do
 
@@ -189,5 +199,8 @@ The reverse changeset from `commit()` is the natural WAL entry — it captures e
 - WAL replay: create world, apply N changesets via WAL, verify final state
 - Snapshot round-trip: save world → load into new world → compare
 - Recovery: snapshot at seq N → append more WAL entries → recover → verify
+- Sparse round-trip: world with sparse components → snapshot → restore → verify sparse data present
+- Mixed archetype + sparse: world with both dense and sparse components → full round-trip
 - Missing codec: attempt to serialize unregistered component → error
+- Missing sparse codec: sparse component without codec → error (not silent skip)
 - Empty world: snapshot/restore of empty world
