@@ -32,6 +32,6 @@ pub use minkowski_derive::Table;
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use transaction::{
     Conflict, Optimistic, OptimisticTx, Pessimistic, PessimisticTx, Sequential, SequentialTx,
-    TransactionStrategy,
+    Transact, TransactionStrategy,
 };
 pub use world::World;

@@ -77,6 +77,7 @@ use crate::world::{World, WorldId};
 pub type TxId = u64;
 
 /// Conflict information returned when a transaction commit fails.
+#[derive(Debug)]
 pub struct Conflict {
     /// Which component columns had conflicting concurrent modifications.
     pub component_ids: FixedBitSet,
@@ -87,8 +88,32 @@ pub struct Conflict {
 /// Strategy-specific teardown logic invoked when a [`Tx`] is dropped
 /// without committing (abort path). Strategies implement this to release
 /// resources they acquired at begin time (e.g. column locks).
+///
+/// Also provides extraction methods for strategy-specific validation state
+/// so that [`Transact::try_commit`] can access it without `Any` downcasting
+/// (which would require `'static` and conflict with borrowed cleanup types).
 pub(crate) trait TxCleanup {
     fn abort(&mut self);
+
+    /// Extract the read tick snapshot (optimistic validation).
+    /// Only `OptimisticCleanup` overrides this; others return `None`.
+    fn take_read_ticks(
+        &mut self,
+    ) -> Option<Vec<(usize, crate::component::ComponentId, crate::tick::Tick)>> {
+        None
+    }
+
+    /// Extract acquired column locks (pessimistic commit).
+    /// Only `PessimisticCleanup` overrides this; others return `None`.
+    fn take_locks(&mut self) -> Option<ColumnLockSet> {
+        None
+    }
+
+    /// Check whether locks were acquired without consuming them.
+    /// Only `PessimisticCleanup` overrides this; others return `false`.
+    fn has_locks(&self) -> bool {
+        false
+    }
 }
 
 /// No-op cleanup for strategies that have nothing to release on abort.
@@ -97,6 +122,49 @@ pub(crate) struct NoopCleanup;
 
 impl TxCleanup for NoopCleanup {
     fn abort(&mut self) {}
+}
+
+/// Cleanup for [`Optimistic`] transactions via the [`Transact`] trait.
+/// Stores the read tick snapshot captured at begin time. Abort is a no-op
+/// (no locks to release). `take_read_ticks` extracts the snapshot for
+/// validation at commit time.
+pub(crate) struct OptimisticCleanup {
+    read_ticks: Option<Vec<(usize, crate::component::ComponentId, crate::tick::Tick)>>,
+}
+
+impl TxCleanup for OptimisticCleanup {
+    fn abort(&mut self) {}
+
+    fn take_read_ticks(
+        &mut self,
+    ) -> Option<Vec<(usize, crate::component::ComponentId, crate::tick::Tick)>> {
+        self.read_ticks.take()
+    }
+}
+
+/// Cleanup for [`Pessimistic`] transactions via the [`Transact`] trait.
+/// Stores acquired column locks and a reference to the lock table.
+/// Abort releases locks back to the table. `take_locks` extracts
+/// the lock set for the commit path.
+pub(crate) struct PessimisticCleanup<'a> {
+    locks: Option<ColumnLockSet>,
+    lock_table: &'a Mutex<ColumnLockTable>,
+}
+
+impl TxCleanup for PessimisticCleanup<'_> {
+    fn abort(&mut self) {
+        if let Some(locks) = self.locks.take() {
+            self.lock_table.lock().release(locks);
+        }
+    }
+
+    fn take_locks(&mut self) -> Option<ColumnLockSet> {
+        self.locks.take()
+    }
+
+    fn has_locks(&self) -> bool {
+        self.locks.is_some()
+    }
 }
 
 /// Unified transaction object. Holds a buffered changeset and tracks
@@ -309,14 +377,20 @@ pub struct Optimistic {
     world_id: WorldId,
     next_tx_id: AtomicU64,
     orphan_queue: crate::world::OrphanQueue,
+    max_retries: usize,
 }
 
 impl Optimistic {
     pub fn new(world: &World) -> Self {
+        Self::with_retries(world, 3)
+    }
+
+    pub fn with_retries(world: &World, max_retries: usize) -> Self {
         Self {
             world_id: world.world_id(),
             next_tx_id: AtomicU64::new(1),
             orphan_queue: world.orphan_queue(),
+            max_retries,
         }
     }
 }
@@ -447,15 +521,21 @@ pub struct Pessimistic {
     lock_table: Mutex<ColumnLockTable>,
     next_tx_id: AtomicU64,
     orphan_queue: crate::world::OrphanQueue,
+    max_retries: usize,
 }
 
 impl Pessimistic {
     pub fn new(world: &World) -> Self {
+        Self::with_retries(world, 64)
+    }
+
+    pub fn with_retries(world: &World, max_retries: usize) -> Self {
         Self {
             world_id: world.world_id(),
             lock_table: Mutex::new(ColumnLockTable::new()),
             next_tx_id: AtomicU64::new(1),
             orphan_queue: world.orphan_queue(),
+            max_retries,
         }
     }
 }
@@ -583,6 +663,228 @@ impl<'s> Drop for PessimisticTx<'s> {
     }
 }
 
+// ── Transact (closure-based API) ─────────────────────────────────
+
+/// Exponential backoff for retry loops. Spin-waits for small attempt
+/// counts, yields the thread for larger ones.
+fn backoff(attempt: usize) {
+    if attempt < 6 {
+        for _ in 0..(4 << attempt) {
+            std::hint::spin_loop();
+        }
+    } else {
+        std::thread::yield_now();
+    }
+}
+
+/// Closure-based transaction API. Wraps the begin/execute/commit cycle
+/// in a retry loop, handling abort cleanup automatically.
+///
+/// Strategies implement [`begin`](Transact::begin) (setup) and
+/// [`try_commit`](Transact::try_commit) (validate + extract changeset).
+/// The default [`transact`](Transact::transact) method runs the closure
+/// in a retry loop, applying the changeset on success.
+///
+/// # Example
+///
+/// ```ignore
+/// let strategy = Optimistic::new(&world);
+/// let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
+/// strategy.transact(&mut world, &access, |tx, world| {
+///     for (pos,) in tx.query::<(&Pos,)>(world) {
+///         // read ...
+///     }
+///     tx.write::<Vel>(world, entity, Vel(1.0));
+/// }).unwrap();
+/// ```
+pub trait Transact {
+    /// Run a closure inside a transaction, retrying on conflict up to
+    /// [`max_retries`](Transact::max_retries) times.
+    ///
+    /// On success: drops the transaction (committed), applies the forward
+    /// changeset to the world, and returns `Ok(value)`.
+    /// On conflict: drops the transaction (abort cleanup runs), retries.
+    /// After exhausting retries: returns `Err(Conflict)`.
+    fn transact<R>(
+        &self,
+        world: &mut World,
+        access: &Access,
+        f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
+    ) -> Result<R, Conflict> {
+        self.transact_inner(world, access, f)
+    }
+
+    /// Default retry loop. Strategies that need custom behavior between
+    /// retries (e.g. backoff) override [`transact`](Transact::transact) instead.
+    fn transact_inner<R>(
+        &self,
+        world: &mut World,
+        access: &Access,
+        mut f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
+    ) -> Result<R, Conflict> {
+        for _ in 0..self.max_retries() {
+            let mut tx = self.begin(world, access);
+            let value = f(&mut tx, world);
+            match self.try_commit(&mut tx, world) {
+                Ok(forward) => {
+                    tx.mark_committed();
+                    drop(tx);
+                    forward.apply(world);
+                    return Ok(value);
+                }
+                Err(_) => {
+                    drop(tx);
+                    continue;
+                }
+            }
+        }
+        Err(Conflict {
+            component_ids: FixedBitSet::new(),
+        })
+    }
+
+    /// Begin a transaction. Snapshots ticks (optimistic) or acquires
+    /// locks (pessimistic). Returns a [`Tx`] with strategy-specific cleanup.
+    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_>;
+
+    /// Validate and extract the changeset. Does NOT apply it — the caller
+    /// (typically the default `transact` impl) applies the returned
+    /// changeset after dropping the `Tx`.
+    ///
+    /// On success: returns the forward changeset (marks the tx for commit
+    /// is the caller's responsibility via `tx.mark_committed()`).
+    /// On failure: returns `Err(Conflict)`. The tx will abort on drop.
+    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict>;
+
+    /// Maximum number of retry attempts before returning `Err(Conflict)`.
+    fn max_retries(&self) -> usize;
+}
+
+impl Transact for Optimistic {
+    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {
+        assert_eq!(
+            self.world_id,
+            world.world_id(),
+            "strategy used with a different World than it was created from"
+        );
+        let mut accessed = access.reads().clone();
+        accessed.union_with(access.writes());
+        let read_ticks = world.snapshot_column_ticks(&accessed);
+        let archetype_count = world.archetypes.archetypes.len();
+        Tx::new(
+            archetype_count,
+            self.orphan_queue.clone(),
+            Box::new(OptimisticCleanup {
+                read_ticks: Some(read_ticks),
+            }),
+        )
+    }
+
+    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+        assert_eq!(
+            self.world_id,
+            world.world_id(),
+            "strategy used with a different World than it was created from"
+        );
+        let read_ticks = tx
+            .cleanup
+            .take_read_ticks()
+            .expect("OptimisticCleanup missing read_ticks");
+        let conflicts = world.check_column_conflicts(&read_ticks);
+        if !conflicts.is_empty() {
+            return Err(Conflict {
+                component_ids: conflicts,
+            });
+        }
+        Ok(tx.take_changeset())
+    }
+
+    fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+}
+
+impl Transact for Pessimistic {
+    fn transact<R>(
+        &self,
+        world: &mut World,
+        access: &Access,
+        mut f: impl FnMut(&mut Tx<'_>, &mut World) -> R,
+    ) -> Result<R, Conflict> {
+        for attempt in 0..self.max_retries() {
+            let mut tx = Transact::begin(self, world, access);
+            if !tx.cleanup.has_locks() {
+                // Lock acquisition failed — abort and retry with backoff
+                drop(tx);
+                backoff(attempt);
+                continue;
+            }
+            let value = f(&mut tx, world);
+            match self.try_commit(&mut tx, world) {
+                Ok(forward) => {
+                    tx.mark_committed();
+                    drop(tx);
+                    forward.apply(world);
+                    return Ok(value);
+                }
+                Err(_) => {
+                    drop(tx);
+                    backoff(attempt);
+                    continue;
+                }
+            }
+        }
+        Err(Conflict {
+            component_ids: FixedBitSet::new(),
+        })
+    }
+
+    fn begin(&self, world: &mut World, access: &Access) -> Tx<'_> {
+        assert_eq!(
+            self.world_id,
+            world.world_id(),
+            "strategy used with a different World than it was created from"
+        );
+        let lock_result = self.lock_table.lock().acquire(
+            &world.archetypes.archetypes,
+            access.reads(),
+            access.writes(),
+        );
+        let locks = lock_result.ok();
+        let archetype_count = world.archetypes.archetypes.len();
+        Tx::new(
+            archetype_count,
+            self.orphan_queue.clone(),
+            Box::new(PessimisticCleanup {
+                locks,
+                lock_table: &self.lock_table,
+            }),
+        )
+    }
+
+    fn try_commit(&self, tx: &mut Tx<'_>, world: &mut World) -> Result<EnumChangeSet, Conflict> {
+        assert_eq!(
+            self.world_id,
+            world.world_id(),
+            "strategy used with a different World than it was created from"
+        );
+        let locks = tx.cleanup.take_locks();
+        if let Some(locks) = locks {
+            let changeset = tx.take_changeset();
+            self.lock_table.lock().release(locks);
+            Ok(changeset)
+        } else {
+            Err(Conflict {
+                component_ids: FixedBitSet::new(),
+            })
+        }
+    }
+
+    fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,7 +957,7 @@ mod tests {
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
         let strategy = Optimistic::new(&world);
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         let count = tx.query::<(&Pos,)>(&world).count();
         assert_eq!(count, 1);
         tx.insert::<Vel>(&mut world, e, Vel(99.0));
@@ -669,7 +971,7 @@ mod tests {
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
         let strategy = Optimistic::new(&world);
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(99.0));
         // query_raw sees old value (write is buffered in changeset)
         let pos = tx.query::<(&Pos,)>(&world).next().unwrap();
@@ -687,7 +989,7 @@ mod tests {
 
         let strategy = Optimistic::new(&world);
         {
-            let mut tx = strategy.begin(&mut world, &access);
+            let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
             tx.insert::<Pos>(&mut world, e, Pos(99.0));
         }
         let pos = world.query::<(&Pos,)>().next().unwrap();
@@ -720,7 +1022,7 @@ mod tests {
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
         let strategy = Optimistic::new(&world);
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         let e = tx.spawn(&mut world, (Pos(42.0),));
         assert!(tx.commit(&mut world).is_ok());
         assert!(world.get::<Pos>(e).is_some());
@@ -735,7 +1037,7 @@ mod tests {
         let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
 
         let strategy = Pessimistic::new(&world);
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         let _ = tx.query::<(&Pos,)>(&world).count();
         tx.insert::<Vel>(&mut world, e, Vel(99.0));
         assert!(tx.commit(&mut world).is_ok());
@@ -748,7 +1050,7 @@ mod tests {
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
         let strategy = Pessimistic::new(&world);
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         tx.insert::<Pos>(&mut world, e, Pos(42.0));
         let pos = tx.query::<(&Pos,)>(&world).next().unwrap();
         assert_eq!(pos.0 .0, 1.0);
@@ -765,9 +1067,9 @@ mod tests {
 
         let strategy = Pessimistic::new(&world);
         {
-            let _tx = strategy.begin(&mut world, &access);
+            let _tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         }
-        let tx2 = strategy.begin(&mut world, &access);
+        let tx2 = TransactionStrategy::begin(&strategy, &mut world, &access);
         let _ = tx2.commit(&mut world);
     }
 
@@ -777,7 +1079,7 @@ mod tests {
         let access = Access::of::<(&mut Pos,)>(&mut world);
 
         let strategy = Pessimistic::new(&world);
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         let e = tx.spawn(&mut world, (Pos(77.0),));
         let _ = tx.commit(&mut world);
         assert!(world.get::<Pos>(e).is_some());
@@ -794,7 +1096,7 @@ mod tests {
 
         let spawned_entity;
         {
-            let mut tx = strategy.begin(&mut world, &access);
+            let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
             spawned_entity = tx.spawn(&mut world, (Pos(1.0),));
             // drop without commit — entity ID goes to pending release queue
         }
@@ -817,7 +1119,7 @@ mod tests {
 
         let spawned_entity;
         {
-            let mut tx = strategy.begin(&mut world, &access);
+            let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
             spawned_entity = tx.spawn(&mut world, (Pos(1.0),));
             // drop without commit
         }
@@ -837,7 +1139,7 @@ mod tests {
         let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
         let strategy = Optimistic::new(&world);
 
-        let mut tx = strategy.begin(&mut world, &access);
+        let mut tx = TransactionStrategy::begin(&strategy, &mut world, &access);
         let spawned = tx.spawn(&mut world, (Pos(99.0),));
 
         // Mutate a read column to force conflict
@@ -860,7 +1162,7 @@ mod tests {
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Optimistic::new(&world_a);
-        let _tx = strategy.begin(&mut world_b, &access);
+        let _tx = TransactionStrategy::begin(&strategy, &mut world_b, &access);
     }
 
     #[test]
@@ -870,7 +1172,7 @@ mod tests {
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Pessimistic::new(&world_a);
-        let _tx = strategy.begin(&mut world_b, &access);
+        let _tx = TransactionStrategy::begin(&strategy, &mut world_b, &access);
     }
 
     #[test]
@@ -880,7 +1182,7 @@ mod tests {
         let mut world_b = World::new();
         let access = Access::of::<(&mut Pos,)>(&mut world_a);
         let strategy = Optimistic::new(&world_a);
-        let tx = strategy.begin(&mut world_a, &access);
+        let tx = TransactionStrategy::begin(&strategy, &mut world_a, &access);
         let _ = tx.commit(&mut world_b);
     }
 
@@ -952,5 +1254,132 @@ mod tests {
         // Drain orphans and confirm the entity is still alive.
         world.register_component::<Vel>();
         assert!(world.is_alive(spawned));
+    }
+
+    // ── Transact (closure API) tests ──────────────────────────────────
+
+    #[test]
+    fn optimistic_transact_returns_closure_value() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0), Vel(2.0)));
+        let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
+        let strategy = Optimistic::new(&world);
+        let count = strategy.transact(&mut world, &access, |tx, world| {
+            tx.query::<(&Pos,)>(world).count()
+        });
+        assert_eq!(count.unwrap(), 1);
+    }
+
+    #[test]
+    fn optimistic_transact_applies_writes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let strategy = Optimistic::new(&world);
+        strategy
+            .transact(&mut world, &access, |tx, world| {
+                tx.write::<Pos>(world, e, Pos(42.0));
+            })
+            .unwrap();
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 42.0);
+    }
+
+    #[test]
+    fn optimistic_transact_retries_on_conflict() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
+        let strategy = Optimistic::with_retries(&world, 3);
+        let mut attempt = 0u32;
+        let result = strategy.transact(&mut world, &access, |tx, world| {
+            attempt += 1;
+            if attempt == 1 {
+                // Mutate a read column to force conflict on first attempt
+                for pos in world.query::<(&mut Pos,)>() {
+                    pos.0 .0 = 99.0;
+                }
+            }
+            tx.write::<Pos>(world, e, Pos(42.0));
+        });
+        assert!(result.is_ok());
+        assert!(attempt >= 2, "should have retried at least once");
+    }
+
+    #[test]
+    fn optimistic_transact_exhausted_retries() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
+        let strategy = Optimistic::with_retries(&world, 2);
+        let result = strategy.transact(&mut world, &access, |_tx, world| {
+            // Every attempt mutates the read column — conflict every time
+            for pos in world.query::<(&mut Pos,)>() {
+                pos.0 .0 += 1.0;
+            }
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pessimistic_transact_returns_closure_value() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0), Vel(2.0)));
+        let access = Access::of::<(&Pos, &mut Vel)>(&mut world);
+        let strategy = Pessimistic::new(&world);
+        let count = strategy.transact(&mut world, &access, |tx, world| {
+            tx.query::<(&Pos,)>(world).count()
+        });
+        assert_eq!(count.unwrap(), 1);
+    }
+
+    #[test]
+    fn pessimistic_transact_applies_writes() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let access = Access::of::<(&mut Pos,)>(&mut world);
+        let strategy = Pessimistic::new(&world);
+        strategy
+            .transact(&mut world, &access, |tx, world| {
+                tx.write::<Pos>(world, e, Pos(77.0));
+            })
+            .unwrap();
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 77.0);
+    }
+
+    #[test]
+    fn transact_entity_cleanup_on_retry() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        let access = Access::of::<(&Pos, &mut Pos)>(&mut world);
+        let strategy = Optimistic::with_retries(&world, 3);
+        let mut spawned_on_first = None;
+        let mut attempt = 0u32;
+        let _result = strategy.transact(&mut world, &access, |tx, world| {
+            attempt += 1;
+            let e = tx.spawn(world, (Pos(0.0),));
+            if attempt == 1 {
+                spawned_on_first = Some(e);
+                // Mutate a read column to force conflict on first attempt
+                for pos in world.query::<(&mut Pos,)>() {
+                    pos.0 .0 = 99.0;
+                }
+            }
+        });
+        if let Some(e) = spawned_on_first {
+            assert!(
+                !world.is_alive(e),
+                "entity from failed attempt should be deallocated"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "different World")]
+    fn transact_panics_on_wrong_world() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        let access = Access::of::<(&mut Pos,)>(&mut world_a);
+        let strategy = Optimistic::new(&world_a);
+        let _ = strategy.transact(&mut world_b, &access, |_tx, _world| {});
     }
 }

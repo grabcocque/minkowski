@@ -694,6 +694,7 @@ impl World {
         snapshot: &[(usize, ComponentId, crate::tick::Tick)],
     ) -> FixedBitSet {
         let mut conflicts = FixedBitSet::new();
+        #[allow(clippy::collapsible_if)]
         for &(arch_idx, comp_id, begin_tick) in snapshot {
             if let Some(arch) = self.archetypes.archetypes.get(arch_idx) {
                 if let Some(&col_idx) = arch.component_index.get(&comp_id) {
@@ -765,7 +766,7 @@ impl World {
     ) -> *const u8 {
         let arch = &self.archetypes.archetypes[arch_idx];
         let col_idx = arch.component_index[&comp_id];
-        arch.columns[col_idx].get_ptr(row) as *const u8
+        unsafe { arch.columns[col_idx].get_ptr(row) as *const u8 }
     }
 
     /// Component name (from `std::any::type_name`). Returns None if unregistered.
@@ -1177,17 +1178,21 @@ mod tests {
         }
         unsafe impl<'w> TableRow<'w> for PosVelMut<'w> {
             unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
-                Self {
-                    pos: &mut *(col_ptrs[0].0.add(row * col_ptrs[0].1) as *mut Pos),
-                    vel: &mut *(col_ptrs[1].0.add(row * col_ptrs[1].1) as *mut Vel),
+                unsafe {
+                    Self {
+                        pos: &mut *(col_ptrs[0].0.add(row * col_ptrs[0].1) as *mut Pos),
+                        vel: &mut *(col_ptrs[1].0.add(row * col_ptrs[1].1) as *mut Vel),
+                    }
                 }
             }
         }
         unsafe impl<'w> TableRow<'w> for PosVelRef<'w> {
             unsafe fn from_row(col_ptrs: &[(*mut u8, usize)], row: usize) -> Self {
-                Self {
-                    pos: &*(col_ptrs[0].0.add(row * col_ptrs[0].1) as *const Pos),
-                    vel: &*(col_ptrs[1].0.add(row * col_ptrs[1].1) as *const Vel),
+                unsafe {
+                    Self {
+                        pos: &*(col_ptrs[0].0.add(row * col_ptrs[0].1) as *const Pos),
+                        vel: &*(col_ptrs[1].0.add(row * col_ptrs[1].1) as *const Vel),
+                    }
                 }
             }
         }
