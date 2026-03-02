@@ -178,12 +178,27 @@ impl<W: WireFormat> Snapshot<W> {
             });
         }
 
+        // Sparse components
+        let mut sparse = Vec::new();
+        for comp_id in world.sparse_component_ids() {
+            if !codecs.has_codec(comp_id) {
+                return Err(CodecError::UnregisteredComponent(comp_id).into());
+            }
+            let entries = codecs.serialize_sparse(comp_id, world)?;
+            if !entries.is_empty() {
+                sparse.push(SparseComponentData {
+                    component_id: comp_id,
+                    entries,
+                });
+            }
+        }
+
         Ok(SnapshotData {
             wal_seq,
             schema,
             allocator,
             archetypes,
-            sparse: vec![], // Task 6 adds sparse support
+            sparse,
         })
     }
 
@@ -229,6 +244,14 @@ impl<W: WireFormat> Snapshot<W> {
             }
 
             changeset.apply(&mut world);
+        }
+
+        // Restore sparse components
+        for sparse_data in &data.sparse {
+            for (entity_bits, bytes) in &sparse_data.entries {
+                let entity = Entity::from_bits(*entity_bits);
+                codecs.insert_sparse_raw(sparse_data.component_id, &mut world, entity, bytes)?;
+            }
         }
 
         // Restore allocator state AFTER all entities are placed.
@@ -353,5 +376,99 @@ mod tests {
         let snap = Snapshot::new(Bincode);
         let result = snap.save(&snap_path, &world, &codecs, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sparse_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("sparse.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Vel>(&mut world);
+
+        // Spawn entities with archetype components
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+
+        // Add sparse Vel to e1 only
+        world.insert_sparse::<Vel>(e1, Vel { dx: 10.0, dy: 20.0 });
+
+        let snap = Snapshot::new(Bincode);
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        let (mut world2, _) = snap.load(&snap_path, &codecs).unwrap();
+
+        // Verify archetype data survived
+        assert_eq!(world2.query::<(&Pos,)>().count(), 2);
+
+        // Verify sparse data survived
+        let vel_id = world2.component_id::<Vel>().unwrap();
+        let sparse_entries: Vec<_> = world2.iter_sparse::<Vel>(vel_id).unwrap().collect();
+        assert_eq!(sparse_entries.len(), 1);
+        assert_eq!(sparse_entries[0].1.dx, 10.0);
+        assert_eq!(sparse_entries[0].1.dy, 20.0);
+
+        // e2 should have no sparse Vel
+        let has_e2 = world2
+            .iter_sparse::<Vel>(vel_id)
+            .unwrap()
+            .any(|(e, _)| e == e2);
+        assert!(!has_e2);
+    }
+
+    #[test]
+    fn sparse_only_entities() {
+        // Entities with ONLY sparse components (no archetype columns).
+        // These entities exist in the allocator but have no archetype row.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("sparse_only.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Vel>(&mut world);
+
+        // Spawn an entity with archetype component so it has an allocator slot
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        // Add sparse on top
+        world.insert_sparse::<Vel>(e1, Vel { dx: 5.0, dy: 6.0 });
+
+        let snap = Snapshot::new(Bincode);
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        let (mut world2, _) = snap.load(&snap_path, &codecs).unwrap();
+
+        // Archetype component
+        assert_eq!(world2.query::<(&Pos,)>().count(), 1);
+
+        // Sparse component
+        let vel_id = world2.component_id::<Vel>().unwrap();
+        let entries: Vec<_> = world2.iter_sparse::<Vel>(vel_id).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.dx, 5.0);
+        assert_eq!(entries[0].1.dy, 6.0);
+    }
+
+    #[test]
+    fn empty_sparse_not_serialized() {
+        // If no entities have sparse data, the sparse section should be empty.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("no_sparse.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = Snapshot::new(Bincode);
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        let (mut world2, _) = snap.load(&snap_path, &codecs).unwrap();
+        assert_eq!(world2.query::<(&Pos,)>().count(), 1);
+        // No sparse data — should be fine
+        assert!(world2.sparse_component_ids().is_empty());
     }
 }

@@ -2,7 +2,7 @@ use std::alloc::Layout;
 use std::collections::HashMap;
 
 use minkowski::component::Component;
-use minkowski::{ComponentId, World};
+use minkowski::{ComponentId, Entity, World};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Type-erased serialize: reads T from raw pointer, serializes to output buffer.
@@ -13,6 +13,14 @@ type DeserializeFn = fn(&[u8]) -> Result<Vec<u8>, CodecError>;
 
 /// Type-erased component registration: registers the concrete type into a World.
 type RegisterFn = fn(&mut World) -> ComponentId;
+
+/// Type-erased sparse serialization: iterates World's sparse storage for a component,
+/// returning `(entity_bits, serialized_bytes)` pairs.
+type SerializeSparseFn =
+    fn(&World, ComponentId, &CodecRegistry) -> Result<Vec<(u64, Vec<u8>)>, CodecError>;
+
+/// Type-erased sparse insertion: deserializes bytes and inserts into World's sparse storage.
+type InsertSparseFn = fn(&mut World, Entity, &[u8]) -> Result<(), CodecError>;
 
 #[derive(Debug)]
 pub enum CodecError {
@@ -39,6 +47,8 @@ struct ComponentCodec {
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
     register_fn: RegisterFn,
+    serialize_sparse_fn: SerializeSparseFn,
+    insert_sparse_fn: InsertSparseFn,
 }
 
 /// Maps ComponentId to serde codecs. Separate from core's ComponentRegistry --
@@ -87,6 +97,28 @@ impl CodecRegistry {
 
         let register_fn: RegisterFn = |world| world.register_component::<T>();
 
+        let serialize_sparse_fn: SerializeSparseFn = |world, comp_id, codecs| {
+            let mut entries = Vec::new();
+            if let Some(iter) = world.iter_sparse::<T>(comp_id) {
+                for (entity, value) in iter {
+                    let mut buf = Vec::new();
+                    // SAFETY: value is a valid &T from the sparse HashMap.
+                    unsafe {
+                        codecs.serialize(comp_id, value as *const T as *const u8, &mut buf)?;
+                    }
+                    entries.push((entity.to_bits(), buf));
+                }
+            }
+            Ok(entries)
+        };
+
+        let insert_sparse_fn: InsertSparseFn = |world, entity, data| {
+            let value: T =
+                bincode::deserialize(data).map_err(|e| CodecError::Deserialize(e.to_string()))?;
+            world.insert_sparse::<T>(entity, value);
+            Ok(())
+        };
+
         self.codecs.insert(
             comp_id,
             ComponentCodec {
@@ -95,6 +127,8 @@ impl CodecRegistry {
                 serialize_fn,
                 deserialize_fn,
                 register_fn,
+                serialize_sparse_fn,
+                insert_sparse_fn,
             },
         );
     }
@@ -145,6 +179,34 @@ impl CodecRegistry {
     /// All registered ComponentIds.
     pub fn registered_ids(&self) -> Vec<ComponentId> {
         self.codecs.keys().copied().collect()
+    }
+
+    /// Serialize all entries for a sparse component.
+    pub fn serialize_sparse(
+        &self,
+        id: ComponentId,
+        world: &World,
+    ) -> Result<Vec<(u64, Vec<u8>)>, CodecError> {
+        let codec = self
+            .codecs
+            .get(&id)
+            .ok_or(CodecError::UnregisteredComponent(id))?;
+        (codec.serialize_sparse_fn)(world, id, self)
+    }
+
+    /// Insert a sparse component value from serialized bytes.
+    pub fn insert_sparse_raw(
+        &self,
+        id: ComponentId,
+        world: &mut World,
+        entity: Entity,
+        data: &[u8],
+    ) -> Result<(), CodecError> {
+        let codec = self
+            .codecs
+            .get(&id)
+            .ok_or(CodecError::UnregisteredComponent(id))?;
+        (codec.insert_sparse_fn)(world, entity, data)
     }
 
     /// Register all known component types into the given World.
