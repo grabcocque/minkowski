@@ -1,3 +1,64 @@
+//! Transaction strategies for concurrent ECS access.
+//!
+//! # Design overview
+//!
+//! A single [`TransactionStrategy`] trait provides optimistic and pessimistic
+//! concurrency behind one interface. [`Sequential`] exists as a zero-cost
+//! passthrough for code that doesn't need isolation — users who never touch
+//! transactions pay nothing.
+//!
+//! ## Split-phase execution
+//!
+//! Tx objects do **not** hold `&mut World`. Methods take the world as a
+//! parameter, which splits every frame into three phases:
+//!
+//! 1. **Begin** (sequential, `&mut World`) — snapshot ticks or acquire locks.
+//! 2. **Execute** (parallel, `&World`) — read through `tx.query(&world)`.
+//!    Multiple transactions can read concurrently because `query` requires
+//!    [`ReadOnlyWorldQuery`], preventing `&mut T` access through a shared
+//!    reference. Without this bound the parallel phase would be unsound —
+//!    two transactions could obtain aliased `&mut T` from the same `&World`.
+//! 3. **Commit** (sequential, `&mut World`) — validate and apply buffered
+//!    writes. `commit(self, &mut World)` consumes the transaction so it
+//!    cannot be reused.
+//!
+//! ## Commit, abort, and entity lifecycle
+//!
+//! Dropping a transaction without calling `commit` is an **abort**: the
+//! changeset is discarded, locks are released, and no mutations reach World.
+//! `commit` consumes `self` so the compiler enforces exactly-once semantics.
+//!
+//! Entity IDs allocated during a transaction (`tx.spawn`) are tracked in a
+//! `spawned_entities` vec. On successful commit they become placed entities.
+//! On abort — whether from an explicit drop or a failed optimistic validation
+//! — the IDs must be reclaimed. `Drop` pushes them to an [`OrphanQueue`]
+//! shared with World via `Arc<Mutex<Vec<Entity>>>`. World drains this queue
+//! automatically at the top of every `&mut self` method, bumping generations
+//! and recycling indices. No entity ID ever leaks, regardless of how the
+//! transaction ends, and no manual cleanup step is required.
+//!
+//! [`OrphanQueue`]: crate::world::OrphanQueue
+//!
+//! ## Cooperative locking (pessimistic)
+//!
+//! [`Pessimistic`] owns a `Mutex<ColumnLockTable>` — a bookkeeping structure
+//! (not an OS mutex per column) tracking shared readers and exclusive writers
+//! at `(ArchetypeId, ComponentId)` granularity. When a component appears in
+//! both reads and writes, the lock request is **upgraded** to exclusive —
+//! `dedup_by` keeps the highest privilege, not the first seen. Locks are
+//! acquired in deterministic `(arch, comp)` order to prevent deadlock. The
+//! mutex is held only during begin/commit/drop (all sequential phases), never
+//! during the parallel read phase.
+//!
+//! ## World identity
+//!
+//! Each World gets a unique [`WorldId`] at construction. Strategies capture it
+//! and assert it matches in `begin()` and `commit()`. This prevents a strategy
+//! created from world A being used with world B, which would push aborted
+//! entity IDs into the wrong orphan queue and corrupt unrelated live entities.
+//!
+//! [`WorldId`]: crate::world::WorldId
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fixedbitset::FixedBitSet;
