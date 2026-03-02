@@ -125,6 +125,13 @@ Lock granularity is per-column `(ArchetypeId, ComponentId)`. `ColumnLockTable` i
 - Every module has `#[cfg(test)] mod tests` with inline tests.
 - `#[allow(dead_code)]` on fields/methods reserved for future phases.
 - **Change detection invariant**: every path that hands out a mutable pointer to column data must either use `BlobVec::get_ptr_mut(row, tick)` (marks the column changed) or mark via the entry-point method (`World::query` for `&mut T`, `query_table_mut`, `query_table_raw`). `BlobVec::get_ptr` is the read path — writing through it silently bypasses `Changed<T>`. If you add a new mutable accessor, it must go through one of these two mechanisms.
+- **Semantic review checklist**: every new primitive that touches concurrency, entity lifecycle, or cross-system state gets a "what can go wrong" review before implementation. The type system catches syntax; these catch design:
+  1. Can this be called with the wrong World?
+  2. Can Drop observe inconsistent state?
+  3. Can two threads reach this through `&self`?
+  4. Does dedup/merge/collapse preserve the strongest invariant?
+  5. What happens if this is abandoned halfway through?
+  6. Can a type bound be violated by a legal generic instantiation?
 
 ## Dependencies
 
