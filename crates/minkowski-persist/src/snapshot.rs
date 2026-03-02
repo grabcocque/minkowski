@@ -452,6 +452,80 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_plus_wal_recovery() {
+        use crate::wal::Wal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("recovery.snap");
+        let wal_path = dir.path().join("recovery.wal");
+
+        // Phase 1: Create world with entities
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Vel>(&mut world);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
+        world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 0.3, dy: 0.4 }));
+
+        // Phase 2: Save snapshot + create WAL
+        let mut wal = Wal::create(&wal_path, Bincode).unwrap();
+        let snap = Snapshot::new(Bincode);
+        let _header = snap
+            .save(&snap_path, &world, &codecs, wal.next_seq())
+            .unwrap();
+
+        // Phase 3: More mutations after snapshot, written to WAL
+        // Spawn a third entity via changeset
+        let e3 = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(
+            &mut world,
+            e3,
+            (Pos { x: 5.0, y: 6.0 }, Vel { dx: 0.5, dy: 0.6 }),
+        );
+        // Append forward changeset to WAL before apply (apply consumes self)
+        wal.append(&cs, &codecs).unwrap();
+        let _reverse = cs.apply(&mut world);
+
+        // Also modify an existing entity
+        let entities: Vec<_> = world
+            .query::<(minkowski::Entity, &Pos)>()
+            .map(|(e, p)| {
+                (
+                    e,
+                    Pos {
+                        x: p.x + 100.0,
+                        y: p.y,
+                    },
+                )
+            })
+            .collect();
+        let mut cs2 = EnumChangeSet::new();
+        for (e, new_pos) in &entities {
+            cs2.insert::<Pos>(&mut world, *e, *new_pos);
+        }
+        // Append forward changeset to WAL before apply
+        wal.append(&cs2, &codecs).unwrap();
+        let _reverse2 = cs2.apply(&mut world);
+
+        // Phase 4: Recover from snapshot + WAL
+        let mut load_codecs = CodecRegistry::new();
+        let mut load_world_tmp = World::new();
+        load_codecs.register::<Pos>(&mut load_world_tmp);
+        load_codecs.register::<Vel>(&mut load_world_tmp);
+
+        let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
+        let last_seq = wal
+            .replay_from(snap_seq, &mut recovered, &load_codecs)
+            .unwrap();
+
+        // Verify: should have 3 entities (2 from snapshot + 1 from WAL spawn)
+        assert_eq!(recovered.query::<(&Pos,)>().count(), 3);
+        assert!(last_seq >= 1); // at least 2 WAL records replayed
+    }
+
+    #[test]
     fn empty_sparse_not_serialized() {
         // If no entities have sparse data, the sparse section should be empty.
         let dir = tempfile::tempdir().unwrap();

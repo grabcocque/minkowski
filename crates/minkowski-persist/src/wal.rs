@@ -224,6 +224,14 @@ impl<W: WireFormat> Wal<W> {
             match mutation {
                 SerializedMutation::Spawn { entity, components } => {
                     let entity = Entity::from_bits(*entity);
+
+                    // Ensure the entity's allocator slot exists so that
+                    // subsequent mutations (Insert, etc.) can pass is_alive
+                    // checks. The changeset Spawn path only checks
+                    // !is_placed, but Insert checks is_alive which requires
+                    // the generation entry.
+                    world.alloc_entity();
+
                     let mut raw_components: Vec<(
                         minkowski::ComponentId,
                         Vec<u8>,
