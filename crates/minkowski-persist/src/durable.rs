@@ -55,6 +55,10 @@ impl<S: Transact, W: WireFormat> Transact for Durable<S, W> {
         let mut f = f;
         for _attempt in 0..self.max_retries() {
             let mut tx = self.begin(world, access);
+            if !tx.is_ready() {
+                drop(tx);
+                continue;
+            }
             let value = f(&mut tx, world);
             match self.try_commit(&mut tx, world) {
                 Ok(forward) => {

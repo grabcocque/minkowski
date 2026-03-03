@@ -114,6 +114,14 @@ pub(crate) trait TxCleanup {
     fn has_locks(&self) -> bool {
         false
     }
+
+    /// Whether the transaction is ready to execute the closure.
+    /// Returns `true` for optimistic (validation at commit) and `false`
+    /// for pessimistic when lock acquisition failed. Callers should skip
+    /// the closure and retry when this returns `false`.
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// No-op cleanup for strategies that have nothing to release on abort.
@@ -163,6 +171,10 @@ impl TxCleanup for PessimisticCleanup<'_> {
     }
 
     fn has_locks(&self) -> bool {
+        self.locks.is_some()
+    }
+
+    fn is_ready(&self) -> bool {
         self.locks.is_some()
     }
 }
@@ -249,6 +261,14 @@ impl<'a> Tx<'a> {
     /// [`Optimistic`] transactions this always returns `false`.
     pub fn has_locks(&self) -> bool {
         self.cleanup.has_locks()
+    }
+
+    /// Whether the transaction is ready to execute the closure.
+    /// Returns `false` for pessimistic transactions that failed to acquire
+    /// locks — the closure should be skipped and the transaction retried.
+    /// Always returns `true` for optimistic transactions.
+    pub fn is_ready(&self) -> bool {
+        self.cleanup.is_ready()
     }
 
     /// Track an externally-allocated entity ID for orphan reclamation on abort.
@@ -475,6 +495,10 @@ pub trait Transact {
     ) -> Result<R, Conflict> {
         for _ in 0..self.max_retries() {
             let mut tx = self.begin(world, access);
+            if !tx.is_ready() {
+                drop(tx);
+                continue;
+            }
             let value = f(&mut tx, world);
             match self.try_commit(&mut tx, world) {
                 Ok(forward) => {
@@ -564,7 +588,7 @@ impl Transact for Pessimistic {
     ) -> Result<R, Conflict> {
         for attempt in 0..self.max_retries() {
             let mut tx = Transact::begin(self, world, access);
-            if !tx.cleanup.has_locks() {
+            if !tx.is_ready() {
                 // Lock acquisition failed — abort and retry with backoff
                 drop(tx);
                 backoff(attempt);
