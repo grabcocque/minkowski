@@ -274,8 +274,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Take ownership of the internal changeset, leaving an empty one in place.
-    #[allow(dead_code)]
-    pub(crate) fn take_changeset(&mut self) -> EnumChangeSet {
+    pub fn take_changeset(&mut self) -> EnumChangeSet {
         std::mem::take(&mut self.changeset)
     }
 }
