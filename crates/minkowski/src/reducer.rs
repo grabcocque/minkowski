@@ -1,5 +1,12 @@
+use std::marker::PhantomData;
+
 use crate::access::Access;
+use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
+use crate::entity::Entity;
+use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
+use crate::transaction::Tx;
+use crate::world::World;
 
 // ── ComponentSet & Contains ──────────────────────────────────────────
 
@@ -88,6 +95,171 @@ impl_component_set!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I);
 impl_component_set!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J);
 impl_component_set!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K);
 impl_component_set!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L);
+
+// ── Typed entity handles (transactional) ─────────────────────────────
+
+/// Read-only entity access. `get::<T>()` is gated by `C: Contains<T, IDX>`.
+pub struct EntityRef<'a, C: ComponentSet> {
+    entity: Entity,
+    resolved: &'a ResolvedComponents,
+    world: &'a World,
+    _marker: PhantomData<C>,
+}
+
+impl<'a, C: ComponentSet> EntityRef<'a, C> {
+    #[allow(dead_code)]
+    pub(crate) fn new(entity: Entity, resolved: &'a ResolvedComponents, world: &'a World) -> Self {
+        Self {
+            entity,
+            resolved,
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get<T: Component, const IDX: usize>(&self) -> &T
+    where
+        C: Contains<T, IDX>,
+    {
+        let comp_id = self.resolved.0[IDX];
+        self.world
+            .get_by_id::<T>(self.entity, comp_id)
+            .expect("component missing on entity — archetype mismatch")
+    }
+
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+}
+
+/// Read-write entity access. `get::<T>()` reads live, `set::<T>()` buffers
+/// writes into the transaction's changeset.
+pub struct EntityMut<'a, C: ComponentSet> {
+    entity: Entity,
+    resolved: &'a ResolvedComponents,
+    tx: &'a mut Tx<'a>,
+    world: &'a World,
+    _marker: PhantomData<C>,
+}
+
+impl<'a, C: ComponentSet> EntityMut<'a, C> {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        entity: Entity,
+        resolved: &'a ResolvedComponents,
+        tx: &'a mut Tx<'a>,
+        world: &'a World,
+    ) -> Self {
+        Self {
+            entity,
+            resolved,
+            tx,
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn get<T: Component, const IDX: usize>(&self) -> &T
+    where
+        C: Contains<T, IDX>,
+    {
+        let comp_id = self.resolved.0[IDX];
+        self.world
+            .get_by_id::<T>(self.entity, comp_id)
+            .expect("component missing on entity — archetype mismatch")
+    }
+
+    pub fn set<T: Component, const IDX: usize>(&mut self, value: T)
+    where
+        C: Contains<T, IDX>,
+    {
+        let comp_id = self.resolved.0[IDX];
+        self.tx.write_raw(self.entity, comp_id, value);
+    }
+
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+}
+
+/// Spawn capability. Each `spawn(bundle)` atomically reserves an entity ID
+/// and buffers the bundle into the transaction's changeset.
+pub struct Spawner<'a, B: Bundle> {
+    tx: &'a mut Tx<'a>,
+    world: &'a World,
+    _marker: PhantomData<B>,
+}
+
+impl<'a, B: Bundle> Spawner<'a, B> {
+    #[allow(dead_code)]
+    pub(crate) fn new(tx: &'a mut Tx<'a>, world: &'a World) -> Self {
+        Self {
+            tx,
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn spawn(&mut self, bundle: B) -> Entity {
+        self.tx.spawn_raw(self.world, bundle)
+    }
+}
+
+// ── Typed query handles (scheduled) ──────────────────────────────────
+
+/// Read-only query iteration. Hides `&World`.
+pub struct QueryRef<'a, Q: ReadOnlyWorldQuery> {
+    world: &'a World,
+    _marker: PhantomData<Q>,
+}
+
+impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
+    #[allow(dead_code)]
+    pub(crate) fn new(world: &'a World) -> Self {
+        Self {
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn for_each(&self, f: impl FnMut(Q::Item<'_>)) {
+        let count = self.world.archetype_count();
+        self.world.query_raw::<Q>(count).for_each(f);
+    }
+
+    pub fn count(&self) -> usize {
+        let count = self.world.archetype_count();
+        self.world.query_raw::<Q>(count).count()
+    }
+}
+
+/// Read-write query iteration. Hides `&mut World`.
+pub struct QueryMut<'a, Q: WorldQuery> {
+    world: &'a mut World,
+    _marker: PhantomData<Q>,
+}
+
+impl<'a, Q: WorldQuery + 'static> QueryMut<'a, Q> {
+    #[allow(dead_code)]
+    pub(crate) fn new(world: &'a mut World) -> Self {
+        Self {
+            world,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn for_each(&mut self, f: impl FnMut(Q::Item<'_>)) {
+        self.world.query::<Q>().for_each(f);
+    }
+
+    pub fn for_each_chunk(&mut self, f: impl FnMut(Q::Slice<'_>)) {
+        self.world.query::<Q>().for_each_chunk(f);
+    }
+
+    pub fn count(&mut self) -> usize {
+        self.world.query::<Q>().count()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -214,5 +386,64 @@ mod tests {
         let vel_id = get_index::<Vel, (Pos, Vel), 1>(&resolved, std::marker::PhantomData);
         assert_eq!(pos_id, reg.id::<Pos>().unwrap());
         assert_eq!(vel_id, reg.id::<Vel>().unwrap());
+    }
+
+    // ── EntityRef tests ──────────────────────────────────────────
+
+    #[test]
+    fn entity_ref_get() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let resolved = ResolvedComponents(<(Pos, Vel)>::resolve(&mut world.components));
+
+        let er: EntityRef<'_, (Pos, Vel)> = EntityRef::new(e, &resolved, &world);
+        assert_eq!(er.get::<Pos, 0>().0, 1.0);
+        assert_eq!(er.get::<Vel, 1>().0, 2.0);
+        assert_eq!(er.entity(), e);
+    }
+
+    // ── QueryRef tests ───────────────────────────────────────────
+
+    #[test]
+    fn query_ref_for_each() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        let qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&world);
+        let mut sum = 0.0;
+        qr.for_each(|(pos,)| sum += pos.0);
+        assert_eq!(sum, 3.0);
+    }
+
+    #[test]
+    fn query_ref_count() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        world.spawn((Pos(3.0),));
+        let qr: QueryRef<'_, (&Pos,)> = QueryRef::new(&world);
+        assert_eq!(qr.count(), 3);
+    }
+
+    // ── QueryMut tests ───────────────────────────────────────────
+
+    #[test]
+    fn query_mut_for_each() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        {
+            let mut qm: QueryMut<'_, (&mut Pos,)> = QueryMut::new(&mut world);
+            qm.for_each(|(pos,)| pos.0 += 10.0);
+        }
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 11.0);
+    }
+
+    #[test]
+    fn query_mut_count() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        let mut qm: QueryMut<'_, (&mut Pos,)> = QueryMut::new(&mut world);
+        assert_eq!(qm.count(), 2);
     }
 }
