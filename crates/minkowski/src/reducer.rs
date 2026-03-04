@@ -285,7 +285,7 @@ pub struct ReducerId(pub usize);
 
 /// Opaque identifier for a scheduled query reducer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct QueryReducerId(usize);
+pub struct QueryReducerId(pub usize);
 
 /// Type-erased entity reducer adapter. Receives changeset + allocated list
 /// (from Tx), world (for reads), resolved IDs, target entity, and type-erased args.
