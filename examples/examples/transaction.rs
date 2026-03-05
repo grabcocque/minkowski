@@ -1,19 +1,16 @@
-//! Transaction strategies — demonstrates Sequential, Optimistic, and Pessimistic
-//! transaction semantics on the same workload.
+//! Transaction strategies — raw Tx building blocks vs reducer-based dispatch.
 //!
 //! Run: cargo run -p minkowski-examples --example transaction --release
 //!
-//! Features exercised:
-//! - `Transact` trait with closure-based `transact()` and building-block `begin()`/`try_commit()`
-//! - `Tx` — unified transaction handle for all strategies
-//! - `SequentialTx` — zero-overhead passthrough, commit always succeeds
-//! - `Optimistic` — live reads, buffered writes, tick-based validation at commit
-//! - `Pessimistic` — cooperative column locks, guaranteed commit success
-//! - `Access` — component-level read/write metadata for transaction begin
-//! - `EnumChangeSet` — reverse changeset returned on successful commit
+//! Part 1: Raw Tx API — Sequential begin/commit + Optimistic transact closure.
+//!         Shows the low-level building blocks that reducers abstract over.
+//!
+//! Part 2: Reducer API — same logic registered as query reducers, dispatched
+//!         via `registry.run()`. Strategy-agnostic, with free conflict detection.
 
 use minkowski::{
-    Access, Entity, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, World,
+    Access, Entity, Optimistic, QueryMut, QueryReducerId, ReducerRegistry, Sequential, Transact,
+    World,
 };
 
 // ── Components ──────────────────────────────────────────────────────
@@ -71,52 +68,41 @@ fn avg_health(world: &mut World) -> f32 {
     total as f32 / n as f32
 }
 
-// ── Sequential ──────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════
+// Part 1: Raw Tx API
+// ════════════════════════════════════════════════════════════════════
 
-fn movement_system(tx: &mut SequentialTx, world: &mut World) {
-    for (pos, vel) in tx.query::<(&mut Pos, &Vel)>(world) {
-        pos.x += vel.dx;
-        pos.y += vel.dy;
-    }
-}
-
-fn run_sequential(world: &mut World) {
+fn run_raw_sequential(world: &mut World) {
     let access = Access::of::<(&mut Pos, &Vel)>(world);
     let strategy = Sequential;
 
     for _ in 0..10 {
-        let mut tx = strategy.begin(world, &access);
-        movement_system(&mut tx, world);
+        let tx = strategy.begin(world, &access);
+        for (pos, vel) in tx.query::<(&mut Pos, &Vel)>(world) {
+            pos.x += vel.dx;
+            pos.y += vel.dy;
+        }
         let result = tx.commit(world);
         assert!(result.is_ok(), "sequential commit always succeeds");
     }
 
     let (ax, ay) = avg_pos(world);
     println!("  after 10 steps: avg pos = ({ax:.1}, {ay:.1})");
-    println!("  commit result:  Ok (always succeeds, zero overhead)");
 }
 
-// ── Optimistic (clean commit) ───────────────────────────────────────
-
-fn run_optimistic_clean(world: &mut World, entities: &[Entity]) {
+fn run_raw_optimistic(world: &mut World) {
     let access = Access::of::<(&Health, &mut Health)>(world);
     let strategy = Optimistic::new(world);
 
     for _ in 0..10 {
-        let entities = entities.to_vec();
         strategy
             .transact(world, &access, |tx, world| {
-                // Read current health values (live read from World via query_raw)
                 let healths: Vec<(Entity, u32)> = tx
                     .query::<(Entity, &Health)>(world)
                     .map(|(e, hp)| (e, hp.0))
                     .collect();
-
-                // Buffer writes into changeset
                 for (e, hp) in healths {
-                    if entities.contains(&e) {
-                        tx.write::<Health>(world, e, Health(hp.saturating_sub(3)));
-                    }
+                    tx.write::<Health>(world, e, Health(hp.saturating_sub(3)));
                 }
             })
             .expect("no concurrent modification = clean commit");
@@ -124,103 +110,140 @@ fn run_optimistic_clean(world: &mut World, entities: &[Entity]) {
 
     let avg = avg_health(world);
     println!("  after 10 steps: avg health = {avg:.0}");
-    println!("  commit result:  Ok (no conflicts detected)");
 }
 
-// ── Optimistic (conflict demonstration) ─────────────────────────────
+// ════════════════════════════════════════════════════════════════════
+// Part 2: Reducer API — same logic, strategy-agnostic
+// ════════════════════════════════════════════════════════════════════
 
-fn run_optimistic_conflict(world: &mut World) {
-    // Declare access: reads Pos, writes Health.
-    // The optimistic strategy snapshots read-column ticks at begin.
-    let access = Access::of::<(&Pos, &mut Health)>(world);
-    let strategy = Optimistic::with_retries(world, 1);
+fn register_reducers(
+    registry: &mut ReducerRegistry,
+    world: &mut World,
+) -> (QueryReducerId, QueryReducerId) {
+    let move_id = registry.register_query::<(&mut Pos, &Vel), f32, _>(
+        world,
+        "move_entities",
+        |mut query: QueryMut<'_, (&mut Pos, &Vel)>, dt: f32| {
+            query.for_each(|(pos, vel)| {
+                pos.x += vel.dx * dt;
+                pos.y += vel.dy * dt;
+            });
+        },
+    );
 
-    // Use the building-block API so we can manually intervene between begin
-    // and commit to demonstrate conflict detection.
-    let mut tx = strategy.begin(world, &access);
+    let decay_id = registry.register_query::<(&mut Health,), u32, _>(
+        world,
+        "decay_health",
+        |mut query: QueryMut<'_, (&mut Health,)>, amount: u32| {
+            query.for_each(|(health,)| {
+                health.0 = health.0.saturating_sub(amount);
+            });
+        },
+    );
 
-    // Mutate the Pos column directly through World (outside the tx).
-    // This advances the Pos column tick, invalidating the snapshot.
-    for pos in world.query::<(&mut Pos,)>() {
-        pos.0.x += 999.0;
-    }
-
-    // try_commit detects that the Pos column tick advanced past the snapshot.
-    let result = strategy.try_commit(&mut tx, world);
-    match result {
-        Err(_conflict) => {
-            println!("  commit result:  Err(Conflict) — read column was modified");
-            println!("  buffered writes discarded (transaction aborted)");
-        }
-        Ok(_) => {
-            println!("  commit result:  Ok (unexpected — conflict should have been detected)");
-        }
-    }
+    (move_id, decay_id)
 }
 
-// ── Pessimistic ─────────────────────────────────────────────────────
-
-fn run_pessimistic(world: &mut World, entities: &[Entity]) {
-    let access = Access::of::<(&Health, &mut Health)>(world);
-    let strategy = Pessimistic::new(world);
-
+fn run_reducer_demo(
+    registry: &ReducerRegistry,
+    world: &mut World,
+    move_id: QueryReducerId,
+    decay_id: QueryReducerId,
+) {
+    // Query reducers use registry.run() — direct &mut World access.
+    // The same reducer IDs work regardless of which strategy you'd use
+    // for transactional reducers; query reducers are always scheduled.
     for _ in 0..10 {
-        let entities = entities.to_vec();
-        strategy
-            .transact(world, &access, |tx, world| {
-                let healths: Vec<(Entity, u32)> = tx
-                    .query::<(Entity, &Health)>(world)
-                    .map(|(e, hp)| (e, hp.0))
-                    .collect();
-
-                for (e, hp) in healths {
-                    if entities.contains(&e) {
-                        tx.write::<Health>(world, e, Health(hp.saturating_sub(3)));
-                    }
-                }
-            })
-            .expect("pessimistic commit always succeeds");
+        registry.run(world, move_id, 1.0f32);
+        registry.run(world, decay_id, 3u32);
     }
 
-    let avg = avg_health(world);
-    println!("  after 10 steps: avg health = {avg:.0}");
-    println!("  commit result:  Ok (locks guarantee success)");
+    let (ax, ay) = avg_pos(world);
+    let avg_hp = avg_health(world);
+    println!("  after 10 steps: avg pos = ({ax:.1}, {ay:.1}), avg health = {avg_hp:.0}");
+}
+
+fn show_conflict_detection(
+    registry: &ReducerRegistry,
+    move_id: QueryReducerId,
+    decay_id: QueryReducerId,
+) {
+    let move_access = registry.query_reducer_access(move_id);
+    let decay_access = registry.query_reducer_access(decay_id);
+
+    println!(
+        "  move vs decay: {}",
+        if move_access.conflicts_with(decay_access) {
+            "CONFLICT"
+        } else {
+            "compatible (disjoint components: Pos+Vel vs Health)"
+        }
+    );
+    println!(
+        "  move vs move: {}",
+        if move_access.conflicts_with(move_access) {
+            "CONFLICT (both write Pos)"
+        } else {
+            "compatible"
+        }
+    );
+    println!(
+        "  decay vs decay: {}",
+        if decay_access.conflicts_with(decay_access) {
+            "CONFLICT (both write Health)"
+        } else {
+            "compatible"
+        }
+    );
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Transaction strategies — 100 entities with (Pos, Vel, Health)");
+    println!("Transaction demo — 100 entities with (Pos, Vel, Health)");
     println!();
 
-    // ── 1. Sequential ───────────────────────────────────────────────
+    // ── Part 1: Raw Tx API ──────────────────────────────────────────
 
-    println!("1. Sequential (zero-cost passthrough)");
-    println!("   Movement system: writes Pos, reads Vel");
-    let (mut world, entities) = spawn_world();
-    run_sequential(&mut world);
+    println!("=== Part 1: Raw Tx API ===");
     println!();
 
-    // ── 2. Optimistic (clean commit) ────────────────────────────────
-
-    println!("2. Optimistic (clean commit)");
-    println!("   Health decay system: reads Health, buffers writes, validates at commit");
-    run_optimistic_clean(&mut world, &entities);
+    println!("1. Sequential (begin/commit, zero-cost passthrough)");
+    let (mut world, _entities) = spawn_world();
+    run_raw_sequential(&mut world);
     println!();
 
-    // ── 3. Optimistic (conflict) ────────────────────────────────────
-
-    println!("3. Optimistic (conflict demonstration)");
-    println!("   Declared access: reads Pos, writes Health");
-    println!("   But Pos column is modified externally — tick advances past snapshot");
-    run_optimistic_conflict(&mut world);
+    println!("2. Optimistic (transact closure, tick-based validation)");
+    run_raw_optimistic(&mut world);
     println!();
 
-    // ── 4. Pessimistic (guaranteed commit) ──────────────────────────
+    // ── Part 2: Reducer API ─────────────────────────────────────────
 
-    println!("4. Pessimistic (guaranteed commit)");
-    println!("   Same health decay, but with cooperative column locks");
-    run_pessimistic(&mut world, &entities);
+    println!("=== Part 2: Reducer API (same logic, less boilerplate) ===");
+    println!();
+
+    // Fresh world for each strategy to show identical results.
+    let mut registry = ReducerRegistry::new();
+
+    // Register once — dispatched identically regardless of strategy context.
+    let (mut world, _) = spawn_world();
+    let (move_id, decay_id) = register_reducers(&mut registry, &mut world);
+
+    // 3. Query reducers run directly on &mut World via registry.run().
+    //    No transaction needed — the Access metadata is still tracked.
+    println!("3. Query reducers (direct &mut World, all strategies equivalent)");
+    run_reducer_demo(&registry, &mut world, move_id, decay_id);
+    println!();
+
+    // 4. Conflict detection — free from the Access metadata recorded at registration.
+    println!("4. Conflict detection via query_reducer_access()");
+    show_conflict_detection(&registry, move_id, decay_id);
+    println!();
+
+    // 5. Same reducers, fresh world — demonstrates reproducibility.
+    println!("5. Same reducers, fresh world (strategy-agnostic reproducibility)");
+    let (mut world2, _) = spawn_world();
+    run_reducer_demo(&registry, &mut world2, move_id, decay_id);
     println!();
 
     println!("Done.");

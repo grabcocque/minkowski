@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (293 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (295 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -15,13 +15,13 @@ cargo fmt --all                                          # Format
 cargo bench -p minkowski               # All criterion benchmarks
 cargo bench -p minkowski -- spawn      # Single benchmark
 
-cargo run -p minkowski-examples --example boids --release   # Boids simulation (5K entities, 1K frames)
-cargo run -p minkowski-examples --example life --release    # Game of Life with undo + derive(Table) (64x64 grid, 500 gens)
-cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
-cargo run -p minkowski-examples --example scheduler --release   # Access conflict detection demo (6 systems, 10 frames)
-cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
-cargo run -p minkowski-examples --example battle --release   # Multi-threaded battle with tunable conflict rates (500 entities, 100 frames)
-cargo run -p minkowski-examples --example persist --release   # Durable transactions: WAL + snapshot save/load/recovery (100 entities, 10 frames)
+cargo run -p minkowski-examples --example boids --release   # Boids flocking with query reducers + spatial grid (5K entities, 1K frames)
+cargo run -p minkowski-examples --example life --release    # Game of Life with QueryMut reducer, Table, undo/redo (64x64 grid, 500 gens)
+cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body with query reducers (2K entities, 1K frames)
+cargo run -p minkowski-examples --example scheduler --release   # ReducerRegistry-based conflict detection + batch scheduling (6 systems, 10 frames)
+cargo run -p minkowski-examples --example transaction --release   # Transaction strategies: raw Tx + reducer comparison (3 strategies, 100 entities)
+cargo run -p minkowski-examples --example battle --release   # Multi-threaded EntityMut reducers with tunable conflict (500 entities, 100 frames)
+cargo run -p minkowski-examples --example persist --release   # Durable QueryWriter reducer: WAL + snapshots (100 entities, 10 frames)
 cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/query-writer/dynamic handles + structural mutations + conflict detection
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
@@ -175,6 +175,7 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 - **Verify-before-design rule**: before designing features that depend on existing APIs, `grep` for the actual current methods/types. Confirm which ones exist vs which need to be created. Past bugs: assuming `EntityAllocator::reserve()` had atomics (it didn't exist), proposing `&mut World` in reducer APIs (unsound). The type system doesn't catch "assumed this method exists" — verification does.
 - **Derive macro visibility rule**: after implementing or modifying derive macros or code generation, always test the generated code from an external example/binary target (`minkowski-examples`) to verify `pub` vs `pub(crate)` visibility is correct. In-crate tests won't catch `pub(crate)` leaking into generated code.
 - **Change detection audit rule**: when implementing change detection or mutation tracking, enumerate ALL mutation paths (spawn, get_mut, insert, remove, query `&mut T`, query_table_mut, query_table_raw, changeset apply, any new accessor) and verify each path triggers detection. Consider same-tick interleaving edge cases where two mutations in the same tick must both be visible.
+- **Bypass-path invariant rule**: when adding a new code path that skips the normal access/mutation pipeline (e.g., `query_table_mut` bypassing `world.query()`, manual archetype scanning in QueryWriter, `query_raw` skipping cache/ticks), verify that ALL existing invariants are maintained through the bypass: change detection ticks, query cache invalidation, Access bitset accuracy, entity lifecycle tracking. The normal pipeline enforces these automatically; bypass paths must enforce them manually or explicitly document which invariants they intentionally skip and why.
 - **Bug fix workflow rule**: when a specific bug is reported, address it directly with targeted investigation — don't route through brainstorming or design exploration workflows. Brainstorming is for new features and design decisions, not concrete bugs with reproduction steps.
 - **Drop cleanup rule**: if Drop needs to clean up engine state, the cleanup path must be reachable from `&self`. This constrains where state can live. If it's on World, Drop can't reach it. If it's behind `Arc<Mutex<_>>` shared between World and the transaction, Drop can. Every future resource that transactions can allocate — entity IDs, archetype slots, reserved capacity — must follow this pattern or it will leak on abort.
 

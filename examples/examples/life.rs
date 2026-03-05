@@ -1,15 +1,19 @@
-//! Game of Life with undo — exercises `#[derive(Table)]`, Changed<T>, EnumChangeSet, and undo/replay.
+//! Game of Life with undo — exercises `#[derive(Table)]`, reducers, Changed<T>, EnumChangeSet,
+//! and undo/replay.
 //!
-//! Run: cargo run -p minkowski --example life --release
+//! Run: cargo run -p minkowski-examples --example life --release
 //!
 //! Features exercised:
 //! - `#[derive(Table)]` for typed row access that skips archetype matching
-//! - `query_table` / `query_table_mut` for bulk reads and writes over the cell grid
+//! - `QueryMut` reducer for writing neighbor counts (Table + reducer integration)
+//! - `query_table` for bulk reads over the cell grid
 //! - `Changed<CellState>` for detecting which cells mutated each generation
 //! - `EnumChangeSet::insert` for recording typed mutations with automatic undo
 //! - Reversible changesets for time-travel (rewind + deterministic replay)
 
-use minkowski::{Changed, Entity, EnumChangeSet, Table, World};
+use minkowski::{
+    Changed, Entity, EnumChangeSet, QueryMut, QueryReducerId, ReducerRegistry, Table, World,
+};
 use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -83,15 +87,6 @@ fn count_neighbors(states: &[bool]) -> Vec<u8> {
     counts
 }
 
-/// Write neighbor counts into the world via `query_table_mut`.
-/// Marks all Cell columns changed (including CellState) — this is the
-/// column-level granularity trade-off of the table mutation path.
-fn write_neighbor_counts(world: &mut World, counts: &[u8]) {
-    for (row, &count) in world.query_table_mut::<Cell>().zip(counts.iter()) {
-        row.neighbors.0 = count;
-    }
-}
-
 /// Apply Conway rules: returns (grid_index, new_state) for each cell that changed.
 fn apply_rules(states: &[bool], counts: &[u8]) -> Vec<(usize, bool)> {
     let mut updates = Vec::new();
@@ -113,6 +108,9 @@ fn apply_rules(states: &[bool], counts: &[u8]) -> Vec<(usize, bool)> {
 
 /// Build an EnumChangeSet from cell state updates and apply it.
 /// Returns the reverse changeset for undo.
+///
+/// Uses EnumChangeSet directly (not a reducer) to capture reverse changesets
+/// for undo/redo — this is the core of the time-travel demo.
 fn apply_updates(world: &mut World, grid: &[Entity], updates: &[(usize, bool)]) -> EnumChangeSet {
     let mut cs = EnumChangeSet::new();
     for &(i, new_state) in updates {
@@ -129,10 +127,30 @@ fn alive_count(world: &mut World) -> usize {
         .count()
 }
 
+/// Register a QueryMut reducer that writes pre-computed neighbor counts
+/// into the NeighborCount column. Demonstrates Table + reducer integration.
+fn register_write_neighbors(registry: &mut ReducerRegistry, world: &mut World) -> QueryReducerId {
+    registry.register_query::<(&mut NeighborCount,), Vec<u8>, _>(
+        world,
+        "write_neighbor_counts",
+        |mut query: QueryMut<'_, (&mut NeighborCount,)>, counts: Vec<u8>| {
+            let mut i = 0;
+            query.for_each(|(nc,)| {
+                nc.0 = counts[i];
+                i += 1;
+            });
+        },
+    )
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
     let mut world = World::new();
+
+    // Set up reducer registry with a QueryMut reducer for neighbor counting
+    let mut registry = ReducerRegistry::new();
+    let write_neighbors_id = register_write_neighbors(&mut registry, &mut world);
 
     // Spawn 64x64 grid in row-major order
     let mut grid = Vec::with_capacity(CELL_COUNT);
@@ -145,11 +163,11 @@ fn main() {
         grid.push(e);
     }
 
-    // Initial neighbor count
+    // Initial neighbor count via reducer
     {
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        write_neighbor_counts(&mut world, &counts);
+        registry.run(&mut world, write_neighbors_id, counts);
     }
 
     println!(
@@ -165,12 +183,14 @@ fn main() {
     for gen in 0..GENERATIONS {
         let frame_start = Instant::now();
 
-        // Snapshot states, recount neighbors
+        // Snapshot states, recount neighbors via QueryMut reducer
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        write_neighbor_counts(&mut world, &counts);
+        registry.run(&mut world, write_neighbors_id, counts.clone());
 
-        // Apply Conway rules via EnumChangeSet — automatic undo capture
+        // Apply Conway rules via EnumChangeSet — automatic undo capture.
+        // Uses EnumChangeSet directly (not a reducer) to capture reverse
+        // changesets for undo/redo.
         let updates = apply_rules(&states, &counts);
         let change_count = updates.len();
         let reverse = apply_updates(&mut world, &grid, &updates);
@@ -235,7 +255,7 @@ fn main() {
     for i in 0..REWIND_GENS {
         let states = snapshot_states(&mut world);
         let counts = count_neighbors(&states);
-        write_neighbor_counts(&mut world, &counts);
+        registry.run(&mut world, write_neighbors_id, counts.clone());
 
         let updates = apply_rules(&states, &counts);
         let _ = apply_updates(&mut world, &grid, &updates);

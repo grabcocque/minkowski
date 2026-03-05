@@ -1,25 +1,26 @@
 //! Multi-threaded arena battle — stress-tests optimistic vs pessimistic
-//! transaction strategies under tunable conflict rates.
+//! transaction strategies under tunable conflict rates using EntityMut reducers.
 //!
 //! Run: cargo run -p minkowski-examples --example battle --release
 //!
 //! Features exercised:
-//! - `Transact` trait with building-block `begin()`/`try_commit()` API
-//! - `Tx` — unified transaction handle with `query()`, `write()`, `has_locks()`
-//! - `rayon::join` for parallel read phases (concurrent `&World` access)
-//! - Split-phase execution: parallel reads, sequential writes, sequential commit
+//! - `ReducerRegistry` with `register_entity` for typed per-entity mutations
+//! - `EntityMut<C>` handles with compile-time access enforcement
+//! - `registry.call()` dispatching through `Optimistic` / `Pessimistic` strategies
+//! - `rayon::join` for parallel snapshot computation, sequential reducer dispatch
 //! - Conflict detection under disjoint vs overlapping write-sets
 //!
 //! Two modes:
-//! - **Low conflict**: combat writes `Damage`, healing writes `Healing` — disjoint
-//!   columns, so optimistic commits succeed without conflicts. A separate
+//! - **Low conflict**: attack writes `Damage`, heal writes `Healing` — disjoint
+//!   component sets, so optimistic commits succeed without conflicts. A separate
 //!   `apply_effects` step merges both into `Health`.
-//! - **High conflict**: both combat and healing write `Health` directly. Both
-//!   transactions read and write the same column, so the first commit advances
-//!   the Health column tick, causing the second commit to detect a conflict.
-//!   The conflicted transaction's writes are discarded (optimistic abort).
+//! - **High conflict**: both attack and heal write `Health` directly. Both
+//!   reducers touch the same column, so optimistic conflicts are expected.
+//!   The strategy's internal retry loop handles them.
 
-use minkowski::{Access, Entity, Optimistic, Pessimistic, Transact, World};
+use minkowski::{
+    Entity, EntityMut, Optimistic, Pessimistic, ReducerId, ReducerRegistry, Transact, World,
+};
 use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -40,65 +41,10 @@ struct Healing(u32);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConflictMode {
-    /// Combat writes Damage, healing writes Healing. Disjoint columns.
+    /// Attack writes Damage, heal writes Healing. Disjoint columns.
     Low,
-    /// Both combat and healing write Health directly. Overlapping.
+    /// Both attack and heal write Health directly. Overlapping.
     High,
-}
-
-// ── System computations ─────────────────────────────────────────────
-//
-// Pure functions: read entity snapshots, return intended mutations.
-
-/// Compute damage for opposing-team entities.
-fn compute_combat(entities: &[(Entity, u8, u32)], mode: ConflictMode) -> Vec<(Entity, u32)> {
-    entities
-        .iter()
-        .filter(|&&(_, team, _)| match mode {
-            ConflictMode::Low => team == 1,
-            ConflictMode::High => true,
-        })
-        .map(|&(e, _, hp)| {
-            let dmg = 5u32;
-            match mode {
-                ConflictMode::Low => (e, dmg),
-                ConflictMode::High => (e, hp.saturating_sub(dmg)),
-            }
-        })
-        .collect()
-}
-
-/// Compute healing for friendly-team entities.
-fn compute_healing(entities: &[(Entity, u8, u32)], mode: ConflictMode) -> Vec<(Entity, u32)> {
-    entities
-        .iter()
-        .filter(|&&(_, team, _)| match mode {
-            ConflictMode::Low => team == 0,
-            ConflictMode::High => true,
-        })
-        .map(|&(e, _, hp)| {
-            let heal = 3u32;
-            match mode {
-                ConflictMode::Low => (e, heal),
-                ConflictMode::High => (e, hp.saturating_add(heal).min(100)),
-            }
-        })
-        .collect()
-}
-
-/// Low-conflict only: merge Damage + Healing into Health.
-fn apply_effects(world: &mut World) {
-    let effects: Vec<(Entity, u32)> = world
-        .query::<(Entity, &Health, &Damage, &Healing)>()
-        .map(|(e, hp, dmg, heal)| {
-            let new_hp = hp.0.saturating_sub(dmg.0).saturating_add(heal.0).min(100);
-            (e, new_hp)
-        })
-        .collect();
-
-    for (e, new_hp) in effects {
-        world.insert(e, Health(new_hp));
-    }
 }
 
 // ── Stats ───────────────────────────────────────────────────────────
@@ -129,245 +75,124 @@ impl FrameStats {
         println!("{label}");
         println!(
             "  commits: {} | conflicts: {} | avg frame: {:.2}ms",
-            self.commits, self.conflicts, avg_ms,
+            self.commits, self.conflicts, avg_ms
         );
     }
 }
 
-// ── Optimistic frame ────────────────────────────────────────────────
+// ── Reducer IDs for each scenario ───────────────────────────────────
 
-fn run_frame_optimistic(
-    world: &mut World,
-    mode: ConflictMode,
-    combat_access: &Access,
-    healing_access: &Access,
-    stats: &mut FrameStats,
-) {
-    let frame_start = Instant::now();
-
-    // 1. Begin phase (sequential -- needs &mut World).
-    let strategy = Optimistic::new(world);
-    let mut tx_combat = strategy.begin(world, combat_access);
-    let mut tx_healing = strategy.begin(world, healing_access);
-
-    // 2. Parallel read phase.
-    //    tx.query(&self, &World) takes shared refs -- safe for concurrent reads.
-    //    Each closure captures &tx (Sync) and &world (Sync), both shareable.
-    let (combat_results, healing_results) = rayon::join(
-        || {
-            let entities: Vec<(Entity, u8, u32)> = tx_combat
-                .query::<(Entity, &Team, &Health)>(world)
-                .map(|(e, t, h)| (e, t.0, h.0))
-                .collect();
-            compute_combat(&entities, mode)
-        },
-        || {
-            let entities: Vec<(Entity, u8, u32)> = tx_healing
-                .query::<(Entity, &Team, &Health)>(world)
-                .map(|(e, t, h)| (e, t.0, h.0))
-                .collect();
-            compute_healing(&entities, mode)
-        },
-    );
-
-    // 3. Sequential write phase -- buffer results into changesets.
-    match mode {
-        ConflictMode::Low => {
-            for &(entity, dmg) in &combat_results {
-                tx_combat.write::<Damage>(world, entity, Damage(dmg));
-            }
-            for &(entity, heal) in &healing_results {
-                tx_healing.write::<Healing>(world, entity, Healing(heal));
-            }
-        }
-        ConflictMode::High => {
-            for &(entity, new_hp) in &combat_results {
-                tx_combat.write::<Health>(world, entity, Health(new_hp));
-            }
-            for &(entity, new_hp) in &healing_results {
-                tx_healing.write::<Health>(world, entity, Health(new_hp));
-            }
-        }
-    }
-
-    // 4. Commit phase (sequential).
-    //    In high-conflict mode, the first commit writes Health and advances
-    //    the column tick. The second commit's validation sees this and fails.
-    match strategy.try_commit(&mut tx_combat, world) {
-        Ok(forward) => {
-            tx_combat.mark_committed();
-            drop(tx_combat);
-            forward.apply(world);
-            stats.commits += 1;
-        }
-        Err(_) => {
-            drop(tx_combat);
-            stats.conflicts += 1;
-        }
-    }
-    match strategy.try_commit(&mut tx_healing, world) {
-        Ok(forward) => {
-            tx_healing.mark_committed();
-            drop(tx_healing);
-            forward.apply(world);
-            stats.commits += 1;
-        }
-        Err(_) => {
-            drop(tx_healing);
-            stats.conflicts += 1;
-        }
-    }
-
-    // 5. Low-conflict mode: merge Damage + Healing into Health.
-    if mode == ConflictMode::Low {
-        apply_effects(world);
-    }
-
-    stats.total_time += frame_start.elapsed();
-    stats.frames += 1;
+struct ReducerIds {
+    /// Low-conflict: writes Damage component
+    attack_low: ReducerId,
+    /// Low-conflict: writes Healing component
+    heal_low: ReducerId,
+    /// High-conflict: writes Health directly
+    attack_high: ReducerId,
+    /// High-conflict: writes Health directly
+    heal_high: ReducerId,
 }
 
-// ── Pessimistic frame ───────────────────────────────────────────────
+// ── System computations ─────────────────────────────────────────────
+//
+// Pure functions: read entity snapshots, return intended targets + amounts.
 
-fn run_frame_pessimistic(
-    world: &mut World,
+/// Compute attack targets for opposing-team entities.
+/// Returns (entity, delta) — always a relative amount, never absolute.
+fn compute_combat_targets(
+    entities: &[(Entity, u8, u32)],
     mode: ConflictMode,
-    combat_access: &Access,
-    healing_access: &Access,
+) -> Vec<(Entity, u32)> {
+    let dmg = 5u32;
+    entities
+        .iter()
+        .filter(|&&(_, team, _)| match mode {
+            ConflictMode::Low => team == 1,
+            ConflictMode::High => true,
+        })
+        .map(|&(e, _, _)| (e, dmg))
+        .collect()
+}
+
+/// Compute healing targets for friendly-team entities.
+/// Returns (entity, delta) — always a relative amount, never absolute.
+fn compute_healing_targets(
+    entities: &[(Entity, u8, u32)],
+    mode: ConflictMode,
+) -> Vec<(Entity, u32)> {
+    let heal = 3u32;
+    entities
+        .iter()
+        .filter(|&&(_, team, _)| match mode {
+            ConflictMode::Low => team == 0,
+            ConflictMode::High => true,
+        })
+        .map(|&(e, _, _)| (e, heal))
+        .collect()
+}
+
+/// Low-conflict only: merge Damage + Healing into Health.
+fn apply_effects(world: &mut World) {
+    let effects: Vec<(Entity, u32)> = world
+        .query::<(Entity, &Health, &Damage, &Healing)>()
+        .map(|(e, hp, dmg, heal)| {
+            let new_hp = hp.0.saturating_sub(dmg.0).saturating_add(heal.0).min(100);
+            (e, new_hp)
+        })
+        .collect();
+
+    for (e, new_hp) in effects {
+        world.insert(e, Health(new_hp));
+    }
+}
+
+// ── Frame execution ─────────────────────────────────────────────────
+
+fn run_frame<S: Transact>(
+    world: &mut World,
+    registry: &ReducerRegistry,
+    strategy: &S,
+    mode: ConflictMode,
+    ids: &ReducerIds,
     stats: &mut FrameStats,
 ) {
     let frame_start = Instant::now();
 
-    // Single strategy instance — both transactions share the same lock table,
-    // so conflicting locks are correctly detected across concurrent systems.
-    let strategy = Pessimistic::new(world);
+    // 1. Snapshot phase: read all entity state for target computation.
+    let snapshot: Vec<(Entity, u8, u32)> = world
+        .query::<(Entity, &Team, &Health)>()
+        .map(|(e, t, h)| (e, t.0, h.0))
+        .collect();
 
-    // 1. Begin phase (sequential).
-    let mut tx_combat = strategy.begin(world, combat_access);
-    let mut tx_healing = strategy.begin(world, healing_access);
-
-    // If the second tx couldn't acquire locks (write-write conflict on same
-    // columns), fall back to sequential execution: commit combat first, then
-    // re-begin healing with locks now available.
-    if !tx_healing.has_locks() {
-        stats.conflicts += 1;
-        // Run combat to completion
-        let entities: Vec<(Entity, u8, u32)> = tx_combat
-            .query::<(Entity, &Team, &Health)>(world)
-            .map(|(e, t, h)| (e, t.0, h.0))
-            .collect();
-        let combat_results = compute_combat(&entities, mode);
-        match mode {
-            ConflictMode::Low => {
-                for &(entity, dmg) in &combat_results {
-                    tx_combat.write::<Damage>(world, entity, Damage(dmg));
-                }
-            }
-            ConflictMode::High => {
-                for &(entity, new_hp) in &combat_results {
-                    tx_combat.write::<Health>(world, entity, Health(new_hp));
-                }
-            }
-        }
-        let forward = strategy
-            .try_commit(&mut tx_combat, world)
-            .expect("combat tx holds locks");
-        tx_combat.mark_committed();
-        drop(tx_combat);
-        forward.apply(world);
-        stats.commits += 1;
-        drop(tx_healing); // release (no locks to release)
-
-        // Re-begin healing — locks now available
-        let mut tx_healing = strategy.begin(world, healing_access);
-        let entities: Vec<(Entity, u8, u32)> = tx_healing
-            .query::<(Entity, &Team, &Health)>(world)
-            .map(|(e, t, h)| (e, t.0, h.0))
-            .collect();
-        let healing_results = compute_healing(&entities, mode);
-        match mode {
-            ConflictMode::Low => {
-                for &(entity, heal) in &healing_results {
-                    tx_healing.write::<Healing>(world, entity, Healing(heal));
-                }
-            }
-            ConflictMode::High => {
-                for &(entity, new_hp) in &healing_results {
-                    tx_healing.write::<Health>(world, entity, Health(new_hp));
-                }
-            }
-        }
-        let forward = strategy
-            .try_commit(&mut tx_healing, world)
-            .expect("healing tx holds locks");
-        tx_healing.mark_committed();
-        drop(tx_healing);
-        forward.apply(world);
-        stats.commits += 1;
-        if mode == ConflictMode::Low {
-            apply_effects(world);
-        }
-        stats.total_time += frame_start.elapsed();
-        stats.frames += 1;
-        return;
-    }
-
-    // 2. Parallel read phase — both txs have locks, safe to read concurrently.
-    let (combat_results, healing_results) = rayon::join(
-        || {
-            let entities: Vec<(Entity, u8, u32)> = tx_combat
-                .query::<(Entity, &Team, &Health)>(world)
-                .map(|(e, t, h)| (e, t.0, h.0))
-                .collect();
-            compute_combat(&entities, mode)
-        },
-        || {
-            let entities: Vec<(Entity, u8, u32)> = tx_healing
-                .query::<(Entity, &Team, &Health)>(world)
-                .map(|(e, t, h)| (e, t.0, h.0))
-                .collect();
-            compute_healing(&entities, mode)
-        },
+    // 2. Parallel computation: determine targets + amounts using rayon.
+    //    This is pure computation on snapshot data — no World access needed.
+    let (combat_targets, healing_targets) = rayon::join(
+        || compute_combat_targets(&snapshot, mode),
+        || compute_healing_targets(&snapshot, mode),
     );
 
-    // 3. Sequential write phase.
-    match mode {
-        ConflictMode::Low => {
-            for &(entity, dmg) in &combat_results {
-                tx_combat.write::<Damage>(world, entity, Damage(dmg));
-            }
-            for &(entity, heal) in &healing_results {
-                tx_healing.write::<Healing>(world, entity, Healing(heal));
-            }
-        }
-        ConflictMode::High => {
-            for &(entity, new_hp) in &combat_results {
-                tx_combat.write::<Health>(world, entity, Health(new_hp));
-            }
-            for &(entity, new_hp) in &healing_results {
-                tx_healing.write::<Health>(world, entity, Health(new_hp));
-            }
+    // 3. Sequential dispatch: apply mutations via registry.call().
+    //    Each call() runs through the strategy's transact() with internal retry.
+    let (attack_id, heal_id) = match mode {
+        ConflictMode::Low => (ids.attack_low, ids.heal_low),
+        ConflictMode::High => (ids.attack_high, ids.heal_high),
+    };
+
+    for &(entity, amount) in &combat_targets {
+        match registry.call(strategy, world, attack_id, (entity, amount)) {
+            Ok(()) => stats.commits += 1,
+            Err(_) => stats.conflicts += 1,
         }
     }
 
-    // 4. Commit phase — locks guarantee success.
-    let forward = strategy
-        .try_commit(&mut tx_combat, world)
-        .expect("combat tx holds locks");
-    tx_combat.mark_committed();
-    drop(tx_combat);
-    forward.apply(world);
-    stats.commits += 1;
+    for &(entity, amount) in &healing_targets {
+        match registry.call(strategy, world, heal_id, (entity, amount)) {
+            Ok(()) => stats.commits += 1,
+            Err(_) => stats.conflicts += 1,
+        }
+    }
 
-    let forward = strategy
-        .try_commit(&mut tx_healing, world)
-        .expect("healing tx holds locks");
-    tx_healing.mark_committed();
-    drop(tx_healing);
-    forward.apply(world);
-    stats.commits += 1;
-
-    // 5. Low-conflict mode: merge effects.
+    // 4. Low-conflict mode: merge Damage + Healing into Health.
     if mode == ConflictMode::Low {
         apply_effects(world);
     }
@@ -388,8 +213,8 @@ fn spawn_arena(world: &mut World, count: usize) {
 
 fn avg_health(world: &mut World) -> f32 {
     let (mut total, mut n) = (0u64, 0u32);
-    for hp in world.query::<(&Health,)>() {
-        total += hp.0 .0 as u64;
+    for hp in world.query::<&Health>() {
+        total += hp.0 as u64;
         n += 1;
     }
     if n == 0 {
@@ -400,6 +225,71 @@ fn avg_health(world: &mut World) -> f32 {
 
 // ── Main ────────────────────────────────────────────────────────────
 
+fn register_reducers(world: &mut World, registry: &mut ReducerRegistry) -> ReducerIds {
+    // Low-conflict: attack writes Damage (disjoint from Healing)
+    let attack_low = registry.register_entity::<(Damage,), u32, _>(
+        world,
+        "attack_low",
+        |mut entity: EntityMut<'_, (Damage,)>, dmg: u32| {
+            entity.set::<Damage, 0>(Damage(dmg));
+        },
+    );
+
+    // Low-conflict: heal writes Healing (disjoint from Damage)
+    let heal_low = registry.register_entity::<(Healing,), u32, _>(
+        world,
+        "heal_low",
+        |mut entity: EntityMut<'_, (Healing,)>, heal: u32| {
+            entity.set::<Healing, 0>(Healing(heal));
+        },
+    );
+
+    // High-conflict: attack reads + writes Health (read-modify-write)
+    let attack_high = registry.register_entity::<(Health,), u32, _>(
+        world,
+        "attack_high",
+        |mut entity: EntityMut<'_, (Health,)>, dmg: u32| {
+            let hp = entity.get::<Health, 0>().0;
+            entity.set::<Health, 0>(Health(hp.saturating_sub(dmg)));
+        },
+    );
+
+    // High-conflict: heal reads + writes Health (read-modify-write)
+    let heal_high = registry.register_entity::<(Health,), u32, _>(
+        world,
+        "heal_high",
+        |mut entity: EntityMut<'_, (Health,)>, heal: u32| {
+            let hp = entity.get::<Health, 0>().0;
+            entity.set::<Health, 0>(Health(hp.saturating_add(heal).min(100)));
+        },
+    );
+
+    // Verify access conflicts match expectations
+    let attack_low_access = registry.reducer_access(attack_low);
+    let heal_low_access = registry.reducer_access(heal_low);
+    let attack_high_access = registry.reducer_access(attack_high);
+    let heal_high_access = registry.reducer_access(heal_high);
+
+    assert!(
+        !attack_low_access.conflicts_with(heal_low_access),
+        "low-conflict reducers should not conflict (disjoint components)"
+    );
+    assert!(
+        attack_high_access.conflicts_with(heal_high_access),
+        "high-conflict reducers should conflict (both write Health)"
+    );
+
+    println!("  attack_low vs heal_low: compatible (disjoint components)");
+    println!("  attack_high vs heal_high: CONFLICT (both write Health)");
+
+    ReducerIds {
+        attack_low,
+        heal_low,
+        attack_high,
+        heal_high,
+    }
+}
+
 fn run_scenario(
     label: &str,
     mode: ConflictMode,
@@ -408,38 +298,22 @@ fn run_scenario(
     use_optimistic: bool,
 ) {
     let mut world = World::new();
+    let mut registry = ReducerRegistry::new();
+    let ids = register_reducers(&mut world, &mut registry);
+
     spawn_arena(&mut world, entity_count);
 
-    // Access descriptors must be created per-world (component IDs are per-registry).
-    let (combat_access, healing_access) = match mode {
-        ConflictMode::Low => (
-            Access::of::<(Entity, &Team, &Health, &mut Damage)>(&mut world),
-            Access::of::<(Entity, &Team, &Health, &mut Healing)>(&mut world),
-        ),
-        ConflictMode::High => (
-            Access::of::<(Entity, &Team, &Health, &mut Health)>(&mut world),
-            Access::of::<(Entity, &Team, &Health, &mut Health)>(&mut world),
-        ),
-    };
-
     let mut stats = FrameStats::new();
-    for _ in 0..frames {
-        if use_optimistic {
-            run_frame_optimistic(
-                &mut world,
-                mode,
-                &combat_access,
-                &healing_access,
-                &mut stats,
-            );
-        } else {
-            run_frame_pessimistic(
-                &mut world,
-                mode,
-                &combat_access,
-                &healing_access,
-                &mut stats,
-            );
+
+    if use_optimistic {
+        let strategy = Optimistic::new(&world);
+        for _ in 0..frames {
+            run_frame(&mut world, &registry, &strategy, mode, &ids, &mut stats);
+        }
+    } else {
+        let strategy = Pessimistic::new(&world);
+        for _ in 0..frames {
+            run_frame(&mut world, &registry, &strategy, mode, &ids, &mut stats);
         }
     }
 
