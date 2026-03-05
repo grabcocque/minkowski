@@ -1,4 +1,5 @@
-//! Reducer system demo: typed handles enforce declared access at compile time.
+//! Reducer system demo: typed handles enforce declared access at compile time,
+//! dynamic reducers provide runtime-flexible access with builder-declared bounds.
 //!
 //! Demonstrates:
 //! 1. Entity reducer (heal) — reads & writes Health via EntityMut
@@ -7,9 +8,10 @@
 //! 4. Spawner reducer — creates new entities via Spawner
 //! 5. Name-based lookup
 //! 6. Access conflict detection between registered reducers
+//! 7. Dynamic reducer — conditional access based on runtime state
 
 use minkowski::{
-    Entity, EntityMut, Optimistic, QueryMut, QueryRef, ReducerRegistry, Spawner, World,
+    DynamicCtx, Entity, EntityMut, Optimistic, QueryMut, QueryRef, ReducerRegistry, Spawner, World,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -17,6 +19,12 @@ struct Health(u32);
 
 #[derive(Clone, Copy, Debug)]
 struct Velocity(f32);
+
+#[derive(Clone, Copy, Debug)]
+struct Energy(f32);
+
+#[derive(Clone, Copy, Debug)]
+struct Shield(f32);
 
 fn main() {
     let mut world = World::new();
@@ -133,11 +141,81 @@ fn main() {
     let found_gravity = registry.query_reducer_id_by_name("gravity").unwrap();
     println!("'gravity' -> {:?}", found_gravity);
 
-    // ── 7. Access conflict detection ─────────────────────────────────
+    // ── 7. Dynamic reducer — conditional access ──────────────────
+    println!("\n--- Dynamic reducers ---");
+
+    // Give hero and enemy Energy + Shield components for dynamic reducer demo
+    world.insert(hero, Energy(80.0));
+    world.insert(hero, Shield(0.0));
+    world.insert(enemy, Energy(30.0));
+    world.insert(enemy, Shield(0.0));
+
+    // Register a dynamic reducer that conditionally applies a shield
+    // based on HP and Energy — can't express this with static types
+    // because the Shield write only happens when HP < 50.
+    let shield_id = registry
+        .dynamic("conditional_shield", &mut world)
+        .can_read::<Health>()
+        .can_read::<Energy>()
+        .can_write::<Energy>()
+        .can_write::<Shield>()
+        .build(|ctx: &mut DynamicCtx, entity: &Entity| {
+            let hp = ctx.read::<Health>(*entity).0;
+            let energy = ctx.read::<Energy>(*entity).0;
+            if energy >= 50.0 {
+                ctx.write(*entity, Energy(energy - 50.0));
+                if hp < 50 {
+                    // Conditional write — only when HP is low
+                    ctx.write(*entity, Shield(100.0));
+                    println!(
+                        "  [shield] entity {:?}: low HP ({}) — shield activated!",
+                        entity, hp
+                    );
+                } else {
+                    println!(
+                        "  [shield] entity {:?}: HP fine ({}) — energy spent, no shield",
+                        entity, hp
+                    );
+                }
+            } else {
+                println!(
+                    "  [shield] entity {:?}: not enough energy ({:.0})",
+                    entity, energy
+                );
+            }
+        });
+    println!(
+        "Registered 'conditional_shield' dynamic reducer (id={:?})",
+        shield_id
+    );
+
+    // Dispatch via Optimistic strategy (dynamic reducers buffer writes,
+    // so they need a real transactional strategy — not Sequential)
+    registry
+        .dynamic_call(&strategy, &mut world, shield_id, &hero)
+        .unwrap();
+    registry
+        .dynamic_call(&strategy, &mut world, shield_id, &enemy)
+        .unwrap();
+
+    println!(
+        "After shields: hero energy={:.0} shield={:.0}, enemy energy={:.0} shield={:.0}",
+        world.get::<Energy>(hero).unwrap().0,
+        world.get::<Shield>(hero).unwrap().0,
+        world.get::<Energy>(enemy).unwrap().0,
+        world.get::<Shield>(enemy).unwrap().0,
+    );
+
+    // Name-based lookup works for dynamic reducers too
+    let found_shield = registry.dynamic_id_by_name("conditional_shield");
+    println!("Dynamic lookup 'conditional_shield' -> {:?}", found_shield);
+
+    // ── 8. Access conflict detection (static vs dynamic) ───────────
     println!("\n--- Access conflict detection ---");
     let heal_access = registry.reducer_access(heal_id);
     let damage_access = registry.reducer_access(damage_id);
     let gravity_access = registry.query_reducer_access(gravity_id);
+    let shield_access = registry.dynamic_access(shield_id);
 
     println!(
         "heal vs damage: {}",
@@ -150,6 +228,22 @@ fn main() {
     println!(
         "heal vs gravity: {}",
         if heal_access.conflicts_with(gravity_access) {
+            "CONFLICT"
+        } else {
+            "compatible (disjoint components)"
+        }
+    );
+    println!(
+        "heal vs conditional_shield: {}",
+        if heal_access.conflicts_with(shield_access) {
+            "CONFLICT (both touch Health)"
+        } else {
+            "compatible"
+        }
+    );
+    println!(
+        "gravity vs conditional_shield: {}",
+        if gravity_access.conflicts_with(shield_access) {
             "CONFLICT"
         } else {
             "compatible (disjoint components)"
