@@ -96,6 +96,11 @@ impl DynamicResolved {
     pub(crate) fn has_remove<T: 'static>(&self) -> bool {
         self.remove_ids.contains(&TypeId::of::<T>())
     }
+
+    /// Check if a ComponentId is in the declared set.
+    pub(crate) fn contains_comp_id(&self, comp_id: ComponentId) -> bool {
+        self.entries.iter().any(|(_, cid)| *cid == comp_id)
+    }
 }
 
 // ── DynamicCtx ───────────────────────────────────────────────────────
@@ -268,6 +273,41 @@ impl<'a> DynamicCtx<'a> {
             "despawn not declared in dynamic reducer (use can_despawn)"
         );
         self.changeset.record_despawn(entity);
+    }
+
+    /// Iterate entities matching query `Q` using the typed query codepath.
+    /// `Q` must be a `ReadOnlyWorldQuery` — writes go through `ctx.write()`.
+    ///
+    /// # Panics
+    /// Panics if `Q` accesses any component not declared via `can_read`
+    /// or `can_write` on the builder.
+    pub fn for_each<Q: ReadOnlyWorldQuery + 'static>(&self, mut f: impl FnMut(Q::Item<'_>)) {
+        // Runtime validation: Q's accessed components must be a subset
+        // of the builder-declared components.
+        let accessed = Q::accessed_ids(&self.world.components);
+        for comp_id in accessed.ones() {
+            assert!(
+                self.resolved.contains_comp_id(comp_id),
+                "query accesses component ID {} which was not declared \
+                 in dynamic reducer (use can_read/can_write)",
+                comp_id,
+            );
+        }
+
+        let required = Q::required_ids(&self.world.components);
+
+        for arch in &self.world.archetypes.archetypes {
+            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                continue;
+            }
+            let fetch = Q::init_fetch(arch, &self.world.components);
+            for row in 0..arch.len() {
+                // Safety: row is in bounds (0..arch.len()), fetch was
+                // initialized from the same archetype.
+                let item = unsafe { Q::fetch(&fetch, row) };
+                f(item);
+            }
+        }
     }
 }
 
@@ -2050,6 +2090,75 @@ mod tests {
             },
         );
         let _ = registry.call(&strategy, &mut world, id, (e, ()));
+    }
+
+    // ── DynamicCtx::for_each tests ──────────────────────────────
+
+    #[test]
+    fn dynamic_ctx_for_each_iterates() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        world.spawn((Vel(3.0),)); // no Pos — not matched
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        let id = registry
+            .dynamic("count_pos", &mut world)
+            .can_read::<Pos>()
+            .build(move |ctx: &mut DynamicCtx, _args: &()| {
+                ctx.for_each::<(&Pos,)>(|(_pos,)| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &())
+            .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "not declared")]
+    fn dynamic_ctx_for_each_undeclared_panics() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("bad_query", &mut world)
+            .can_read::<Pos>()
+            .build(|ctx: &mut DynamicCtx, _args: &()| {
+                ctx.for_each::<(&Pos, &Vel)>(|(_p, _v)| {});
+            });
+        let _ = registry.dynamic_call(&strategy, &mut world, id, &());
+    }
+
+    #[test]
+    fn dynamic_ctx_for_each_with_write_after_read() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos(1.0), Vel(10.0)));
+        let e2 = world.spawn((Pos(2.0), Vel(20.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .dynamic("double_vel", &mut world)
+            .can_read::<Vel>()
+            .can_write::<Vel>()
+            .build(|ctx: &mut DynamicCtx, _args: &()| {
+                let mut updates: Vec<(Entity, f32)> = Vec::new();
+                ctx.for_each::<(Entity, &Vel)>(|(entity, vel)| {
+                    updates.push((entity, vel.0 * 2.0));
+                });
+                for (entity, new_vel) in updates {
+                    ctx.write(entity, Vel(new_vel));
+                }
+            });
+        registry
+            .dynamic_call(&strategy, &mut world, id, &())
+            .unwrap();
+        assert_eq!(world.get::<Vel>(e1).unwrap().0, 20.0);
+        assert_eq!(world.get::<Vel>(e2).unwrap().0, 40.0);
     }
 
     // ── Debug assertion tests ────────────────────────────────────
