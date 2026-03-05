@@ -21,7 +21,6 @@
 use minkowski::{
     Entity, EntityMut, Optimistic, Pessimistic, ReducerId, ReducerRegistry, Transact, World,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 // ── Components ──────────────────────────────────────────────────────
@@ -76,7 +75,7 @@ impl FrameStats {
         println!("{label}");
         println!(
             "  commits: {} | conflicts: {} | avg frame: {:.2}ms",
-            self.commits, self.conflicts, avg_ms,
+            self.commits, self.conflicts, avg_ms
         );
     }
 }
@@ -99,44 +98,36 @@ struct ReducerIds {
 // Pure functions: read entity snapshots, return intended targets + amounts.
 
 /// Compute attack targets for opposing-team entities.
+/// Returns (entity, delta) — always a relative amount, never absolute.
 fn compute_combat_targets(
     entities: &[(Entity, u8, u32)],
     mode: ConflictMode,
 ) -> Vec<(Entity, u32)> {
+    let dmg = 5u32;
     entities
         .iter()
         .filter(|&&(_, team, _)| match mode {
             ConflictMode::Low => team == 1,
             ConflictMode::High => true,
         })
-        .map(|&(e, _, hp)| {
-            let dmg = 5u32;
-            match mode {
-                ConflictMode::Low => (e, dmg),
-                ConflictMode::High => (e, hp.saturating_sub(dmg)),
-            }
-        })
+        .map(|&(e, _, _)| (e, dmg))
         .collect()
 }
 
 /// Compute healing targets for friendly-team entities.
+/// Returns (entity, delta) — always a relative amount, never absolute.
 fn compute_healing_targets(
     entities: &[(Entity, u8, u32)],
     mode: ConflictMode,
 ) -> Vec<(Entity, u32)> {
+    let heal = 3u32;
     entities
         .iter()
         .filter(|&&(_, team, _)| match mode {
             ConflictMode::Low => team == 0,
             ConflictMode::High => true,
         })
-        .map(|&(e, _, hp)| {
-            let heal = 3u32;
-            match mode {
-                ConflictMode::Low => (e, heal),
-                ConflictMode::High => (e, hp.saturating_add(heal).min(100)),
-            }
-        })
+        .map(|&(e, _, _)| (e, heal))
         .collect()
 }
 
@@ -164,7 +155,6 @@ fn run_frame<S: Transact>(
     mode: ConflictMode,
     ids: &ReducerIds,
     stats: &mut FrameStats,
-    conflict_counter: &AtomicU32,
 ) {
     let frame_start = Instant::now();
 
@@ -188,24 +178,19 @@ fn run_frame<S: Transact>(
         ConflictMode::High => (ids.attack_high, ids.heal_high),
     };
 
-    let before_conflicts = conflict_counter.load(Ordering::Relaxed);
-
     for &(entity, amount) in &combat_targets {
-        let result = registry.call(strategy, world, attack_id, (entity, amount));
-        if result.is_ok() {
-            stats.commits += 1;
+        match registry.call(strategy, world, attack_id, (entity, amount)) {
+            Ok(()) => stats.commits += 1,
+            Err(_) => stats.conflicts += 1,
         }
     }
 
     for &(entity, amount) in &healing_targets {
-        let result = registry.call(strategy, world, heal_id, (entity, amount));
-        if result.is_ok() {
-            stats.commits += 1;
+        match registry.call(strategy, world, heal_id, (entity, amount)) {
+            Ok(()) => stats.commits += 1,
+            Err(_) => stats.conflicts += 1,
         }
     }
-
-    let after_conflicts = conflict_counter.load(Ordering::Relaxed);
-    stats.conflicts += after_conflicts - before_conflicts;
 
     // 4. Low-conflict mode: merge Damage + Healing into Health.
     if mode == ConflictMode::Low {
@@ -228,8 +213,8 @@ fn spawn_arena(world: &mut World, count: usize) {
 
 fn avg_health(world: &mut World) -> f32 {
     let (mut total, mut n) = (0u64, 0u32);
-    for hp in world.query::<(&Health,)>() {
-        total += hp.0 .0 as u64;
+    for hp in world.query::<&Health>() {
+        total += hp.0 as u64;
         n += 1;
     }
     if n == 0 {
@@ -259,21 +244,23 @@ fn register_reducers(world: &mut World, registry: &mut ReducerRegistry) -> Reduc
         },
     );
 
-    // High-conflict: attack writes Health directly
+    // High-conflict: attack reads + writes Health (read-modify-write)
     let attack_high = registry.register_entity::<(Health,), u32, _>(
         world,
         "attack_high",
-        |mut entity: EntityMut<'_, (Health,)>, new_hp: u32| {
-            entity.set::<Health, 0>(Health(new_hp));
+        |mut entity: EntityMut<'_, (Health,)>, dmg: u32| {
+            let hp = entity.get::<Health, 0>().0;
+            entity.set::<Health, 0>(Health(hp.saturating_sub(dmg)));
         },
     );
 
-    // High-conflict: heal writes Health directly
+    // High-conflict: heal reads + writes Health (read-modify-write)
     let heal_high = registry.register_entity::<(Health,), u32, _>(
         world,
         "heal_high",
-        |mut entity: EntityMut<'_, (Health,)>, new_hp: u32| {
-            entity.set::<Health, 0>(Health(new_hp));
+        |mut entity: EntityMut<'_, (Health,)>, heal: u32| {
+            let hp = entity.get::<Health, 0>().0;
+            entity.set::<Health, 0>(Health(hp.saturating_add(heal).min(100)));
         },
     );
 
@@ -316,38 +303,17 @@ fn run_scenario(
 
     spawn_arena(&mut world, entity_count);
 
-    // AtomicU32 for tracking retries/conflicts — visible across strategy retries.
-    // Note: individual call() invocations are sequential here, so this counter
-    // primarily tracks optimistic conflicts that exhaust retries (returned as Err).
-    let conflict_counter = AtomicU32::new(0);
-
     let mut stats = FrameStats::new();
 
     if use_optimistic {
         let strategy = Optimistic::new(&world);
         for _ in 0..frames {
-            run_frame(
-                &mut world,
-                &registry,
-                &strategy,
-                mode,
-                &ids,
-                &mut stats,
-                &conflict_counter,
-            );
+            run_frame(&mut world, &registry, &strategy, mode, &ids, &mut stats);
         }
     } else {
         let strategy = Pessimistic::new(&world);
         for _ in 0..frames {
-            run_frame(
-                &mut world,
-                &registry,
-                &strategy,
-                mode,
-                &ids,
-                &mut stats,
-                &conflict_counter,
-            );
+            run_frame(&mut world, &registry, &strategy, mode, &ids, &mut stats);
         }
     }
 
@@ -364,15 +330,6 @@ fn main() {
         "Battle simulation: {entity_count} entities ({} per team), {frames} frames",
         entity_count / 2,
     );
-    println!();
-
-    println!("Registered reducers:");
-    // Trigger registration output by running a throwaway scenario setup
-    {
-        let mut world = World::new();
-        let mut registry = ReducerRegistry::new();
-        register_reducers(&mut world, &mut registry);
-    }
     println!();
 
     // ── Low conflict mode ───────────────────────────────────────────
