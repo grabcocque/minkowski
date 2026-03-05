@@ -69,7 +69,7 @@ uniform density, tree for clustered.
   - Note: first call always matches everything (no prior observation tick)
 - Numeric tight loop (physics, particles)? -> `for_each_chunk` for SIMD slices
 - CPU-heavy per-entity work? -> `par_for_each` with rayon
-- Need raw typed slices? -> `as_slice::<T>()` on the query iterator
+- Need raw typed slices? -> `for_each_chunk` yields `&[T]`/`&mut [T]` slices per archetype
 
 ### Mutation Strategy
 
@@ -268,12 +268,12 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 | Example | Key patterns | File |
 |---|---|---|
 | `reducer` | All handle types (EntityMut, QueryMut, QueryRef, Spawner, QueryWriter, DynamicCtx), structural mutations, conflict detection | `examples/examples/reducer.rs` |
-| `boids` | Query reducers, SpatialGrid, SIMD via `for_each_chunk`, parallel force computation | `examples/examples/boids.rs` |
-| `life` | QueryWriter, `#[derive(Table)]`, undo/redo via changeset reversal | `examples/examples/life.rs` |
-| `nbody` | Query reducers, Barnes-Hut quadtree, parallel force computation | `examples/examples/nbody.rs` |
+| `boids` | Query reducers, SpatialGrid, SIMD via `for_each_chunk`, deferred commands | `examples/examples/boids.rs` |
+| `life` | QueryMut, `#[derive(Table)]`, EnumChangeSet undo/redo via changeset reversal | `examples/examples/life.rs` |
+| `nbody` | Query reducers, Barnes-Hut quadtree, rayon parallel force computation | `examples/examples/nbody.rs` |
 | `scheduler` | ReducerRegistry for Access metadata, conflict detection, greedy batch scheduling | `examples/examples/scheduler.rs` |
 | `transaction` | Three strategies (Sequential/Optimistic/Pessimistic), raw Tx + reducer comparison | `examples/examples/transaction.rs` |
-| `battle` | EntityMut reducers, rayon parallel dispatch, tunable conflict rates | `examples/examples/battle.rs` |
+| `battle` | EntityMut reducers, rayon parallel snapshot computation, sequential dispatch, tunable conflict rates | `examples/examples/battle.rs` |
 | `persist` | QueryWriter + Durable, WAL, snapshots, crash recovery | `examples/examples/persist.rs` |
 
 ### Pattern Quick-Find

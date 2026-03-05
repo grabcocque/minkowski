@@ -7,10 +7,10 @@
 //! `registry.query_reducer_access(id)` to build a conflict matrix and assign
 //! systems to batches via greedy graph coloring.
 //!
-//! Three batches:
+//! Three batches (greedy coloring):
 //! - Batch 0: movement (writes Pos, reads Vel) + health_regen (writes Health)
-//! - Batch 1: gravity (writes Vel) + apply_damage (writes Health)
-//! - Batch 2: log_positions (reads Pos) + log_health (reads Health)
+//! - Batch 1: gravity (writes Vel) + apply_damage (writes Health) + log_positions (reads Pos)
+//! - Batch 2: log_health (reads Health)
 //!
 //! Within each batch, systems touch disjoint component sets and could run
 //! in parallel. Across batches, conflicts require sequential execution.
@@ -220,9 +220,9 @@ fn main() {
     }
 
     // Final state
-    let pos_sum: f32 = world.query::<(&Pos,)>().map(|p| p.0.x).sum();
-    let vel_sum: f32 = world.query::<(&Vel,)>().map(|v| v.0.dy).sum();
-    let hp_sum: u32 = world.query::<(&Health,)>().map(|h| h.0 .0).sum();
+    let pos_sum: f32 = world.query::<&Pos>().map(|p| p.x).sum();
+    let vel_sum: f32 = world.query::<&Vel>().map(|v| v.dy).sum();
+    let hp_sum: u32 = world.query::<&Health>().map(|h| h.0).sum();
 
     println!();
     println!("After 10 frames:");

@@ -2,7 +2,7 @@
 //! with a quadtree, a fundamentally different spatial structure from the
 //! uniform grid used in the boids example.
 //!
-//! Run: cargo run -p minkowski --example nbody --release
+//! Run: cargo run -p minkowski-examples --example nbody --release
 //!
 //! Exercises: spawn, despawn, multi-component queries, mutation,
 //! parallel iteration (rayon), deferred commands, SpatialIndex trait,
@@ -140,14 +140,6 @@ struct Rect {
 impl Rect {
     fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { x, y, w, h }
-    }
-
-    #[allow(dead_code)]
-    fn contains(&self, point: Vec2) -> bool {
-        point.x >= self.x
-            && point.x < self.x + self.w
-            && point.y >= self.y
-            && point.y < self.y + self.h
     }
 
     /// Returns 0-3 for which child quadrant the point falls in.

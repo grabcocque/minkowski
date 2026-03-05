@@ -1,7 +1,7 @@
 //! Game of Life with undo — exercises `#[derive(Table)]`, reducers, Changed<T>, EnumChangeSet,
 //! and undo/replay.
 //!
-//! Run: cargo run -p minkowski --example life --release
+//! Run: cargo run -p minkowski-examples --example life --release
 //!
 //! Features exercised:
 //! - `#[derive(Table)]` for typed row access that skips archetype matching
