@@ -1,6 +1,8 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::access::Access;
 use crate::bundle::Bundle;
@@ -9,6 +11,7 @@ use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::query::fetch::{Changed, ReadOnlyWorldQuery, ThinSlicePtr, WorldQuery};
 use crate::storage::archetype::Archetype;
+use crate::tick::Tick;
 use crate::transaction::{Conflict, Transact};
 use crate::world::World;
 
@@ -653,6 +656,86 @@ impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J);
 impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J, K);
 impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 
+// ── QueryWriter (transactional, buffered) ────────────────────────────
+
+/// Transactional query iteration with buffered writes.
+///
+/// Iterates matching archetypes **without** marking columns as changed
+/// (unlike `world.query()`). Writes go through `WritableRef<T>` into an
+/// `EnumChangeSet` that is applied atomically on commit. This avoids
+/// self-conflict with optimistic tick-based validation.
+///
+/// Each `QueryWriter` reducer stores a per-reducer `last_read_tick` in an
+/// `Arc<AtomicU64>` for `Changed<T>` filter support.
+pub struct QueryWriter<'a, Q: WriterQuery> {
+    world: &'a mut World,
+    changeset: *mut EnumChangeSet,
+    last_read_tick: &'a Arc<AtomicU64>,
+    _marker: PhantomData<Q>,
+}
+
+impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
+    pub(crate) fn new(
+        world: &'a mut World,
+        changeset: *mut EnumChangeSet,
+        last_read_tick: &'a Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            world,
+            changeset,
+            last_read_tick,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Iterate all matching entities, yielding buffered writer items.
+    ///
+    /// `&T` components are read directly from archetype columns.
+    /// `&mut T` components produce `WritableRef<T>` — reads from the column,
+    /// writes buffer into the changeset.
+    pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
+        let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
+        let new_tick = self.world.next_tick();
+
+        let required = Q::required_ids(&self.world.components);
+        let cs_ptr = self.changeset;
+
+        for arch in &self.world.archetypes.archetypes {
+            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                continue;
+            }
+            if !Q::matches_filters(arch, &self.world.components, last_tick) {
+                continue;
+            }
+            let fetch = Q::init_writer_fetch(arch, &self.world.components);
+            for row in 0..arch.len() {
+                let entity = arch.entities[row];
+                let item = unsafe { Q::fetch_writer(&fetch, row, entity, cs_ptr) };
+                f(item);
+            }
+        }
+
+        self.last_read_tick.store(new_tick.raw(), Ordering::Relaxed);
+    }
+
+    /// Count matching entities (respects `Changed<T>` filters).
+    pub fn count(&mut self) -> usize {
+        let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
+        let required = Q::required_ids(&self.world.components);
+        let mut total = 0;
+        for arch in &self.world.archetypes.archetypes {
+            if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                continue;
+            }
+            if !Q::matches_filters(arch, &self.world.components, last_tick) {
+                continue;
+            }
+            total += arch.len();
+        }
+        total
+    }
+}
+
 // ── Typed query handles (scheduled) ──────────────────────────────────
 
 /// Read-only query iteration. Hides `&mut World`.
@@ -877,6 +960,49 @@ impl ReducerRegistry {
                 let world_ref: &World = world;
                 let handle = Spawner::<B>::new(changeset, allocated, world_ref);
                 f(handle, args);
+            });
+
+        self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
+    }
+
+    /// Register a query writer reducer: `f(QueryWriter<Q>, args)`.
+    ///
+    /// Iterates matching archetypes with buffered writes. `&T` reads directly
+    /// from columns; `&mut T` produces `WritableRef<T>` that buffers into the
+    /// transaction's changeset. Column ticks are NOT advanced during iteration
+    /// (avoiding self-conflict with optimistic validation). Changes are applied
+    /// atomically on commit.
+    pub fn register_query_writer<Q, Args, F>(
+        &mut self,
+        world: &mut World,
+        name: &'static str,
+        f: F,
+    ) -> ReducerId
+    where
+        Q: WriterQuery + 'static,
+        Args: Clone + 'static,
+        F: Fn(QueryWriter<'_, Q>, Args) + Send + Sync + 'static,
+    {
+        Q::register(&mut world.components);
+        let resolved = ResolvedComponents(Vec::new());
+        let access = Access::of::<Q>(world);
+        let last_read_tick = Arc::new(AtomicU64::new(0));
+        let tick_ref = last_read_tick.clone();
+
+        let adapter: TransactionalAdapter =
+            Box::new(move |changeset, _allocated, world, _resolved, args_any| {
+                let args = args_any
+                    .downcast_ref::<Args>()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reducer args type mismatch: expected {}",
+                            std::any::type_name::<Args>()
+                        )
+                    })
+                    .clone();
+                let cs_ptr: *mut EnumChangeSet = changeset;
+                let qw = QueryWriter::<Q>::new(world, cs_ptr, &tick_ref);
+                f(qw, args);
             });
 
         self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
@@ -2175,5 +2301,89 @@ mod tests {
         // Verify: every entity in the world should be alive (no leaked IDs)
         // and the attempt count confirms at least one attempt happened.
         assert!(attempt_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    // ── QueryWriter tests ─────────────────────────────────────────
+
+    #[test]
+    fn query_writer_for_each_reads_and_buffers() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos(1.0), Vel(10.0)));
+        let e2 = world.spawn((Pos(2.0), Vel(20.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        let id = registry.register_query_writer::<(&Pos, &mut Vel), f32, _>(
+            &mut world,
+            "apply_drag",
+            |mut query, drag: f32| {
+                query.for_each(|(pos, mut vel)| {
+                    let _ = pos; // read Pos (passthrough)
+                    vel.modify(|v| v.0 *= drag);
+                });
+            },
+        );
+
+        registry.call(&strategy, &mut world, id, 0.5f32).unwrap();
+
+        assert_eq!(world.get::<Vel>(e1).unwrap().0, 5.0);
+        assert_eq!(world.get::<Vel>(e2).unwrap().0, 10.0);
+        assert_eq!(world.get::<Pos>(e1).unwrap().0, 1.0); // unchanged
+    }
+
+    #[test]
+    fn query_writer_count() {
+        let mut world = World::new();
+        world.spawn((Pos(1.0),));
+        world.spawn((Pos(2.0),));
+        world.spawn((Vel(3.0),)); // no Pos — not matched
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+
+        let id = registry.register_query_writer::<(&mut Pos,), (), _>(
+            &mut world,
+            "counter",
+            |mut query, ()| {
+                assert_eq!(query.count(), 2);
+            },
+        );
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+    }
+
+    #[test]
+    fn query_writer_access_conflict() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+
+        let entity_id =
+            registry.register_entity::<(Vel,), (), _>(&mut world, "set_vel", |_e, ()| {});
+        let writer_id = registry.register_query_writer::<(&mut Vel,), (), _>(
+            &mut world,
+            "bulk_vel",
+            |_q, ()| {},
+        );
+
+        let entity_access = registry.reducer_access(entity_id);
+        let writer_access = registry.reducer_access(writer_id);
+        assert!(entity_access.conflicts_with(writer_access));
+    }
+
+    #[test]
+    fn query_writer_no_conflict_disjoint() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+
+        let entity_id =
+            registry.register_entity::<(Pos,), (), _>(&mut world, "set_pos", |_e, ()| {});
+        let writer_id = registry.register_query_writer::<(&mut Vel,), (), _>(
+            &mut world,
+            "bulk_vel",
+            |_q, ()| {},
+        );
+
+        let entity_access = registry.reducer_access(entity_id);
+        let writer_access = registry.reducer_access(writer_id);
+        assert!(!entity_access.conflicts_with(writer_access));
     }
 }
