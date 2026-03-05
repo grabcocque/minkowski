@@ -382,6 +382,7 @@ pub struct EntityMut<'a, C: ComponentSet> {
     resolved: &'a ResolvedComponents,
     changeset: &'a mut EnumChangeSet,
     world: &'a World,
+    can_despawn: bool,
     _marker: PhantomData<C>,
 }
 
@@ -392,12 +393,14 @@ impl<'a, C: ComponentSet> EntityMut<'a, C> {
         resolved: &'a ResolvedComponents,
         changeset: &'a mut EnumChangeSet,
         world: &'a World,
+        can_despawn: bool,
     ) -> Self {
         Self {
             entity,
             resolved,
             changeset,
             world,
+            can_despawn,
             _marker: PhantomData,
         }
     }
@@ -425,6 +428,25 @@ impl<'a, C: ComponentSet> EntityMut<'a, C> {
     {
         let comp_id = self.resolved.0[IDX];
         self.changeset.insert_raw(self.entity, comp_id, value);
+    }
+
+    /// Buffer a component removal. Bounded by the declared component set C.
+    pub fn remove<T: Component, const IDX: usize>(&mut self)
+    where
+        C: Contains<T, IDX>,
+    {
+        let comp_id = self.resolved.0[IDX];
+        self.changeset.record_remove(self.entity, comp_id);
+    }
+
+    /// Buffer an entity despawn. Panics if the reducer was not registered
+    /// with `register_entity_despawn`.
+    pub fn despawn(&mut self) {
+        assert!(
+            self.can_despawn,
+            "despawn not declared (use register_entity_despawn)"
+        );
+        self.changeset.record_despawn(self.entity);
     }
 
     pub fn entity(&self) -> Entity {
@@ -1035,7 +1057,51 @@ impl ReducerRegistry {
                         )
                     })
                     .clone();
-                let handle = EntityMut::<C>::new(entity, resolved, changeset, tw.as_ref());
+                let handle = EntityMut::<C>::new(entity, resolved, changeset, tw.as_ref(), false);
+                f(handle, args);
+            });
+
+        self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Transactional(adapter),
+            None,
+        )
+    }
+
+    /// Register an entity reducer with despawn capability.
+    /// Same as `register_entity`, but `EntityMut::despawn()` is enabled
+    /// and the Access includes the despawn flag.
+    pub fn register_entity_despawn<C, Args, F>(
+        &mut self,
+        world: &mut World,
+        name: &'static str,
+        f: F,
+    ) -> ReducerId
+    where
+        C: ComponentSet,
+        Args: Clone + 'static,
+        F: Fn(EntityMut<'_, C>, Args) + Send + Sync + 'static,
+    {
+        let resolved = ResolvedComponents(C::resolve(&mut world.components));
+        let reads = C::access(&mut world.components, true);
+        let writes = C::access(&mut world.components, false);
+        let mut access = reads.merge(&writes);
+        access.set_despawns();
+
+        let adapter: TransactionalAdapter =
+            Box::new(move |changeset, _allocated, tw, resolved, args_any| {
+                let (entity, args) = args_any
+                    .downcast_ref::<(Entity, Args)>()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reducer args type mismatch: expected (Entity, {})",
+                            std::any::type_name::<Args>()
+                        )
+                    })
+                    .clone();
+                let handle = EntityMut::<C>::new(entity, resolved, changeset, tw.as_ref(), true);
                 f(handle, args);
             });
 
@@ -1930,6 +1996,60 @@ mod tests {
                 ctx.despawn(*entity);
             });
         let _ = registry.dynamic_call(&strategy, &mut world, id, &e);
+    }
+
+    // ── EntityMut structural mutation tests ──────────────────────
+
+    #[test]
+    fn entity_mut_remove_buffers_mutation() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry.register_entity::<(Pos, Vel), (), _>(
+            &mut world,
+            "strip_vel",
+            |mut entity: EntityMut<'_, (Pos, Vel)>, ()| {
+                entity.remove::<Vel, 1>();
+            },
+        );
+        registry.call(&strategy, &mut world, id, (e, ())).unwrap();
+        assert!(world.get::<Vel>(e).is_none());
+        assert!(world.get::<Pos>(e).is_some());
+    }
+
+    #[test]
+    fn entity_mut_despawn_buffers_mutation() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry.register_entity_despawn::<(Pos,), (), _>(
+            &mut world,
+            "killer",
+            |mut entity: EntityMut<'_, (Pos,)>, ()| {
+                entity.despawn();
+            },
+        );
+        registry.call(&strategy, &mut world, id, (e, ())).unwrap();
+        assert!(!world.is_alive(e));
+    }
+
+    #[test]
+    #[should_panic(expected = "register_entity_despawn")]
+    fn entity_mut_despawn_without_flag_panics() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry.register_entity::<(Pos,), (), _>(
+            &mut world,
+            "bad_killer",
+            |mut entity: EntityMut<'_, (Pos,)>, ()| {
+                entity.despawn();
+            },
+        );
+        let _ = registry.call(&strategy, &mut world, id, (e, ()));
     }
 
     // ── Debug assertion tests ────────────────────────────────────
