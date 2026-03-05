@@ -7,7 +7,8 @@ use crate::bundle::Bundle;
 use crate::changeset::EnumChangeSet;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
-use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
+use crate::query::fetch::{Changed, ReadOnlyWorldQuery, ThinSlicePtr, WorldQuery};
+use crate::storage::archetype::Archetype;
 use crate::transaction::{Conflict, Transact};
 use crate::world::World;
 
@@ -401,6 +402,256 @@ impl<'a, B: Bundle> Spawner<'a, B> {
         entity
     }
 }
+
+// ── WritableRef ─────────────────────────────────────────────────────
+
+/// Per-component buffered write handle. Reads the current value from the
+/// archetype column; writes are buffered into an `EnumChangeSet` and only
+/// applied on commit.
+///
+/// Uses a raw pointer to `EnumChangeSet` because multiple `WritableRef`s
+/// in a tuple query need shared write access to the same changeset.
+#[allow(dead_code)]
+pub struct WritableRef<'a, T: Component> {
+    entity: Entity,
+    current: &'a T,
+    comp_id: ComponentId,
+    changeset: *mut EnumChangeSet,
+    _marker: PhantomData<&'a mut EnumChangeSet>,
+}
+
+impl<'a, T: Component> WritableRef<'a, T> {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        entity: Entity,
+        current: &'a T,
+        comp_id: ComponentId,
+        changeset: *mut EnumChangeSet,
+    ) -> Self {
+        Self {
+            entity,
+            current,
+            comp_id,
+            changeset,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Read the current (pre-transaction) value.
+    #[allow(dead_code)]
+    pub fn get(&self) -> &T {
+        self.current
+    }
+
+    /// Buffer a write. The value is stored in the changeset and applied on commit.
+    #[allow(dead_code)]
+    pub fn set(&mut self, value: T) {
+        // Safety: the raw pointer is valid for the lifetime of the transaction.
+        // Multiple WritableRefs may share this pointer, but each targets a
+        // different (entity, component) pair — no aliased writes.
+        unsafe { &mut *self.changeset }.insert_raw(self.entity, self.comp_id, value);
+    }
+
+    /// Clone the current value, apply `f`, and buffer the result.
+    #[allow(dead_code)]
+    pub fn modify(&mut self, f: impl FnOnce(&mut T))
+    where
+        T: Clone,
+    {
+        let mut val = self.current.clone();
+        f(&mut val);
+        self.set(val);
+    }
+}
+
+// ── WriterQuery ─────────────────────────────────────────────────────
+
+/// Maps a `WorldQuery` to a buffered-write variant. For `&T` this is a
+/// passthrough; for `&mut T` it produces `WritableRef<T>` which reads
+/// from the archetype column but writes into an `EnumChangeSet`.
+///
+/// # Safety
+/// Implementors must guarantee that `init_writer_fetch` returns valid state
+/// for the archetype, and `fetch_writer` returns valid items for any
+/// row < archetype.len().
+#[allow(dead_code)]
+pub unsafe trait WriterQuery: WorldQuery {
+    type WriterItem<'a>;
+    type WriterFetch<'a>: Send + Sync;
+
+    fn init_writer_fetch<'w>(
+        archetype: &'w Archetype,
+        registry: &ComponentRegistry,
+    ) -> Self::WriterFetch<'w>;
+
+    /// # Safety
+    /// `row` must be less than `archetype.len()`. `changeset` must be valid.
+    unsafe fn fetch_writer<'w>(
+        fetch: &Self::WriterFetch<'w>,
+        row: usize,
+        entity: Entity,
+        changeset: *mut EnumChangeSet,
+    ) -> Self::WriterItem<'w>;
+}
+
+// --- &T: passthrough ---
+// Safety: delegates to WorldQuery::fetch which produces &'w T.
+unsafe impl<T: Component> WriterQuery for &T {
+    type WriterItem<'a> = &'a T;
+    type WriterFetch<'a> = ThinSlicePtr<T>;
+
+    fn init_writer_fetch<'w>(
+        archetype: &'w Archetype,
+        registry: &ComponentRegistry,
+    ) -> Self::WriterFetch<'w> {
+        <&T as WorldQuery>::init_fetch(archetype, registry)
+    }
+
+    unsafe fn fetch_writer<'w>(
+        fetch: &Self::WriterFetch<'w>,
+        row: usize,
+        _entity: Entity,
+        _changeset: *mut EnumChangeSet,
+    ) -> Self::WriterItem<'w> {
+        <&T as WorldQuery>::fetch(fetch, row)
+    }
+}
+
+// --- &mut T: WritableRef ---
+// Safety: reads from the column pointer (valid for archetype lifetime),
+// writes are buffered into the changeset.
+unsafe impl<T: Component> WriterQuery for &mut T {
+    type WriterItem<'a> = WritableRef<'a, T>;
+    type WriterFetch<'a> = (ThinSlicePtr<T>, ComponentId);
+
+    fn init_writer_fetch<'w>(
+        archetype: &'w Archetype,
+        registry: &ComponentRegistry,
+    ) -> Self::WriterFetch<'w> {
+        let id = registry.id::<T>().expect("component not registered");
+        let ptr = <&T as WorldQuery>::init_fetch(archetype, registry);
+        (ptr, id)
+    }
+
+    unsafe fn fetch_writer<'w>(
+        fetch: &Self::WriterFetch<'w>,
+        row: usize,
+        entity: Entity,
+        changeset: *mut EnumChangeSet,
+    ) -> Self::WriterItem<'w> {
+        let (ptr, comp_id) = fetch;
+        let current: &T = &*ptr.ptr.add(row);
+        WritableRef::new(entity, current, *comp_id, changeset)
+    }
+}
+
+// --- Entity: passthrough ---
+// Safety: entity is Copy, no pointer dereference.
+unsafe impl WriterQuery for Entity {
+    type WriterItem<'a> = Entity;
+    type WriterFetch<'a> = ();
+
+    fn init_writer_fetch<'w>(
+        _archetype: &'w Archetype,
+        _registry: &ComponentRegistry,
+    ) -> Self::WriterFetch<'w> {
+    }
+
+    unsafe fn fetch_writer<'w>(
+        _fetch: &Self::WriterFetch<'w>,
+        _row: usize,
+        entity: Entity,
+        _changeset: *mut EnumChangeSet,
+    ) -> Self::WriterItem<'w> {
+        entity
+    }
+}
+
+// --- Option<&T>: passthrough ---
+// Safety: delegates to WorldQuery::fetch which produces Option<&'w T>.
+unsafe impl<T: Component> WriterQuery for Option<&T> {
+    type WriterItem<'a> = Option<&'a T>;
+    type WriterFetch<'a> = Option<ThinSlicePtr<T>>;
+
+    fn init_writer_fetch<'w>(
+        archetype: &'w Archetype,
+        registry: &ComponentRegistry,
+    ) -> Self::WriterFetch<'w> {
+        <Option<&T> as WorldQuery>::init_fetch(archetype, registry)
+    }
+
+    unsafe fn fetch_writer<'w>(
+        fetch: &Self::WriterFetch<'w>,
+        row: usize,
+        _entity: Entity,
+        _changeset: *mut EnumChangeSet,
+    ) -> Self::WriterItem<'w> {
+        <Option<&T> as WorldQuery>::fetch(fetch, row)
+    }
+}
+
+// --- Changed<T>: filter only ---
+// Safety: produces (), no pointer dereference.
+unsafe impl<T: Component> WriterQuery for Changed<T> {
+    type WriterItem<'a> = ();
+    type WriterFetch<'a> = ();
+
+    fn init_writer_fetch<'w>(
+        _archetype: &'w Archetype,
+        _registry: &ComponentRegistry,
+    ) -> Self::WriterFetch<'w> {
+    }
+
+    unsafe fn fetch_writer<'w>(
+        _fetch: &Self::WriterFetch<'w>,
+        _row: usize,
+        _entity: Entity,
+        _changeset: *mut EnumChangeSet,
+    ) -> Self::WriterItem<'w> {
+    }
+}
+
+// --- WriterQuery tuple impls ---
+macro_rules! impl_writer_query_tuple {
+    ($($name:ident),*) => {
+        #[allow(non_snake_case)]
+        // Safety: delegates to each element's WriterQuery impl.
+        unsafe impl<$($name: WriterQuery),*> WriterQuery for ($($name,)*) {
+            type WriterItem<'a> = ($($name::WriterItem<'a>,)*);
+            type WriterFetch<'a> = ($($name::WriterFetch<'a>,)*);
+
+            fn init_writer_fetch<'w>(
+                archetype: &'w Archetype,
+                registry: &ComponentRegistry,
+            ) -> Self::WriterFetch<'w> {
+                ($($name::init_writer_fetch(archetype, registry),)*)
+            }
+
+            unsafe fn fetch_writer<'w>(
+                fetch: &Self::WriterFetch<'w>,
+                row: usize,
+                entity: Entity,
+                changeset: *mut EnumChangeSet,
+            ) -> Self::WriterItem<'w> {
+                let ($($name,)*) = fetch;
+                ($(<$name as WriterQuery>::fetch_writer($name, row, entity, changeset),)*)
+            }
+        }
+    };
+}
+
+impl_writer_query_tuple!(A);
+impl_writer_query_tuple!(A, B);
+impl_writer_query_tuple!(A, B, C);
+impl_writer_query_tuple!(A, B, C, D);
+impl_writer_query_tuple!(A, B, C, D, E);
+impl_writer_query_tuple!(A, B, C, D, E, F);
+impl_writer_query_tuple!(A, B, C, D, E, F, G);
+impl_writer_query_tuple!(A, B, C, D, E, F, G, H);
+impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I);
+impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 
 // ── Typed query handles (scheduled) ──────────────────────────────────
 
@@ -1772,6 +2023,125 @@ mod tests {
             "clash",
             |_entity: EntityMut<'_, (u32,)>, ()| {},
         );
+    }
+
+    // ── WritableRef tests ──────────────────────────────────────────
+
+    #[test]
+    fn writable_ref_get_returns_current_value() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(42.0),));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let current = world.get::<Pos>(e).unwrap();
+
+        let mut cs = EnumChangeSet::new();
+        let wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
+        assert_eq!(wr.get().0, 42.0);
+    }
+
+    #[test]
+    fn writable_ref_set_buffers_into_changeset() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0),));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let current = world.get::<Pos>(e).unwrap();
+
+        let mut cs = EnumChangeSet::new();
+        {
+            let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
+            wr.set(Pos(99.0));
+        }
+        // World unchanged before apply
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
+        assert_eq!(cs.len(), 1);
+        // Apply and verify
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 99.0);
+    }
+
+    #[test]
+    fn writable_ref_modify_clones_and_sets() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(10.0),));
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let current = world.get::<Pos>(e).unwrap();
+
+        let mut cs = EnumChangeSet::new();
+        {
+            let mut wr = WritableRef::new(e, current, pos_id, &mut cs as *mut EnumChangeSet);
+            wr.modify(|p| p.0 += 10.0);
+        }
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 20.0);
+    }
+
+    // ── WriterQuery tests ──────────────────────────────────────────
+
+    #[test]
+    fn writer_query_ref_t_passthrough() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(7.0),));
+        let loc = world.entity_locations[e.index() as usize].unwrap();
+        let archetype = &world.archetypes.archetypes[loc.archetype_id.0];
+
+        let fetch = <&Pos as WriterQuery>::init_writer_fetch(archetype, &world.components);
+        let mut cs = EnumChangeSet::new();
+        let item = unsafe {
+            <&Pos as WriterQuery>::fetch_writer(&fetch, loc.row, e, &mut cs as *mut EnumChangeSet)
+        };
+        assert_eq!(item.0, 7.0);
+    }
+
+    #[test]
+    fn writer_query_mut_t_becomes_writable_ref() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(5.0),));
+        let loc = world.entity_locations[e.index() as usize].unwrap();
+        let archetype = &world.archetypes.archetypes[loc.archetype_id.0];
+
+        let fetch = <&mut Pos as WriterQuery>::init_writer_fetch(archetype, &world.components);
+        let mut cs = EnumChangeSet::new();
+        let mut item = unsafe {
+            <&mut Pos as WriterQuery>::fetch_writer(
+                &fetch,
+                loc.row,
+                e,
+                &mut cs as *mut EnumChangeSet,
+            )
+        };
+        assert_eq!(item.get().0, 5.0);
+        item.set(Pos(55.0));
+        // World unchanged
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 5.0);
+        // Apply changeset
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 55.0);
+    }
+
+    #[test]
+    fn writer_query_tuple_fetch() {
+        let mut world = World::new();
+        let e = world.spawn((Pos(3.0), Vel(4.0)));
+        let loc = world.entity_locations[e.index() as usize].unwrap();
+        let archetype = &world.archetypes.archetypes[loc.archetype_id.0];
+
+        let fetch =
+            <(&Vel, &mut Pos) as WriterQuery>::init_writer_fetch(archetype, &world.components);
+        let mut cs = EnumChangeSet::new();
+        let (vel_ref, mut pos_wr) = unsafe {
+            <(&Vel, &mut Pos) as WriterQuery>::fetch_writer(
+                &fetch,
+                loc.row,
+                e,
+                &mut cs as *mut EnumChangeSet,
+            )
+        };
+        // Read velocity passthrough
+        assert_eq!(vel_ref.0, 4.0);
+        // Write position via WritableRef
+        pos_wr.set(Pos(vel_ref.0 + pos_wr.get().0));
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 7.0);
     }
 
     #[test]
