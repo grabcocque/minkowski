@@ -414,13 +414,15 @@ impl<'a, B: Bundle> Spawner<'a, B> {
 ///
 /// Uses a raw pointer to `EnumChangeSet` because multiple `WritableRef`s
 /// in a tuple query need shared write access to the same changeset.
+/// `PhantomData<&'a EnumChangeSet>` ties the lifetime without falsely
+/// claiming exclusive access (multiple WritableRefs coexist).
 #[allow(dead_code)]
 pub struct WritableRef<'a, T: Component> {
     entity: Entity,
     current: &'a T,
     comp_id: ComponentId,
     changeset: *mut EnumChangeSet,
-    _marker: PhantomData<&'a mut EnumChangeSet>,
+    _marker: PhantomData<&'a EnumChangeSet>,
 }
 
 impl<'a, T: Component> WritableRef<'a, T> {
@@ -450,8 +452,10 @@ impl<'a, T: Component> WritableRef<'a, T> {
     #[allow(dead_code)]
     pub fn set(&mut self, value: T) {
         // Safety: the raw pointer is valid for the lifetime of the transaction.
-        // Multiple WritableRefs may share this pointer, but each targets a
-        // different (entity, component) pair — no aliased writes.
+        // Multiple WritableRefs in a tuple query share this pointer, but the
+        // temporary `&mut EnumChangeSet` does not outlive this method call,
+        // and `&mut self` prevents re-entrant access — no overlapping
+        // mutable references.
         unsafe { &mut *self.changeset }.insert_raw(self.entity, self.comp_id, value);
     }
 
@@ -671,7 +675,8 @@ pub struct QueryWriter<'a, Q: WriterQuery> {
     world: &'a mut World,
     changeset: *mut EnumChangeSet,
     last_read_tick: &'a Arc<AtomicU64>,
-    _marker: PhantomData<Q>,
+    _cs: PhantomData<&'a EnumChangeSet>,
+    _query: PhantomData<Q>,
 }
 
 impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
@@ -684,7 +689,8 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
             world,
             changeset,
             last_read_tick,
-            _marker: PhantomData,
+            _cs: PhantomData,
+            _query: PhantomData,
         }
     }
 
@@ -693,6 +699,9 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// `&T` components are read directly from archetype columns.
     /// `&mut T` components produce `WritableRef<T>` — reads from the column,
     /// writes buffer into the changeset.
+    ///
+    /// Advances the change detection tick: entities matched here will NOT
+    /// be matched again on the next call unless their columns are modified.
     pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
         let new_tick = self.world.next_tick();
@@ -719,8 +728,13 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     }
 
     /// Count matching entities (respects `Changed<T>` filters).
+    ///
+    /// Advances the change detection tick (same as `for_each`): entities
+    /// counted here will NOT be matched again unless their columns are modified.
     pub fn count(&mut self) -> usize {
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
+        let new_tick = self.world.next_tick();
+
         let required = Q::required_ids(&self.world.components);
         let mut total = 0;
         for arch in &self.world.archetypes.archetypes {
@@ -732,6 +746,8 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
             }
             total += arch.len();
         }
+
+        self.last_read_tick.store(new_tick.raw(), Ordering::Relaxed);
         total
     }
 }
@@ -829,11 +845,45 @@ impl DynamicReducerId {
     }
 }
 
+/// Restricted view of `&mut World` for transactional adapters. Exposes
+/// only what reducers legitimately need — archetype iteration, component
+/// registry, tick advancement — without the full `World` mutation API.
+///
+/// Prevents transactional closures from calling `world.spawn()`,
+/// `world.insert()`, or `world.query::<(&mut T,)>()` directly,
+/// which would bypass the ChangeSet and break optimistic validation.
+pub(crate) struct TransactionalWorld<'a>(pub(crate) &'a mut World);
+
+impl<'a> TransactionalWorld<'a> {
+    /// Reborrow as `&World` for read-only access (entity reducers, spawners).
+    pub(crate) fn as_ref(&self) -> &World {
+        self.0
+    }
+
+    /// Advance the tick counter.
+    #[allow(dead_code)]
+    pub(crate) fn next_tick(&mut self) -> crate::tick::Tick {
+        self.0.next_tick()
+    }
+}
+
+impl<'a> std::ops::Deref for TransactionalWorld<'a> {
+    type Target = World;
+    fn deref(&self) -> &World {
+        self.0
+    }
+}
+
 /// Type-erased transactional reducer adapter. Receives changeset + allocated list
-/// (from Tx), world, resolved IDs, and type-erased args.
+/// (from Tx), a restricted world view, resolved IDs, and type-erased args.
 type TransactionalAdapter = Box<
-    dyn Fn(&mut EnumChangeSet, &mut Vec<Entity>, &mut World, &ResolvedComponents, &dyn Any)
-        + Send
+    dyn Fn(
+            &mut EnumChangeSet,
+            &mut Vec<Entity>,
+            &mut TransactionalWorld<'_>,
+            &ResolvedComponents,
+            &dyn Any,
+        ) + Send
         + Sync,
 >;
 
@@ -913,7 +963,7 @@ impl ReducerRegistry {
         let access = reads.merge(&writes);
 
         let adapter: TransactionalAdapter =
-            Box::new(move |changeset, _allocated, world, resolved, args_any| {
+            Box::new(move |changeset, _allocated, tw, resolved, args_any| {
                 let (entity, args) = args_any
                     .downcast_ref::<(Entity, Args)>()
                     .unwrap_or_else(|| {
@@ -923,8 +973,7 @@ impl ReducerRegistry {
                         )
                     })
                     .clone();
-                let world_ref: &World = world;
-                let handle = EntityMut::<C>::new(entity, resolved, changeset, world_ref);
+                let handle = EntityMut::<C>::new(entity, resolved, changeset, tw.as_ref());
                 f(handle, args);
             });
 
@@ -947,7 +996,7 @@ impl ReducerRegistry {
         let access = Access::empty(); // spawner creates new entities, no column conflicts
 
         let adapter: TransactionalAdapter =
-            Box::new(move |changeset, allocated, world, _resolved, args_any| {
+            Box::new(move |changeset, allocated, tw, _resolved, args_any| {
                 let args = args_any
                     .downcast_ref::<Args>()
                     .unwrap_or_else(|| {
@@ -957,8 +1006,7 @@ impl ReducerRegistry {
                         )
                     })
                     .clone();
-                let world_ref: &World = world;
-                let handle = Spawner::<B>::new(changeset, allocated, world_ref);
+                let handle = Spawner::<B>::new(changeset, allocated, tw.as_ref());
                 f(handle, args);
             });
 
@@ -990,7 +1038,7 @@ impl ReducerRegistry {
         let tick_ref = last_read_tick.clone();
 
         let adapter: TransactionalAdapter =
-            Box::new(move |changeset, _allocated, world, _resolved, args_any| {
+            Box::new(move |changeset, _allocated, tw, _resolved, args_any| {
                 let args = args_any
                     .downcast_ref::<Args>()
                     .unwrap_or_else(|| {
@@ -1001,7 +1049,7 @@ impl ReducerRegistry {
                     })
                     .clone();
                 let cs_ptr: *mut EnumChangeSet = changeset;
-                let qw = QueryWriter::<Q>::new(world, cs_ptr, &tick_ref);
+                let qw = QueryWriter::<Q>::new(tw.0, cs_ptr, &tick_ref);
                 f(qw, args);
             });
 
@@ -1120,7 +1168,8 @@ impl ReducerRegistry {
 
         strategy.transact(world, access, |tx, world| {
             let (changeset, allocated) = tx.reducer_parts();
-            adapter(changeset, allocated, world, resolved, &args);
+            let mut tw = TransactionalWorld(world);
+            adapter(changeset, allocated, &mut tw, resolved, &args);
         })
     }
 
