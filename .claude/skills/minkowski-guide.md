@@ -107,7 +107,7 @@ uniform density, tree for clustered.
 - Need crash recovery? -> WAL via `Durable<S, W>`
 - Need fast restore? -> periodic `Snapshot` saves (not every frame)
 - Which components survive restart? -> register codecs for those types
-- After snapshot restore -> always call `sync_reserved()` on EntityAllocator
+- After snapshot restore -> `restore_allocator_state()` calls `sync_reserved()` internally; custom restoration paths must call it manually
 - Mutation path -> `QueryWriter` reducer (buffers writes, changeset goes to WAL)
 
 ### Spatial Indexing
@@ -217,10 +217,11 @@ Accessing a component not declared in the builder (`can_read`, `can_write`, etc.
 in ALL builds. This is `assert!`, not `debug_assert!`, because it protects the scheduler's
 Access bitset invariant. Declare everything the reducer might touch, even conditionally.
 
-### Forgetting `sync_reserved()` after snapshot restore
-After `restore_allocator_state`, the atomic `next_reserved` counter stays at 0.
-`reserve()` then hands out indices 0, 1, 2... overlapping with restored entities.
-Always call `sync_reserved()` after any state restoration path.
+### Forgetting `sync_reserved()` in custom restore paths
+The standard `restore_allocator_state()` calls `sync_reserved()` automatically. But if you
+add a new state restoration path that bypasses it, the atomic `next_reserved` counter stays
+at 0 and `reserve()` hands out indices overlapping with restored entities. Any custom
+restoration path must call `sync_reserved()` — the standard path handles it for you.
 
 ### Lock table per strategy instance
 Each `Pessimistic` strategy has its own `ColumnLockTable`. Two separate `Pessimistic`
@@ -304,7 +305,7 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 ```rust
 let id = registry.register_query::<(&mut Vel,), f32, _>(
     &mut world, "gravity",
-    |mut query: QueryMut<(&mut Vel,)>, dt: f32| {
+    |mut query: QueryMut<'_, (&mut Vel,)>, dt: f32| {
         query.for_each(|(vel,)| { vel.0 -= 9.81 * dt; });
     },
 );
@@ -315,7 +316,7 @@ registry.run(&mut world, id, 0.016f32);
 ```rust
 let id = registry.register_entity::<(Health,), u32, _>(
     &mut world, "heal",
-    |mut entity: EntityMut<(Health,)>, amount: u32| {
+    |mut entity: EntityMut<'_, (Health,)>, amount: u32| {
         let hp = entity.get::<Health, 0>().0;
         entity.set::<Health, 0>(Health(hp + amount));
     },
