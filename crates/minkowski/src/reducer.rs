@@ -56,7 +56,7 @@ impl DynamicResolved {
         spawn_bundles: HashSet<TypeId>,
     ) -> Self {
         entries.sort_by_key(|(tid, _)| *tid);
-        debug_assert!(
+        assert!(
             entries
                 .windows(2)
                 .all(|w| w[0].0 != w[1].0 || w[0].1 == w[1].1),
@@ -150,7 +150,7 @@ impl<'a> DynamicCtx<'a> {
     }
 
     /// Buffer a component write. The value is applied on commit.
-    /// Panics in debug mode if the component was only declared as readable.
+    /// Panics if the component was only declared as readable.
     pub fn write<T: crate::component::Component>(&mut self, entity: Entity, value: T) {
         let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
             panic!(
@@ -158,7 +158,7 @@ impl<'a> DynamicCtx<'a> {
                 std::any::type_name::<T>()
             )
         });
-        debug_assert!(
+        assert!(
             self.resolved.access().writes().contains(comp_id),
             "component {} declared as read-only, not writable \
              (use can_write instead of can_read)",
@@ -168,7 +168,8 @@ impl<'a> DynamicCtx<'a> {
     }
 
     /// Buffer a component write only if the entity currently has that component.
-    /// Returns `true` if the write was buffered.
+    /// Returns `true` if the write was buffered, `false` if the entity does not
+    /// have the component (in which case `value` is dropped without effect).
     pub fn try_write<T: crate::component::Component>(&mut self, entity: Entity, value: T) -> bool {
         let comp_id = self.resolved.lookup::<T>().unwrap_or_else(|| {
             panic!(
@@ -176,7 +177,7 @@ impl<'a> DynamicCtx<'a> {
                 std::any::type_name::<T>()
             )
         });
-        debug_assert!(
+        assert!(
             self.resolved.access().writes().contains(comp_id),
             "component {} declared as read-only, not writable \
              (use can_write instead of can_read)",
@@ -193,7 +194,7 @@ impl<'a> DynamicCtx<'a> {
     /// Spawn an entity with a bundle. The bundle type must have been declared
     /// via `can_spawn` on the builder.
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
-        debug_assert!(
+        assert!(
             self.resolved.has_spawn_bundle::<B>(),
             "bundle {} not declared for spawning in dynamic reducer \
              (use can_spawn)",
@@ -527,7 +528,6 @@ struct ReducerEntry {
 struct DynamicReducerEntry {
     #[allow(dead_code)]
     name: &'static str,
-    access: Access,
     resolved: DynamicResolved,
     closure: DynamicAdapter,
 }
@@ -822,9 +822,9 @@ impl ReducerRegistry {
         args: &Args,
     ) -> Result<(), Conflict> {
         let entry = &self.dynamic_reducers[id.0];
-        let access = &entry.access;
         let closure = &entry.closure;
         let resolved = &entry.resolved;
+        let access = resolved.access();
 
         strategy.transact(world, access, |tx, world| {
             let (changeset, allocated) = tx.reducer_parts();
@@ -845,7 +845,7 @@ impl ReducerRegistry {
 
     /// Access metadata for a dynamic reducer.
     pub fn dynamic_access(&self, id: DynamicReducerId) -> &Access {
-        &self.dynamic_reducers[id.0].access
+        self.dynamic_reducers[id.0].resolved.access()
     }
 
     // ── Internal ─────────────────────────────────────────────────
@@ -966,7 +966,6 @@ impl<'a> DynamicReducerBuilder<'a> {
             .insert(self.name, ReducerSlot::Dynamic(id));
         self.registry.dynamic_reducers.push(DynamicReducerEntry {
             name: self.name,
-            access: self.access,
             resolved,
             closure,
         });
@@ -1123,10 +1122,10 @@ mod tests {
         let pos_id = world.components.id::<Pos>().unwrap();
         let vel_id = world.components.id::<Vel>().unwrap();
         let entry = &reducers.dynamic_reducers[id.0];
-        assert!(entry.access.reads()[pos_id]);
-        assert!(!entry.access.writes()[pos_id]); // read-only
-        assert!(entry.access.reads()[vel_id]);
-        assert!(entry.access.writes()[vel_id]); // writable
+        assert!(entry.resolved.access().reads()[pos_id]);
+        assert!(!entry.resolved.access().writes()[pos_id]); // read-only
+        assert!(entry.resolved.access().reads()[vel_id]);
+        assert!(entry.resolved.access().writes()[vel_id]); // writable
     }
 
     #[test]
@@ -1142,8 +1141,8 @@ mod tests {
         let vel_id = world.components.id::<Vel>().unwrap();
         let entry = &reducers.dynamic_reducers[id.0];
         // Spawn adds writes for conflict detection
-        assert!(entry.access.writes()[pos_id]);
-        assert!(entry.access.writes()[vel_id]);
+        assert!(entry.resolved.access().writes()[pos_id]);
+        assert!(entry.resolved.access().writes()[vel_id]);
     }
 
     #[test]
@@ -1237,9 +1236,8 @@ mod tests {
     // ── Debug assertion tests ────────────────────────────────────
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "read-only")]
-    fn dynamic_ctx_write_on_read_only_panics_in_debug() {
+    fn dynamic_ctx_write_on_read_only_panics() {
         use std::any::TypeId;
         let mut world = World::new();
         let pos_id = world.register_component::<Pos>();
@@ -1258,9 +1256,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "bundle")]
-    fn dynamic_ctx_spawn_undeclared_bundle_panics_in_debug() {
+    fn dynamic_ctx_spawn_undeclared_bundle_panics() {
         let mut world = World::new();
         world.register_component::<Pos>();
 
