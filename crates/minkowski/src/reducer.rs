@@ -1220,6 +1220,45 @@ mod tests {
         assert!(!access.writes()[pos_id]);
     }
 
+    // ── Debug assertion tests ────────────────────────────────────
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "read-only")]
+    fn dynamic_ctx_write_on_read_only_panics_in_debug() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let pos_id = world.register_component::<Pos>();
+        let e = world.spawn((Pos(1.0),));
+
+        // Declare Pos as read-only (not writable)
+        let entries = vec![(TypeId::of::<Pos>(), pos_id)];
+        let mut access = Access::empty();
+        access.add_read(pos_id); // read only, no write
+        let resolved = DynamicResolved::new(entries, access, Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+        ctx.write(e, Pos(99.0)); // should panic: read-only
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "bundle")]
+    fn dynamic_ctx_spawn_undeclared_bundle_panics_in_debug() {
+        let mut world = World::new();
+        world.register_component::<Pos>();
+
+        // No spawn bundles declared
+        let resolved = DynamicResolved::new(vec![], Access::empty(), Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+        ctx.spawn((Pos(1.0),)); // should panic: bundle not declared
+    }
+
     // ── ComponentSet tests ──────────────────────────────────────
 
     #[test]

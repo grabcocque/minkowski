@@ -32,8 +32,8 @@ pub use index::SpatialIndex;
 pub use minkowski_derive::Table;
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
-    ComponentSet, Contains, EntityMut, EntityRef, QueryMut, QueryReducerId, QueryRef, ReducerId,
-    ReducerRegistry, Spawner,
+    ComponentSet, Contains, DynamicCtx, DynamicReducerBuilder, DynamicReducerId, EntityMut,
+    EntityRef, QueryMut, QueryReducerId, QueryRef, ReducerId, ReducerRegistry, Spawner,
 };
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
 pub use world::World;
