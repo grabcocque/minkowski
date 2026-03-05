@@ -56,6 +56,12 @@ impl DynamicResolved {
         spawn_bundles: HashSet<TypeId>,
     ) -> Self {
         entries.sort_by_key(|(tid, _)| *tid);
+        debug_assert!(
+            entries
+                .windows(2)
+                .all(|w| w[0].0 != w[1].0 || w[0].1 == w[1].1),
+            "DynamicResolved: duplicate TypeId with different ComponentIds"
+        );
         entries.dedup_by_key(|(tid, _)| *tid);
         Self {
             entries,
@@ -852,11 +858,15 @@ impl ReducerRegistry {
         kind: ReducerKind,
     ) -> ReducerId {
         let id = self.reducers.len();
-        if self.by_name.contains_key(name) {
+        if let Some(slot) = self.by_name.get(name) {
+            let existing = match slot {
+                ReducerSlot::Unified(idx) => *idx,
+                ReducerSlot::Dynamic(idx) => *idx,
+            };
             panic!(
                 "ReducerRegistry: duplicate reducer name '{}' \
                  (already registered at index {})",
-                name, id
+                name, existing
             );
         }
         self.by_name.insert(name, ReducerSlot::Unified(id));
@@ -940,11 +950,15 @@ impl<'a> DynamicReducerBuilder<'a> {
         });
 
         let id = self.registry.dynamic_reducers.len();
-        if self.registry.by_name.contains_key(self.name) {
+        if let Some(slot) = self.registry.by_name.get(self.name) {
+            let existing = match slot {
+                ReducerSlot::Unified(idx) => *idx,
+                ReducerSlot::Dynamic(idx) => *idx,
+            };
             panic!(
                 "ReducerRegistry: duplicate reducer name '{}' \
-                 (already registered)",
-                self.name
+                 (already registered at index {})",
+                self.name, existing
             );
         }
         self.registry
@@ -994,10 +1008,10 @@ mod tests {
     #[test]
     fn dynamic_resolved_dedup() {
         use std::any::TypeId;
-        let entries = vec![(TypeId::of::<u32>(), 0), (TypeId::of::<u32>(), 5)];
+        let entries = vec![(TypeId::of::<u32>(), 0), (TypeId::of::<u32>(), 0)];
         let resolved = DynamicResolved::new(entries, Access::empty(), Default::default());
-        // After dedup, first entry wins (sorted, then dedup keeps first)
-        assert!(resolved.lookup::<u32>().is_some());
+        // After dedup, duplicate entries are collapsed
+        assert_eq!(resolved.lookup::<u32>(), Some(0));
     }
 
     #[test]
@@ -1628,6 +1642,78 @@ mod tests {
         let mut registry = ReducerRegistry::new();
         registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
         registry.register_entity::<(Health,), (), _>(&mut world, "heal", |_entity, ()| {});
+    }
+
+    #[test]
+    fn dynamic_ctx_try_write_success() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let e = world.spawn((42u32,));
+        let comp_id = world.components.id::<u32>().unwrap();
+
+        let mut access = Access::empty();
+        access.add_write(comp_id);
+        let entries = vec![(TypeId::of::<u32>(), comp_id)];
+        let resolved = DynamicResolved::new(entries, access, Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+
+        let wrote = ctx.try_write::<u32>(e, 99);
+        assert!(wrote);
+
+        let _reverse = cs.apply(&mut world);
+        assert_eq!(*world.get::<u32>(e).unwrap(), 99);
+    }
+
+    #[test]
+    fn dynamic_ctx_try_write_missing_component() {
+        use std::any::TypeId;
+        let mut world = World::new();
+        let e = world.spawn((42u32,)); // has u32, not f64
+        let f64_id = world.register_component::<f64>();
+
+        let mut access = Access::empty();
+        access.add_write(f64_id);
+        let entries = vec![(TypeId::of::<f64>(), f64_id)];
+        let resolved = DynamicResolved::new(entries, access, Default::default());
+
+        let mut cs = EnumChangeSet::new();
+        let mut allocated = Vec::new();
+        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
+
+        let wrote = ctx.try_write::<f64>(e, 99.0);
+        assert!(!wrote);
+        assert_eq!(cs.len(), 0); // nothing buffered
+    }
+
+    #[test]
+    fn dynamic_call_spawn_places_entity() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+
+        let id = reducers
+            .dynamic("spawner", &mut world)
+            .can_spawn::<(u32, f64)>()
+            .build(|ctx: &mut DynamicCtx, _args: &()| {
+                let e = ctx.spawn((42u32, std::f64::consts::PI));
+                let _ = e;
+            });
+
+        let strategy = Optimistic::new(&world);
+        reducers
+            .dynamic_call(&strategy, &mut world, id, &())
+            .unwrap();
+
+        // Verify the spawned entity exists with correct components
+        let mut found = false;
+        world.query::<(&u32, &f64)>().for_each(|(u, f)| {
+            assert_eq!(*u, 42);
+            assert!((f - std::f64::consts::PI).abs() < f64::EPSILON);
+            found = true;
+        });
+        assert!(found, "spawned entity not found in world");
     }
 
     #[test]
