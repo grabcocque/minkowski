@@ -15,13 +15,13 @@ cargo fmt --all                                          # Format
 cargo bench -p minkowski               # All criterion benchmarks
 cargo bench -p minkowski -- spawn      # Single benchmark
 
-cargo run -p minkowski-examples --example boids --release   # Boids simulation (5K entities, 1K frames)
-cargo run -p minkowski-examples --example life --release    # Game of Life with undo + derive(Table) (64x64 grid, 500 gens)
-cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body (2K entities, 1K frames)
-cargo run -p minkowski-examples --example scheduler --release   # Access conflict detection demo (6 systems, 10 frames)
-cargo run -p minkowski-examples --example transaction --release   # Transaction strategies demo (3 strategies, 100 entities)
-cargo run -p minkowski-examples --example battle --release   # Multi-threaded battle with tunable conflict rates (500 entities, 100 frames)
-cargo run -p minkowski-examples --example persist --release   # Durable transactions: WAL + snapshot save/load/recovery (100 entities, 10 frames)
+cargo run -p minkowski-examples --example boids --release   # Boids flocking with query reducers + spatial grid (5K entities, 1K frames)
+cargo run -p minkowski-examples --example life --release    # Game of Life with QueryMut reducer, Table, undo/redo (64x64 grid, 500 gens)
+cargo run -p minkowski-examples --example nbody --release   # Barnes-Hut N-body with query reducers (2K entities, 1K frames)
+cargo run -p minkowski-examples --example scheduler --release   # ReducerRegistry-based conflict detection + batch scheduling (6 systems, 10 frames)
+cargo run -p minkowski-examples --example transaction --release   # Transaction strategies: raw Tx + reducer comparison (3 strategies, 100 entities)
+cargo run -p minkowski-examples --example battle --release   # Multi-threaded EntityMut reducers with tunable conflict (500 entities, 100 frames)
+cargo run -p minkowski-examples --example persist --release   # Durable QueryWriter reducer: WAL + snapshots (100 entities, 10 frames)
 cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/query-writer/dynamic handles + structural mutations + conflict detection
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
