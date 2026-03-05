@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::access::Access;
@@ -116,6 +116,7 @@ pub struct DynamicCtx<'a> {
     allocated: &'a mut Vec<Entity>,
     resolved: &'a DynamicResolved,
     last_read_tick: &'a Arc<AtomicU64>,
+    queried: &'a AtomicBool,
 }
 
 impl<'a> DynamicCtx<'a> {
@@ -125,6 +126,7 @@ impl<'a> DynamicCtx<'a> {
         allocated: &'a mut Vec<Entity>,
         resolved: &'a DynamicResolved,
         last_read_tick: &'a Arc<AtomicU64>,
+        queried: &'a AtomicBool,
     ) -> Self {
         Self {
             world,
@@ -132,6 +134,7 @@ impl<'a> DynamicCtx<'a> {
             allocated,
             resolved,
             last_read_tick,
+            queried,
         }
     }
 
@@ -285,6 +288,7 @@ impl<'a> DynamicCtx<'a> {
     /// Panics if `Q` accesses any component not declared via `can_read`
     /// or `can_write` on the builder.
     pub fn for_each<Q: ReadOnlyWorldQuery + 'static>(&self, mut f: impl FnMut(Q::Item<'_>)) {
+        self.queried.store(true, Ordering::Relaxed);
         // Runtime validation: Q's accessed components must be a subset
         // of the builder-declared components.
         let accessed = Q::accessed_ids(&self.world.components);
@@ -805,6 +809,7 @@ pub struct QueryWriter<'a, Q: WriterQuery> {
     world: &'a mut World,
     changeset: *mut EnumChangeSet,
     last_read_tick: &'a Arc<AtomicU64>,
+    queried: &'a AtomicBool,
     _cs: PhantomData<&'a EnumChangeSet>,
     _query: PhantomData<Q>,
 }
@@ -814,11 +819,13 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
         world: &'a mut World,
         changeset: *mut EnumChangeSet,
         last_read_tick: &'a Arc<AtomicU64>,
+        queried: &'a AtomicBool,
     ) -> Self {
         Self {
             world,
             changeset,
             last_read_tick,
+            queried,
             _cs: PhantomData,
             _query: PhantomData,
         }
@@ -833,6 +840,7 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// Advances the change detection tick: entities matched here will NOT
     /// be matched again on the next call unless their columns are modified.
     pub fn for_each(&mut self, mut f: impl FnMut(Q::WriterItem<'_>)) {
+        self.queried.store(true, Ordering::Relaxed);
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
 
         let required = Q::required_ids(&self.world.components);
@@ -854,7 +862,7 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
         }
 
         // last_read_tick is updated by call() AFTER the changeset is applied,
-        // ensuring it's newer than any column tick set during commit.
+        // only if this flag was set (i.e., for_each or count was actually called).
     }
 
     /// Count matching entities (respects `Changed<T>` filters).
@@ -863,6 +871,7 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
     /// so entities counted here will NOT be matched again unless their columns
     /// are modified externally.
     pub fn count(&mut self) -> usize {
+        self.queried.store(true, Ordering::Relaxed);
         let last_tick = Tick::new(self.last_read_tick.load(Ordering::Relaxed));
 
         let required = Q::required_ids(&self.world.components);
@@ -877,7 +886,8 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
             total += arch.len();
         }
 
-        // last_read_tick is updated by call() AFTER the changeset is applied.
+        // last_read_tick is updated by call() AFTER the changeset is applied,
+        // only if this flag was set.
         total
     }
 }
@@ -1040,6 +1050,8 @@ struct ReducerEntry {
     /// Per-reducer tick for `Changed<T>` support in `QueryWriter`.
     /// `None` for non-query-writer reducers.
     last_read_tick: Option<Arc<AtomicU64>>,
+    /// Set to `true` by `for_each`/`count` — tick only advances if query ran.
+    queried: Option<Arc<AtomicBool>>,
 }
 
 struct DynamicReducerEntry {
@@ -1117,6 +1129,7 @@ impl ReducerRegistry {
             resolved,
             ReducerKind::Transactional(adapter),
             None,
+            None,
         )
     }
 
@@ -1161,6 +1174,7 @@ impl ReducerRegistry {
             resolved,
             ReducerKind::Transactional(adapter),
             None,
+            None,
         )
     }
 
@@ -1200,6 +1214,7 @@ impl ReducerRegistry {
             resolved,
             ReducerKind::Transactional(adapter),
             None,
+            None,
         )
     }
 
@@ -1226,6 +1241,8 @@ impl ReducerRegistry {
         let access = Access::of::<Q>(world);
         let last_read_tick = Arc::new(AtomicU64::new(0));
         let tick_ref = last_read_tick.clone();
+        let queried = Arc::new(AtomicBool::new(false));
+        let queried_ref = queried.clone();
 
         let adapter: TransactionalAdapter =
             Box::new(move |changeset, _allocated, tw, _resolved, args_any| {
@@ -1239,7 +1256,7 @@ impl ReducerRegistry {
                     })
                     .clone();
                 let cs_ptr: *mut EnumChangeSet = changeset;
-                let qw = QueryWriter::<Q>::new(tw.0, cs_ptr, &tick_ref);
+                let qw = QueryWriter::<Q>::new(tw.0, cs_ptr, &tick_ref, &queried_ref);
                 f(qw, args);
             });
 
@@ -1249,6 +1266,7 @@ impl ReducerRegistry {
             resolved,
             ReducerKind::Transactional(adapter),
             Some(last_read_tick),
+            Some(queried),
         )
     }
 
@@ -1288,6 +1306,7 @@ impl ReducerRegistry {
             access,
             resolved,
             ReducerKind::Scheduled(adapter),
+            None,
             None,
         );
         QueryReducerId(id.0)
@@ -1330,6 +1349,7 @@ impl ReducerRegistry {
             access,
             resolved,
             ReducerKind::Scheduled(adapter),
+            None,
             None,
         );
         QueryReducerId(id.0)
@@ -1376,17 +1396,28 @@ impl ReducerRegistry {
         let resolved = &entry.resolved;
 
         let tick_arc = entry.last_read_tick.clone();
+        let queried_flag = entry.queried.clone();
+        // Reset the queried flag before each call so we only advance the
+        // tick if for_each/count actually runs during this invocation.
+        if let Some(q) = &queried_flag {
+            q.store(false, Ordering::Relaxed);
+        }
         let result = strategy.transact(world, access, |tx, world| {
             let (changeset, allocated) = tx.reducer_parts();
             let mut tw = TransactionalWorld(world);
             adapter(changeset, allocated, &mut tw, resolved, &args);
         });
         // Update last_read_tick AFTER the changeset is applied (by transact),
-        // so that the stored tick is newer than any column tick set during commit.
+        // but only if for_each/count was actually called during this invocation.
         if result.is_ok() {
             if let Some(arc) = &tick_arc {
-                let new_tick = world.next_tick();
-                arc.store(new_tick.raw(), Ordering::Relaxed);
+                if queried_flag
+                    .as_ref()
+                    .is_none_or(|q| q.load(Ordering::Relaxed))
+                {
+                    let new_tick = world.next_tick();
+                    arc.store(new_tick.raw(), Ordering::Relaxed);
+                }
             }
         }
         result
@@ -1459,16 +1490,19 @@ impl ReducerRegistry {
         let resolved = &entry.resolved;
         let access = resolved.access();
         let tick_arc = entry.last_read_tick.clone();
+        let queried = Arc::new(AtomicBool::new(false));
 
         let result = strategy.transact(world, access, |tx, world| {
             let (changeset, allocated) = tx.reducer_parts();
             let world_ref: &World = world;
-            let mut ctx = DynamicCtx::new(world_ref, changeset, allocated, resolved, &tick_arc);
+            let mut ctx = DynamicCtx::new(
+                world_ref, changeset, allocated, resolved, &tick_arc, &queried,
+            );
             closure(&mut ctx, args);
         });
         // Update last_read_tick AFTER the changeset is applied (by transact),
-        // so that the stored tick is newer than any column tick set during commit.
-        if result.is_ok() {
+        // but only if for_each was actually called during this invocation.
+        if result.is_ok() && queried.load(Ordering::Relaxed) {
             let new_tick = world.next_tick();
             entry
                 .last_read_tick
@@ -1500,6 +1534,7 @@ impl ReducerRegistry {
         resolved: ResolvedComponents,
         kind: ReducerKind,
         last_read_tick: Option<Arc<AtomicU64>>,
+        queried: Option<Arc<AtomicBool>>,
     ) -> ReducerId {
         let id = self.reducers.len();
         if let Some(slot) = self.by_name.get(name) {
@@ -1520,6 +1555,7 @@ impl ReducerRegistry {
             resolved,
             kind,
             last_read_tick,
+            queried,
         });
         ReducerId(id)
     }
@@ -1720,9 +1756,17 @@ mod tests {
             DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         assert_eq!(ctx.read::<Pos>(e).0, 42.0);
     }
 
@@ -1742,9 +1786,17 @@ mod tests {
             DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         assert!(ctx.try_read::<Pos>(e).is_some());
         assert!(ctx.try_read::<Vel>(e).is_none());
     }
@@ -1763,11 +1815,18 @@ mod tests {
             DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
         {
-            let mut ctx =
-                DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+            let mut ctx = DynamicCtx::new(
+                &world,
+                &mut cs,
+                &mut allocated,
+                &resolved,
+                &default_tick,
+                &default_queried,
+            );
             ctx.write(e, Pos(99.0));
         }
         // Not yet applied
@@ -1792,9 +1851,17 @@ mod tests {
             Default::default(),
         );
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         let _ = ctx.read::<Pos>(e);
     }
 
@@ -2254,9 +2321,17 @@ mod tests {
             DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let mut ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         ctx.write(e, Pos(99.0)); // should panic: read-only
     }
 
@@ -2275,9 +2350,17 @@ mod tests {
         );
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let mut ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         ctx.spawn((Pos(1.0),)); // should panic: bundle not declared
     }
 
@@ -2666,9 +2749,17 @@ mod tests {
             DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let mut ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
 
         let wrote = ctx.try_write::<u32>(e, 99);
         assert!(wrote);
@@ -2691,9 +2782,17 @@ mod tests {
             DynamicResolved::new(entries, access, Default::default(), Default::default());
 
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let mut ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
 
         let wrote = ctx.try_write::<f64>(e, 99.0);
         assert!(!wrote);
@@ -2759,9 +2858,17 @@ mod tests {
             Default::default(),
         );
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         let _ = ctx.try_read::<u32>(e);
     }
 
@@ -2777,9 +2884,17 @@ mod tests {
             Default::default(),
         );
         let default_tick = Arc::new(AtomicU64::new(0));
+        let default_queried = AtomicBool::new(false);
         let mut cs = EnumChangeSet::new();
         let mut allocated = Vec::new();
-        let mut ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved, &default_tick);
+        let mut ctx = DynamicCtx::new(
+            &world,
+            &mut cs,
+            &mut allocated,
+            &resolved,
+            &default_tick,
+            &default_queried,
+        );
         ctx.try_write::<u32>(e, 99);
     }
 
