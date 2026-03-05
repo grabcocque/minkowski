@@ -34,6 +34,7 @@ use crate::world::World;
 /// // Read Pos vs write Pos — conflict
 /// assert!(movement.conflicts_with(&log));
 /// ```
+#[derive(Clone)]
 pub struct Access {
     reads: FixedBitSet,
     writes: FixedBitSet,

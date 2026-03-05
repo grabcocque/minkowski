@@ -714,6 +714,25 @@ impl ReducerRegistry {
         QueryReducerId(id.0)
     }
 
+    // ── Dynamic registration ────────────────────────────────────
+
+    /// Start building a dynamic reducer. Returns a builder that lets you
+    /// declare which components the closure may read, write, or spawn.
+    pub fn dynamic<'a>(
+        &'a mut self,
+        name: &'static str,
+        world: &'a mut World,
+    ) -> DynamicReducerBuilder<'a> {
+        DynamicReducerBuilder {
+            registry: self,
+            world,
+            name,
+            access: Access::empty(),
+            entries: Vec::new(),
+            spawn_bundles: HashSet::new(),
+        }
+    }
+
     // ── Dispatch ─────────────────────────────────────────────────
 
     /// Call a transactional entity reducer with a chosen strategy.
@@ -825,6 +844,90 @@ impl ReducerRegistry {
 impl Default for ReducerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── DynamicReducerBuilder ────────────────────────────────────────────
+
+/// Builder for registering a dynamic reducer. Declare upper-bound access
+/// with `can_read`, `can_write`, and `can_spawn`, then finalize with `build`.
+pub struct DynamicReducerBuilder<'a> {
+    registry: &'a mut ReducerRegistry,
+    world: &'a mut World,
+    name: &'static str,
+    access: Access,
+    entries: Vec<(TypeId, ComponentId)>,
+    spawn_bundles: HashSet<TypeId>,
+}
+
+impl<'a> DynamicReducerBuilder<'a> {
+    /// Declare that the closure may read component `T`.
+    pub fn can_read<T: crate::component::Component>(mut self) -> Self {
+        let comp_id = self.world.register_component::<T>();
+        self.access.add_read(comp_id);
+        self.entries.push((TypeId::of::<T>(), comp_id));
+        self
+    }
+
+    /// Declare that the closure may write component `T`.
+    /// Also adds a read entry (write implies read capability).
+    pub fn can_write<T: crate::component::Component>(mut self) -> Self {
+        let comp_id = self.world.register_component::<T>();
+        self.access.add_read(comp_id);
+        self.access.add_write(comp_id);
+        self.entries.push((TypeId::of::<T>(), comp_id));
+        self
+    }
+
+    /// Declare that the closure may spawn entities with bundle `B`.
+    /// Adds write access for conflict detection but does NOT add TypeId
+    /// entries (spawn uses the Bundle trait directly, not per-component lookup).
+    pub fn can_spawn<B: Bundle>(mut self) -> Self {
+        let comp_ids = B::component_ids(&mut self.world.components);
+        for &comp_id in &comp_ids {
+            self.access.add_write(comp_id);
+        }
+        self.spawn_bundles.insert(TypeId::of::<B>());
+        self
+    }
+
+    /// Finalize registration. The closure receives `&mut DynamicCtx` and
+    /// type-erased `&Args`. Returns the opaque `DynamicReducerId`.
+    pub fn build<Args, F>(self, f: F) -> DynamicReducerId
+    where
+        Args: 'static,
+        F: Fn(&mut DynamicCtx, &Args) + Send + Sync + 'static,
+    {
+        let resolved = DynamicResolved::new(self.entries, self.access.clone(), self.spawn_bundles);
+
+        let closure: DynamicAdapter = Box::new(move |ctx, args_any| {
+            let args = args_any.downcast_ref::<Args>().unwrap_or_else(|| {
+                panic!(
+                    "dynamic reducer args type mismatch: expected {}",
+                    std::any::type_name::<Args>()
+                )
+            });
+            f(ctx, args);
+        });
+
+        let id = self.registry.dynamic_reducers.len();
+        if self.registry.by_name.contains_key(self.name) {
+            panic!(
+                "ReducerRegistry: duplicate reducer name '{}' \
+                 (already registered)",
+                self.name
+            );
+        }
+        self.registry
+            .by_name
+            .insert(self.name, ReducerSlot::Dynamic(id));
+        self.registry.dynamic_reducers.push(DynamicReducerEntry {
+            name: self.name,
+            access: self.access,
+            resolved,
+            closure,
+        });
+        DynamicReducerId(id)
     }
 }
 
@@ -957,6 +1060,71 @@ mod tests {
         let mut allocated = Vec::new();
         let ctx = DynamicCtx::new(&world, &mut cs, &mut allocated, &resolved);
         let _ = ctx.read::<Pos>(e);
+    }
+
+    // ── DynamicReducerBuilder tests ──────────────────────────────
+
+    #[test]
+    fn dynamic_builder_registers() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+        let id = reducers
+            .dynamic("test_dyn", &mut world)
+            .can_read::<Pos>()
+            .can_write::<Vel>()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+
+        assert_eq!(id.index(), 0);
+
+        // Verify access: Pos is read, Vel is read+write
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let vel_id = world.components.id::<Vel>().unwrap();
+        let entry = &reducers.dynamic_reducers[id.0];
+        assert!(entry.access.reads()[pos_id]);
+        assert!(!entry.access.writes()[pos_id]); // read-only
+        assert!(entry.access.reads()[vel_id]);
+        assert!(entry.access.writes()[vel_id]); // writable
+    }
+
+    #[test]
+    fn dynamic_builder_can_spawn() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+        let id = reducers
+            .dynamic("spawner", &mut world)
+            .can_spawn::<(Pos, Vel)>()
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+
+        let pos_id = world.components.id::<Pos>().unwrap();
+        let vel_id = world.components.id::<Vel>().unwrap();
+        let entry = &reducers.dynamic_reducers[id.0];
+        // Spawn adds writes for conflict detection
+        assert!(entry.access.writes()[pos_id]);
+        assert!(entry.access.writes()[vel_id]);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate reducer name")]
+    fn dynamic_builder_duplicate_name_panics() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+        reducers
+            .dynamic("dup", &mut world)
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+        reducers
+            .dynamic("dup", &mut world)
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate reducer name")]
+    fn dynamic_name_conflicts_with_unified() {
+        let mut world = World::new();
+        let mut reducers = ReducerRegistry::new();
+        reducers.register_entity::<(Health,), (), _>(&mut world, "shared_name", |_e, ()| {});
+        reducers
+            .dynamic("shared_name", &mut world)
+            .build(|_ctx: &mut DynamicCtx, _args: &()| {});
     }
 
     // ── ComponentSet tests ──────────────────────────────────────
