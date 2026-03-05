@@ -746,10 +746,10 @@ impl DynamicReducerId {
     }
 }
 
-/// Type-erased entity reducer adapter. Receives changeset + allocated list
-/// (from Tx), world (for reads), resolved IDs, target entity, and type-erased args.
-type EntityAdapter = Box<
-    dyn Fn(&mut EnumChangeSet, &mut Vec<Entity>, &World, &ResolvedComponents, Entity, &dyn Any)
+/// Type-erased transactional reducer adapter. Receives changeset + allocated list
+/// (from Tx), world, resolved IDs, and type-erased args.
+type TransactionalAdapter = Box<
+    dyn Fn(&mut EnumChangeSet, &mut Vec<Entity>, &mut World, &ResolvedComponents, &dyn Any)
         + Send
         + Sync,
 >;
@@ -763,7 +763,7 @@ type DynamicAdapter = Box<dyn Fn(&mut DynamicCtx, &dyn Any) + Send + Sync>;
 /// Two execution models for reducers.
 enum ReducerKind {
     /// Runs inside `strategy.transact()`. Entity + args from call site.
-    EntityTransactional(EntityAdapter),
+    Transactional(TransactionalAdapter),
     /// Runs with direct `&mut World`.
     Scheduled(ScheduledAdapter),
 }
@@ -811,7 +811,7 @@ impl ReducerRegistry {
     // ── Transactional registration ───────────────────────────────
 
     /// Register an entity reducer: `f(EntityMut<C>, args)`.
-    /// At dispatch, the entity comes from `call_entity()`.
+    /// At dispatch, call with `(entity, args)` as the args tuple.
     pub fn register_entity<C, Args, F>(
         &mut self,
         world: &mut World,
@@ -829,28 +829,23 @@ impl ReducerRegistry {
         let writes = C::access(&mut world.components, false);
         let access = reads.merge(&writes);
 
-        let adapter: EntityAdapter = Box::new(
-            move |changeset, _allocated, world, resolved, entity, args_any| {
-                let args = args_any
-                    .downcast_ref::<Args>()
+        let adapter: TransactionalAdapter =
+            Box::new(move |changeset, _allocated, world, resolved, args_any| {
+                let (entity, args) = args_any
+                    .downcast_ref::<(Entity, Args)>()
                     .unwrap_or_else(|| {
                         panic!(
-                            "reducer args type mismatch: expected {}",
+                            "reducer args type mismatch: expected (Entity, {})",
                             std::any::type_name::<Args>()
                         )
                     })
                     .clone();
-                let handle = EntityMut::<C>::new(entity, resolved, changeset, world);
+                let world_ref: &World = world;
+                let handle = EntityMut::<C>::new(entity, resolved, changeset, world_ref);
                 f(handle, args);
-            },
-        );
+            });
 
-        self.push_entry(
-            name,
-            access,
-            resolved,
-            ReducerKind::EntityTransactional(adapter),
-        )
+        self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
     }
 
     /// Register a spawner reducer: `f(Spawner<B>, args)`.
@@ -868,8 +863,8 @@ impl ReducerRegistry {
         let resolved = ResolvedComponents(B::component_ids(&mut world.components));
         let access = Access::empty(); // spawner creates new entities, no column conflicts
 
-        let adapter: EntityAdapter = Box::new(
-            move |changeset, allocated, world, _resolved, _entity, args_any| {
+        let adapter: TransactionalAdapter =
+            Box::new(move |changeset, allocated, world, _resolved, args_any| {
                 let args = args_any
                     .downcast_ref::<Args>()
                     .unwrap_or_else(|| {
@@ -879,17 +874,12 @@ impl ReducerRegistry {
                         )
                     })
                     .clone();
-                let handle = Spawner::<B>::new(changeset, allocated, world);
+                let world_ref: &World = world;
+                let handle = Spawner::<B>::new(changeset, allocated, world_ref);
                 f(handle, args);
-            },
-        );
+            });
 
-        self.push_entry(
-            name,
-            access,
-            resolved,
-            ReducerKind::EntityTransactional(adapter),
-        )
+        self.push_entry(name, access, resolved, ReducerKind::Transactional(adapter))
     }
 
     // ── Scheduled registration ───────────────────────────────────
@@ -984,20 +974,19 @@ impl ReducerRegistry {
 
     // ── Dispatch ─────────────────────────────────────────────────
 
-    /// Call a transactional entity reducer with a chosen strategy.
-    pub fn call_entity<S: Transact, Args: Clone + 'static>(
+    /// Call a transactional reducer (entity, spawner, or query writer).
+    pub fn call<S: Transact, Args: Clone + 'static>(
         &self,
         strategy: &S,
         world: &mut World,
         id: ReducerId,
-        entity: Entity,
         args: Args,
     ) -> Result<(), Conflict> {
         let entry = &self.reducers[id.0];
         let adapter = match &entry.kind {
-            ReducerKind::EntityTransactional(f) => f,
+            ReducerKind::Transactional(f) => f,
             ReducerKind::Scheduled(_) => {
-                panic!("call_entity() on scheduled reducer — use run() instead")
+                panic!("call() on scheduled reducer — use run() instead")
             }
         };
         let access = &entry.access;
@@ -1005,8 +994,7 @@ impl ReducerRegistry {
 
         strategy.transact(world, access, |tx, world| {
             let (changeset, allocated) = tx.reducer_parts();
-            let world_ref: &World = world;
-            adapter(changeset, allocated, world_ref, resolved, entity, &args);
+            adapter(changeset, allocated, world, resolved, &args);
         })
     }
 
@@ -1015,8 +1003,8 @@ impl ReducerRegistry {
         let entry = &self.reducers[id.0];
         match &entry.kind {
             ReducerKind::Scheduled(f) => f(world, &args),
-            ReducerKind::EntityTransactional(_) => {
-                panic!("run() called on transactional reducer — use call_entity() instead")
+            ReducerKind::Transactional(_) => {
+                panic!("run() called on transactional reducer — use call() instead")
             }
         }
     }
@@ -1027,7 +1015,7 @@ impl ReducerRegistry {
         let &slot = self.by_name.get(name)?;
         match slot {
             ReducerSlot::Unified(idx) => match &self.reducers[idx].kind {
-                ReducerKind::EntityTransactional(_) => Some(ReducerId(idx)),
+                ReducerKind::Transactional(_) => Some(ReducerId(idx)),
                 ReducerKind::Scheduled(_) => None,
             },
             ReducerSlot::Dynamic(_) => None,
@@ -1041,7 +1029,7 @@ impl ReducerRegistry {
         match slot {
             ReducerSlot::Unified(idx) => match &self.reducers[idx].kind {
                 ReducerKind::Scheduled(_) => Some(QueryReducerId(idx)),
-                ReducerKind::EntityTransactional(_) => None,
+                ReducerKind::Transactional(_) => None,
             },
             ReducerSlot::Dynamic(_) => None,
         }
@@ -1716,7 +1704,7 @@ mod tests {
         );
 
         registry
-            .call_entity(&strategy, &mut world, heal_id, e, 25u32)
+            .call(&strategy, &mut world, heal_id, (e, 25u32))
             .unwrap();
         assert_eq!(world.get::<Health>(e).unwrap().0, 125);
     }
@@ -1827,7 +1815,7 @@ mod tests {
         );
 
         registry
-            .call_entity(&strategy, &mut world, spawn_id, Entity::DANGLING, 50u32)
+            .call(&strategy, &mut world, spawn_id, 50u32)
             .unwrap();
 
         let mut count = 0;

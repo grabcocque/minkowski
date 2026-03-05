@@ -103,7 +103,7 @@ fn main() {
 
     // Heal hero
     registry
-        .call_entity(&strategy, &mut world, heal_id, hero, 25u32)
+        .call(&strategy, &mut world, heal_id, (hero, 25u32))
         .unwrap();
     println!(
         "After heal: hero hp={}",
@@ -112,7 +112,7 @@ fn main() {
 
     // Damage enemy
     registry
-        .call_entity(&strategy, &mut world, damage_id, enemy, 30u32)
+        .call(&strategy, &mut world, damage_id, (enemy, 30u32))
         .unwrap();
     println!(
         "After damage: enemy hp={}",
@@ -131,7 +131,7 @@ fn main() {
 
     // Spawn a new unit via spawner reducer
     registry
-        .call_entity(&strategy, &mut world, spawn_id, Entity::DANGLING, 75u32)
+        .call(&strategy, &mut world, spawn_id, 75u32)
         .unwrap();
 
     // ── 6. Name-based lookup ─────────────────────────────────────────
