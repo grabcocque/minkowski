@@ -23,7 +23,7 @@ Search the user's codebase for existing concurrency patterns:
 - **Single-threaded, no persistence needed**: `Sequential` — zero overhead, all ops delegate directly to World. Commit always succeeds. Use `registry.run()` for query reducers.
 - **First step into concurrency**: `Optimistic` — live reads via `query_raw(&self)`, buffered writes into `EnumChangeSet`, tick-based validation at commit. Cheap when conflicts are rare. Default 3 retries.
 - **Write-heavy with expensive retries**: `Pessimistic` — cooperative per-column locks acquired at begin, buffered writes, commit always succeeds. Higher lock overhead but no wasted work. Default 64 retries with spin+yield backoff.
-- **Need crash safety**: `Durable<S, W>` wrapping any strategy. On successful commit, forward changeset is written to WAL before being applied to World. WAL write failure panics (durability invariant is non-negotiable).
+- **Need crash safety**: `Durable<S>` wrapping any strategy. On successful commit, forward changeset is written to WAL before being applied to World. WAL write failure panics (durability invariant is non-negotiable).
 
 **Strategy selection guide:**
 1. Start with `Sequential`. It is the right choice until proven otherwise.

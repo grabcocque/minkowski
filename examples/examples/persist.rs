@@ -5,24 +5,35 @@
 //! 2. Save a snapshot
 //! 3. Apply mutations via a durable QueryWriter reducer (WAL-backed)
 //! 4. Recover from snapshot + WAL replay
+//! 5. Zero-copy snapshot load (mmap-based, no per-value deserialization)
 //!
 //! Run: cargo run -p minkowski-examples --example persist --release
 
 use minkowski::{Optimistic, QueryWriter, ReducerRegistry, World};
-use minkowski_persist::{Bincode, CodecRegistry, Durable, Snapshot, Wal};
-use serde::{Deserialize, Serialize};
+use minkowski_persist::{CodecRegistry, Durable, Snapshot, Wal};
+use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[repr(C)]
 struct Pos {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[repr(C)]
 struct Vel {
     dx: f32,
     dy: f32,
 }
+
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[repr(C)]
+struct Health(u32);
+
+#[derive(Clone, Copy, Archive, Serialize, Deserialize)]
+#[repr(C)]
+struct Score(u32);
 
 fn main() {
     let dir = std::env::temp_dir().join("minkowski-persist-example");
@@ -34,14 +45,17 @@ fn main() {
     let _ = std::fs::remove_file(&wal_path);
     let _ = std::fs::remove_file(&snap_path);
 
-    // -- Phase 1: Create world --
-    println!("Phase 1: Creating world with 100 entities...");
+    // -- Phase 1: Create world with multiple archetypes --
+    println!("Phase 1: Creating world with 100 entities across 3 archetypes...");
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
     codecs.register::<Pos>(&mut world);
     codecs.register::<Vel>(&mut world);
+    codecs.register::<Health>(&mut world);
+    codecs.register::<Score>(&mut world);
 
-    for i in 0..100 {
+    // Archetype 1: (Pos, Vel) — moving entities
+    for i in 0..50 {
         world.spawn((
             Pos {
                 x: i as f32,
@@ -50,10 +64,42 @@ fn main() {
             Vel { dx: 1.0, dy: 0.5 },
         ));
     }
+    // Archetype 2: (Pos, Health) — static entities with health
+    for i in 50..80 {
+        world.spawn((
+            Pos {
+                x: i as f32,
+                y: 100.0,
+            },
+            Health(100),
+        ));
+    }
+    // Archetype 3: (Pos, Vel, Health, Score) — full-featured entities
+    for i in 80..100 {
+        world.spawn((
+            Pos {
+                x: i as f32,
+                y: 50.0,
+            },
+            Vel { dx: 0.5, dy: -0.5 },
+            Health(200),
+            Score(i),
+        ));
+    }
+    // Sparse: add Score to some Archetype-1 entities
+    let moving: Vec<_> = world
+        .query::<(minkowski::Entity, &Vel)>()
+        .filter(|(_, v)| v.dx > 0.9)
+        .map(|(e, _)| e)
+        .take(10)
+        .collect();
+    for (i, e) in moving.iter().enumerate() {
+        world.insert_sparse::<Score>(*e, Score(1000 + i as u32));
+    }
 
-    // -- Phase 2: Snapshot (before creating Durable, which takes ownership of codecs) --
-    let snap = Snapshot::new(Bincode);
-    let wal = Wal::create(&wal_path, Bincode).unwrap();
+    // -- Phase 2: Snapshot --
+    let snap = Snapshot::new();
+    let wal = Wal::create(&wal_path).unwrap();
     let header = snap
         .save(&snap_path, &world, &codecs, wal.next_seq())
         .unwrap();
@@ -96,15 +142,17 @@ fn main() {
     }
     println!("  WAL has {} records", durable.wal_seq());
 
-    // -- Phase 4: Recovery --
+    // -- Phase 4: Recovery (standard load) --
     println!("Phase 4: Recovering from snapshot + WAL...");
     let mut load_codecs = CodecRegistry::new();
     let mut load_world_tmp = World::new();
     load_codecs.register::<Pos>(&mut load_world_tmp);
     load_codecs.register::<Vel>(&mut load_world_tmp);
+    load_codecs.register::<Health>(&mut load_world_tmp);
+    load_codecs.register::<Score>(&mut load_world_tmp);
 
     let (mut recovered, snap_seq) = snap.load(&snap_path, &load_codecs).unwrap();
-    let mut replay_wal = Wal::open(&wal_path, Bincode).unwrap();
+    let mut replay_wal = Wal::open(&wal_path).unwrap();
     let last_seq = replay_wal
         .replay_from(snap_seq, &mut recovered, &load_codecs)
         .unwrap();
@@ -113,11 +161,42 @@ fn main() {
         snap_seq, last_seq
     );
 
-    let count = recovered.query::<(&Pos,)>().count();
-    let sample = recovered.query::<(&Pos,)>().next().unwrap();
+    let pos_count = recovered.query::<(&Pos,)>().count();
+    let vel_count = recovered.query::<(&Vel,)>().count();
+    let health_count = recovered.query::<(&Health,)>().count();
     println!(
-        "  Recovered world: {} entities, first at ({:.1}, {:.1})",
-        count, sample.0.x, sample.0.y
+        "  Recovered: {} with Pos, {} with Vel, {} with Health",
+        pos_count, vel_count, health_count
+    );
+    let score_id = recovered.component_id::<Score>().unwrap();
+    let sparse_scores: Vec<_> = recovered.iter_sparse::<Score>(score_id).unwrap().collect();
+    println!("  Sparse scores recovered: {}", sparse_scores.len());
+
+    // -- Phase 5: Zero-copy snapshot load --
+    println!("Phase 5: Zero-copy snapshot load (mmap)...");
+    let mut zc_codecs = CodecRegistry::new();
+    let mut zc_world_tmp = World::new();
+    zc_codecs.register::<Pos>(&mut zc_world_tmp);
+    zc_codecs.register::<Vel>(&mut zc_world_tmp);
+    zc_codecs.register::<Health>(&mut zc_world_tmp);
+    zc_codecs.register::<Score>(&mut zc_world_tmp);
+
+    let (mut zc_world, zc_seq) = snap.load_zero_copy(&snap_path, &zc_codecs).unwrap();
+    let zc_pos = zc_world.query::<(&Pos,)>().count();
+    let zc_vel = zc_world.query::<(&Vel,)>().count();
+    let zc_health = zc_world.query::<(&Health,)>().count();
+    let zc_score_id = zc_world.component_id::<Score>().unwrap();
+    let zc_sparse: Vec<_> = zc_world
+        .iter_sparse::<Score>(zc_score_id)
+        .unwrap()
+        .collect();
+    println!(
+        "  Zero-copy (seq {}): {} Pos, {} Vel, {} Health, {} sparse Scores",
+        zc_seq,
+        zc_pos,
+        zc_vel,
+        zc_health,
+        zc_sparse.len()
     );
 
     // Cleanup

@@ -51,7 +51,7 @@ registry.run(&mut world, move_id, ());
 - **Split-phase transactions** — `Tx` does not hold `&mut World`, so concurrent reads via `&World` are sound by construction. Transactions read from shared &World references and buffer writes into a private changeset. Multiple transactions execute concurrently in a parallel phase, then commit sequentially. The Rust borrow checker enforces the phase boundary — you can't start committing until all shared references are released. No manual synchronization required.
 - **AI-powered developer tooling** — an auto-triggering skill provides passive expertise; 13 slash commands guide design decisions across the paradigm
 - **No undefined behaviour** — Miri verified under Tree Borrows
-- **Composable persistence** — The Durable<S, F> wrapper takes any transaction strategy and any wire format, and guarantees that every committed transaction is WAL-logged before the caller sees the result. If the WAL write fails, the process panics — there's no silent data loss. Crash recovery replays the log from the last snapshot. The core engine has zero dependency on serde or any serialization framework.
+- **Composable persistence** — The `Durable<S>` wrapper takes any transaction strategy and guarantees that every committed transaction is WAL-logged before the caller sees the result. If the WAL write fails, the process panics — there's no silent data loss. Crash recovery replays the log from the last snapshot. Zero-copy snapshot loading via mmap + rkyv bypasses envelope deserialization and copies `#[repr(C)]` component bytes directly into columns without typed construction. The core engine has zero dependency on any serialization framework.
 - **Zero-cost tiers** — Users who don't need transactions pay nothing — direct world.get_mut() has no overhead. Users who need transactions but not persistence pay only for the changeset buffer. Users who need durability add the Durable wrapper. Each tier adds cost only for the guarantees it provides.
 - **Mechanisms, not policy** — There's no built-in scheduler, no application lifecycle, no domain-specific component types. Scheduling, system ordering, and parallelism strategy are the framework author's job — minkowski provides `Access` bitsets and `is_compatible()` so they can build their own. Secondary indexes (spatial grids, B-trees) are external consumers of the change detection system, not engine features. The litmus test: "does this require knowledge of what the user's program does?" If yes, it doesn't belong in minkowski.
 
@@ -123,11 +123,11 @@ Entity IDs allocated during a transaction are tracked automatically. On abort, o
 
 ## Persistence
 
-The `minkowski-persist` crate provides [WAL][wal] (write-ahead log) and [bincode][bincode] snapshots. `Durable<S, W>` wraps any `Transact` strategy — on successful commit, the forward changeset is written to the WAL before being applied to World. Failed attempts (retries) are not logged. WAL write failure panics — the durability invariant is non-negotiable. Recovery loads the latest snapshot and replays subsequent WAL entries.
+The `minkowski-persist` crate provides [WAL][wal] (write-ahead log) and [rkyv][rkyv]-serialized snapshots. `Durable<S>` wraps any `Transact` strategy — on successful commit, the forward changeset is written to the WAL before being applied to World. Failed attempts (retries) are not logged. WAL write failure panics — the durability invariant is non-negotiable. Recovery loads the latest snapshot and replays subsequent WAL entries. `Snapshot::load_zero_copy` uses mmap + rkyv's archived types to skip envelope deserialization. For `#[repr(C)]` components whose archived layout matches native, archived bytes are copied directly into BlobVec columns without typed construction; other components fall back to `rkyv::from_bytes`.
 
 ```rust
 // Durable wraps any strategy — Optimistic, Pessimistic, or Sequential
-let durable = Durable::new(strategy, wal, codecs);
+let durable = Durable::new(strategy, wal, codecs);  // S = Optimistic here
 durable.transact(&mut world, access, |tx, world| { /* ... */ });
 // Changeset written to WAL on successful commit
 ```
@@ -167,7 +167,7 @@ Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) 
 | `scheduler` | Greedy batch scheduler over 6 registered query reducers. Calls `registry.query_reducer_access(id)` to extract `Access` bitsets, builds a conflict matrix, and assigns systems to non-conflicting batches via graph coloring — producing 3 batches where intra-batch systems touch disjoint components and could run in parallel. | `cargo run -p minkowski-examples --example scheduler --release` |
 | `transaction` | Two-part comparison of raw `Tx` building blocks versus reducer-based dispatch. Part 1 shows `Sequential` begin/commit and `Optimistic` transact closure at the low level. Part 2 registers the same logic as query reducers, gaining strategy-agnostic dispatch and free conflict detection without changing the closure body. | `cargo run -p minkowski-examples --example transaction --release` |
 | `battle` | Multi-threaded arena with 500 entities over 100 frames. Registers `EntityMut` reducers for attack and heal, dispatches them through both `Optimistic` and `Pessimistic` strategies, and uses `rayon::join` for parallel snapshot reads before sequential reducer dispatch. Demonstrates low-conflict (disjoint component sets) versus high-conflict (shared `Health` column) modes and how each strategy handles retry. | `cargo run -p minkowski-examples --example battle --release` |
-| `persist` | Full persistence lifecycle with 100 entities. Spawns entities, saves a `Snapshot`, applies mutations through a `Durable`-wrapped `QueryWriter` reducer (WAL-backed), then recovers by loading the snapshot and replaying subsequent WAL entries — verifying that the recovered world matches the pre-crash state. | `cargo run -p minkowski-examples --example persist --release` |
+| `persist` | Full persistence lifecycle with 100 entities across 3 archetypes. Spawns entities with varied component sets (including sparse components), saves an rkyv `Snapshot`, applies mutations through a `Durable`-wrapped `QueryWriter` reducer (WAL-backed), recovers via snapshot + WAL replay, then demonstrates zero-copy snapshot loading via mmap. | `cargo run -p minkowski-examples --example persist --release` |
 | `reducer` | Tour of all 7 reducer handle types in one program: `EntityMut` (heal), `QueryMut` (gravity), `QueryRef` (logger), `Spawner` (spawn projectiles), `QueryWriter` (drag), name-based lookup, access conflict detection between registered reducers, `DynamicCtx` (conditional runtime access with builder-declared bounds), and structural despawn via dynamic iteration. | `cargo run -p minkowski-examples --example reducer --release` |
 | `index` | Column index demo on a `Score` component across two archetypes (200 entities). Builds a `BTreeIndex` for O(log n) range queries and a `HashIndex` for O(1) exact lookups, performs incremental updates via per-index `ChangeTick` after mutations, and validates stale-entry detection after despawn. | `cargo run -p minkowski-examples --example index --release` |
 
@@ -200,7 +200,6 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 | Feature | Rationale |
 |---|---|
-| rkyv zero-copy snapshots | Zero-copy deserialization matching BlobVec layout |
 | Replication & sync | Filtered WAL replay for read replicas and client mirrors |
 
 ## Glossary
@@ -232,7 +231,7 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 <!-- Link definitions -->
 [archetype]: https://ajmmertens.medium.com/building-an-ecs-2-archetypes-and-vectorization-fe21690f6d51
 [barnes-hut]: https://en.wikipedia.org/wiki/Barnes%E2%80%93Hut_simulation
-[bincode]: https://github.com/bincode-org/bincode
+[rkyv]: https://github.com/rkyv/rkyv
 [bitset]: https://en.wikipedia.org/wiki/Bit_array
 [column-store]: https://en.wikipedia.org/wiki/Column-oriented_DBMS
 [component]: https://en.wikipedia.org/wiki/Entity_component_system#Components
