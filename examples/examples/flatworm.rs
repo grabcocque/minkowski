@@ -110,8 +110,8 @@ struct SimParams {
     turn_rate: f32,
     sense_radius: f32,
     eat_radius: f32,
-    energy_drain: f32,       // energy lost per tick
-    fission_threshold: f32,  // energy needed to split
+    energy_drain: f32,      // energy lost per tick
+    fission_threshold: f32, // energy needed to split
     starvation_threshold: f32,
     min_worm_size: f32,
     max_worm_size: f32,
@@ -289,19 +289,18 @@ fn main() {
     let min_size = params.min_worm_size;
     let max_size = params.max_worm_size;
     let fission_thr = params.fission_threshold;
-    let metabolism_id =
-        registry.register_query::<(&mut Energy, &mut WormSize, &Worm), f32, _>(
-            &mut world,
-            "metabolism",
-            move |mut query: QueryMut<'_, (&mut Energy, &mut WormSize, &Worm)>, dt: f32| {
-                query.for_each(|(energy, size, _)| {
-                    energy.0 -= energy_drain * dt;
-                    // Size scales linearly with energy, clamped
-                    let target = min_size + (energy.0 / fission_thr) * (max_size - min_size);
-                    size.0 = target.clamp(min_size, max_size);
-                });
-            },
-        );
+    let metabolism_id = registry.register_query::<(&mut Energy, &mut WormSize, &Worm), f32, _>(
+        &mut world,
+        "metabolism",
+        move |mut query: QueryMut<'_, (&mut Energy, &mut WormSize, &Worm)>, dt: f32| {
+            query.for_each(|(energy, size, _)| {
+                energy.0 -= energy_drain * dt;
+                // Size scales linearly with energy, clamped
+                let target = min_size + (energy.0 / fission_thr) * (max_size - min_size);
+                size.0 = target.clamp(min_size, max_size);
+            });
+        },
+    );
 
     // Census: count worms (read-only)
     let census_id = registry.register_query_ref::<(&Energy, &Worm), (), _>(
