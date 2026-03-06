@@ -1,3 +1,10 @@
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
+use std::ops::RangeBounds;
+
+use crate::component::Component;
+use crate::entity::Entity;
+use crate::query::fetch::Changed;
 use crate::world::World;
 
 /// A secondary spatial index that can be rebuilt from world state.
@@ -44,6 +51,172 @@ pub trait SpatialIndex {
     /// returns false.
     fn update(&mut self, world: &mut World) {
         self.rebuild(world);
+    }
+}
+
+/// A sorted index over a single component column, backed by a [`BTreeMap`].
+///
+/// Supports exact-match lookups via [`get`](Self::get) and ordered range
+/// queries via [`range`](Self::range). The index is fully user-owned —
+/// World has no awareness of it.
+///
+/// # Incremental updates
+///
+/// [`SpatialIndex::update`] uses [`Changed<T>`] to scan only entities whose
+/// indexed component was mutated since the last call, making incremental
+/// maintenance proportional to the number of changes rather than total
+/// entity count.
+///
+/// # Stale entries after despawn
+///
+/// Despawned entities are **not** eagerly removed. Callers should filter
+/// results with [`World::is_alive`] at query time. The next [`rebuild`]
+/// call cleans up stale entries.
+///
+/// [`rebuild`]: SpatialIndex::rebuild
+pub struct BTreeIndex<T: Component + Ord + Clone> {
+    tree: BTreeMap<T, Vec<Entity>>,
+    reverse: HashMap<Entity, T>,
+}
+
+impl<T: Component + Ord + Clone> BTreeIndex<T> {
+    /// Create an empty index. Call [`rebuild`](SpatialIndex::rebuild) to populate.
+    pub fn new() -> Self {
+        Self {
+            tree: BTreeMap::new(),
+            reverse: HashMap::new(),
+        }
+    }
+
+    /// Return all entities with exactly the given component value.
+    ///
+    /// Returns an empty slice if no entities match.
+    pub fn get(&self, value: &T) -> &[Entity] {
+        self.tree.get(value).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Iterate over `(value, entities)` pairs whose keys fall within `range`.
+    pub fn range<R: RangeBounds<T>>(&self, range: R) -> impl Iterator<Item = (&T, &[Entity])> {
+        self.tree.range(range).map(|(k, v)| (k, v.as_slice()))
+    }
+
+    fn remove_entity(&mut self, entity: Entity) {
+        if let Some(old_value) = self.reverse.remove(&entity) {
+            if let Some(bucket) = self.tree.get_mut(&old_value) {
+                bucket.retain(|&e| e != entity);
+                if bucket.is_empty() {
+                    self.tree.remove(&old_value);
+                }
+            }
+        }
+    }
+
+    fn insert_entity(&mut self, entity: Entity, value: T) {
+        self.reverse.insert(entity, value.clone());
+        self.tree.entry(value).or_default().push(entity);
+    }
+}
+
+impl<T: Component + Ord + Clone> Default for BTreeIndex<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
+    fn rebuild(&mut self, world: &mut World) {
+        self.tree.clear();
+        self.reverse.clear();
+        for (entity, value) in world.query::<(Entity, &T)>() {
+            self.insert_entity(entity, value.clone());
+        }
+    }
+
+    fn update(&mut self, world: &mut World) {
+        for (entity, value, _) in world.query::<(Entity, &T, Changed<T>)>() {
+            self.remove_entity(entity);
+            self.insert_entity(entity, value.clone());
+        }
+    }
+}
+
+/// A hash-based index over a single component column, backed by a [`HashMap`].
+///
+/// Supports exact-match lookups via [`get`](Self::get). For ordered queries,
+/// use [`BTreeIndex`] instead.
+///
+/// # Incremental updates
+///
+/// [`SpatialIndex::update`] uses [`Changed<T>`] to scan only entities whose
+/// indexed component was mutated since the last call, making incremental
+/// maintenance proportional to the number of changes rather than total
+/// entity count.
+///
+/// # Stale entries after despawn
+///
+/// Despawned entities are **not** eagerly removed. Callers should filter
+/// results with [`World::is_alive`] at query time. The next [`rebuild`]
+/// call cleans up stale entries.
+///
+/// [`rebuild`]: SpatialIndex::rebuild
+pub struct HashIndex<T: Component + Hash + Eq + Clone> {
+    map: HashMap<T, Vec<Entity>>,
+    reverse: HashMap<Entity, T>,
+}
+
+impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
+    /// Create an empty index. Call [`rebuild`](SpatialIndex::rebuild) to populate.
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            reverse: HashMap::new(),
+        }
+    }
+
+    /// Return all entities with exactly the given component value.
+    ///
+    /// Returns an empty slice if no entities match.
+    pub fn get(&self, value: &T) -> &[Entity] {
+        self.map.get(value).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn remove_entity(&mut self, entity: Entity) {
+        if let Some(old_value) = self.reverse.remove(&entity) {
+            if let Some(bucket) = self.map.get_mut(&old_value) {
+                bucket.retain(|&e| e != entity);
+                if bucket.is_empty() {
+                    self.map.remove(&old_value);
+                }
+            }
+        }
+    }
+
+    fn insert_entity(&mut self, entity: Entity, value: T) {
+        self.reverse.insert(entity, value.clone());
+        self.map.entry(value).or_default().push(entity);
+    }
+}
+
+impl<T: Component + Hash + Eq + Clone> Default for HashIndex<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Component + Hash + Eq + Clone> SpatialIndex for HashIndex<T> {
+    fn rebuild(&mut self, world: &mut World) {
+        self.map.clear();
+        self.reverse.clear();
+        for (entity, value) in world.query::<(Entity, &T)>() {
+            self.insert_entity(entity, value.clone());
+        }
+    }
+
+    fn update(&mut self, world: &mut World) {
+        for (entity, value, _) in world.query::<(Entity, &T, Changed<T>)>() {
+            self.remove_entity(entity);
+            self.insert_entity(entity, value.clone());
+        }
     }
 }
 
@@ -124,5 +297,213 @@ mod tests {
             .collect();
         assert_eq!(live.len(), 1);
         assert_eq!(*live[0], e2);
+    }
+
+    // --- BTreeIndex / HashIndex test component ---
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct Score(u32);
+
+    // --- BTreeIndex tests ---
+
+    #[test]
+    fn btree_rebuild_basic() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+        let e3 = world.spawn((Score(10),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let tens = idx.get(&Score(10));
+        assert_eq!(tens.len(), 2);
+        assert!(tens.contains(&e1));
+        assert!(tens.contains(&e3));
+
+        let twenties = idx.get(&Score(20));
+        assert_eq!(twenties.len(), 1);
+        assert!(twenties.contains(&e2));
+
+        // Missing value returns empty slice.
+        assert!(idx.get(&Score(99)).is_empty());
+    }
+
+    #[test]
+    fn btree_range() {
+        let mut world = World::new();
+        world.spawn((Score(5),));
+        let e2 = world.spawn((Score(15),));
+        let e3 = world.spawn((Score(25),));
+        world.spawn((Score(35),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let in_range: Vec<_> = idx.range(Score(10)..Score(30)).collect();
+        assert_eq!(in_range.len(), 2);
+
+        let (val0, ents0) = in_range[0];
+        assert_eq!(*val0, Score(15));
+        assert!(ents0.contains(&e2));
+
+        let (val1, ents1) = in_range[1];
+        assert_eq!(*val1, Score(25));
+        assert!(ents1.contains(&e3));
+    }
+
+    #[test]
+    fn btree_empty() {
+        let mut world = World::new();
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        assert!(idx.get(&Score(0)).is_empty());
+        assert_eq!(idx.range(..).count(), 0);
+    }
+
+    #[test]
+    fn btree_update_incremental() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        world.spawn((Score(20),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        assert_eq!(idx.get(&Score(10)).len(), 1);
+
+        // Mutate e1's score from 10 to 30.
+        *world.get_mut::<Score>(e1).unwrap() = Score(30);
+        idx.update(&mut world);
+
+        // Old bucket should be empty, new bucket should have the entity.
+        assert!(idx.get(&Score(10)).is_empty());
+        let thirties = idx.get(&Score(30));
+        assert_eq!(thirties.len(), 1);
+        assert!(thirties.contains(&e1));
+    }
+
+    #[test]
+    fn btree_stale_after_despawn() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        assert_eq!(idx.get(&Score(10)).len(), 1);
+
+        // Despawn e1 — index is now stale.
+        world.despawn(e1);
+
+        // Stale entry still present in index.
+        let tens = idx.get(&Score(10));
+        assert_eq!(tens.len(), 1);
+        assert!(!world.is_alive(tens[0]));
+
+        // Rebuild cleans up stale entries.
+        idx.rebuild(&mut world);
+        assert!(idx.get(&Score(10)).is_empty());
+
+        let twenties = idx.get(&Score(20));
+        assert_eq!(twenties.len(), 1);
+        assert!(twenties.contains(&e2));
+    }
+
+    #[test]
+    fn btree_multi_archetype() {
+        let mut world = World::new();
+        // Archetype (Score, Pos)
+        let e1 = world.spawn((Score(10), Pos { x: 0.0, y: 0.0 }));
+        // Archetype (Score,)
+        let e2 = world.spawn((Score(10),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let tens = idx.get(&Score(10));
+        assert_eq!(tens.len(), 2);
+        assert!(tens.contains(&e1));
+        assert!(tens.contains(&e2));
+    }
+
+    // --- HashIndex tests ---
+
+    #[test]
+    fn hash_rebuild_basic() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+        let e3 = world.spawn((Score(10),));
+
+        let mut idx = HashIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let tens = idx.get(&Score(10));
+        assert_eq!(tens.len(), 2);
+        assert!(tens.contains(&e1));
+        assert!(tens.contains(&e3));
+
+        let twenties = idx.get(&Score(20));
+        assert_eq!(twenties.len(), 1);
+        assert!(twenties.contains(&e2));
+
+        assert!(idx.get(&Score(99)).is_empty());
+    }
+
+    #[test]
+    fn hash_update_incremental() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        world.spawn((Score(20),));
+
+        let mut idx = HashIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        assert_eq!(idx.get(&Score(10)).len(), 1);
+
+        // Mutate e1's score from 10 to 30.
+        *world.get_mut::<Score>(e1).unwrap() = Score(30);
+        idx.update(&mut world);
+
+        assert!(idx.get(&Score(10)).is_empty());
+        let thirties = idx.get(&Score(30));
+        assert_eq!(thirties.len(), 1);
+        assert!(thirties.contains(&e1));
+    }
+
+    #[test]
+    fn hash_duplicate_values() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let e2 = world.spawn((Score(42),));
+        let e3 = world.spawn((Score(42),));
+
+        let mut idx = HashIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let fortytwos = idx.get(&Score(42));
+        assert_eq!(fortytwos.len(), 3);
+        assert!(fortytwos.contains(&e1));
+        assert!(fortytwos.contains(&e2));
+        assert!(fortytwos.contains(&e3));
+    }
+
+    #[test]
+    fn spatial_index_trait_satisfaction() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+
+        let mut indexes: Vec<Box<dyn SpatialIndex>> = vec![
+            Box::new(BTreeIndex::<Score>::new()),
+            Box::new(HashIndex::<Score>::new()),
+        ];
+
+        for idx in &mut indexes {
+            idx.rebuild(&mut world);
+        }
+
+        for idx in &mut indexes {
+            idx.update(&mut world);
+        }
     }
 }

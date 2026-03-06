@@ -91,7 +91,7 @@ pub use changeset::{EnumChangeSet, MutationRef};
 pub use command::CommandBuffer;
 pub use component::ComponentId;
 pub use entity::Entity;
-pub use index::SpatialIndex;
+pub use index::{BTreeIndex, HashIndex, SpatialIndex};
 pub use minkowski_derive::Table;
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
