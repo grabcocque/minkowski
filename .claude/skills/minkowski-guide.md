@@ -43,8 +43,10 @@ Handle types: `EntityMut<C>` (single-entity mutation), `QueryMut<Q>` (bulk direc
 Dispatch: `call()` for transactional (entity, spawner, query writer), `run()` for
 scheduled (query), `dynamic_call()` for dynamic.
 
-**Persistence** via `minkowski-persist`: `Durable<S, W>` wraps any strategy with WAL
-logging. `Snapshot` for point-in-time saves. `CodecRegistry` for component serialization.
+**Persistence** via `minkowski-persist`: `Durable<S>` wraps any strategy with WAL
+logging. `Snapshot` for point-in-time saves with rkyv serialization. `load_zero_copy()`
+for mmap-based restore. `CodecRegistry` for component serialization (rkyv derives).
+`#[repr(C)]` recommended on persistent components for zero-copy benefit.
 Always call `sync_reserved()` after snapshot restore.
 
 **Spatial Indexing** via `SpatialIndex` trait: `rebuild` (required) + `update` (optional,
@@ -84,7 +86,7 @@ uniform density, tree for clustered.
 - Single-threaded, no conflict detection needed? -> `Sequential`
 - Multiple readers, occasional writes? -> `Optimistic` (tick validation, default 3 retries)
 - Write-heavy, retries are expensive? -> `Pessimistic` (column locks, backoff)
-- Need crash safety? -> `Durable<S, W>` wrapping any strategy
+- Need crash safety? -> `Durable<S>` wrapping any strategy
 - Ask yourself: what is the read/write ratio? How expensive is a retry vs a lock?
 
 ### Reducer Type Selection
@@ -104,7 +106,7 @@ uniform density, tree for clustered.
 
 ### Persistence
 
-- Need crash recovery? -> WAL via `Durable<S, W>`
+- Need crash recovery? -> WAL via `Durable<S>`
 - Need fast restore? -> periodic `Snapshot` saves (not every frame)
 - Which components survive restart? -> register codecs for those types
 - After snapshot restore -> `restore_allocator_state()` calls `sync_reserved()` internally; custom restoration paths must call it manually
@@ -285,7 +287,7 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 | `scheduler` | ReducerRegistry for Access metadata, conflict detection, greedy batch scheduling | `examples/examples/scheduler.rs` |
 | `transaction` | Three strategies (Sequential/Optimistic/Pessimistic), raw Tx + reducer comparison | `examples/examples/transaction.rs` |
 | `battle` | EntityMut reducers, rayon parallel snapshot computation, sequential dispatch, tunable conflict rates | `examples/examples/battle.rs` |
-| `persist` | QueryWriter + Durable, WAL, snapshots, crash recovery | `examples/examples/persist.rs` |
+| `persist` | QueryWriter + Durable, WAL, rkyv snapshots, zero-copy load, crash recovery | `examples/examples/persist.rs` |
 | `index` | BTreeIndex range queries, HashIndex exact lookups, incremental update, batch fetch | `examples/examples/index.rs` |
 
 ### Pattern Quick-Find

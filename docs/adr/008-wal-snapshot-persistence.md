@@ -9,7 +9,7 @@ Crash-safe persistence requires durability guarantees without serializing the en
 
 ## Decision
 
-`Durable<S, W>` wraps any `Transact` strategy, appending the forward changeset to a write-ahead log on successful commit. `Snapshot` captures full world state for point-in-time recovery. Recovery loads the latest snapshot and replays the WAL from its sequence number. `CodecRegistry` maps `ComponentId` to serde-based codecs for serialization. WAL write failure panics — the durability invariant is non-negotiable.
+`Durable<S>` wraps any `Transact` strategy, appending the forward changeset to a write-ahead log on successful commit. `Snapshot` captures full world state for point-in-time recovery. Recovery loads the latest snapshot and replays the WAL from its sequence number. `CodecRegistry` maps `ComponentId` to rkyv-based codecs for serialization (migrated from serde/bincode in ADR-013). WAL write failure panics — the durability invariant is non-negotiable.
 
 **Key insight: persistence composes with any transaction strategy — `Durable::new(strategy, wal, codecs)` adds durability without changing the strategy's conflict detection semantics.**
 
