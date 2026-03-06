@@ -55,6 +55,11 @@ struct ComponentCodec {
     register_fn: RegisterFn,
     serialize_sparse_fn: SerializeSparseFn,
     insert_sparse_fn: InsertSparseFn,
+    /// When `Some(size)`, the archived representation has the same size as the
+    /// native type — archived bytes can be copied directly into BlobVec without
+    /// typed deserialization. True for `#[repr(C)]` types of primitives on
+    /// little-endian platforms where rkyv's archived layout matches native.
+    raw_copy_size: Option<usize>,
 }
 
 /// Maps ComponentId to rkyv codecs. Separate from core's ComponentRegistry —
@@ -85,6 +90,17 @@ impl CodecRegistry {
         let comp_id = world.register_component::<T>();
         let layout = Layout::new::<T>();
         let name = std::any::type_name::<T>();
+
+        // If the archived type has the same size as the native type, archived
+        // bytes can be copied directly into BlobVec without rkyv::from_bytes.
+        // This is true for #[repr(C)] structs of primitives on LE platforms.
+        let raw_copy_size = if std::mem::size_of::<T>() == std::mem::size_of::<T::Archived>()
+            && layout.size() > 0
+        {
+            Some(layout.size())
+        } else {
+            None
+        };
 
         let serialize_fn: SerializeFn = |ptr, out| {
             let value = unsafe { &*ptr.cast::<T>() };
@@ -144,6 +160,7 @@ impl CodecRegistry {
                 register_fn,
                 serialize_sparse_fn,
                 insert_sparse_fn,
+                raw_copy_size,
             },
         );
     }
@@ -189,6 +206,13 @@ impl CodecRegistry {
     /// Check if a component has a registered codec.
     pub fn has_codec(&self, id: ComponentId) -> bool {
         self.codecs.contains_key(&id)
+    }
+
+    /// If the archived representation matches the native layout (same size),
+    /// returns `Some(size)` — the zero-copy load path can copy archived bytes
+    /// directly into BlobVec without typed deserialization.
+    pub fn raw_copy_size(&self, id: ComponentId) -> Option<usize> {
+        self.codecs.get(&id).and_then(|c| c.raw_copy_size)
     }
 
     /// All registered ComponentIds.

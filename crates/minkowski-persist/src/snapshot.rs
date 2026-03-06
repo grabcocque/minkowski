@@ -104,10 +104,12 @@ impl Snapshot {
 
     /// Load a snapshot with zero-copy component data.
     ///
-    /// mmaps the snapshot file. Archived component bytes in the rkyv buffer
-    /// are accessed directly and copied into BlobVec columns without
-    /// intermediate typed deserialization. The mmap is dropped after load
-    /// completes.
+    /// mmaps the snapshot file and validates the archived structure in-place
+    /// via `rkyv::access` (no allocation for the envelope). For components
+    /// whose archived layout matches native (`#[repr(C)]` POD types on LE),
+    /// archived bytes are copied directly into BlobVec without typed
+    /// deserialization. Other components fall back to `rkyv::from_bytes`.
+    /// The mmap is dropped after load completes.
     pub fn load_zero_copy(
         &self,
         path: &Path,
@@ -116,11 +118,20 @@ impl Snapshot {
         let file = File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        // Skip the 8-byte length prefix
         if mmap.len() < 8 {
             return Err(SnapshotError::Format("file too small".to_string()));
         }
-        let payload = &mmap[8..];
+
+        // Validate length prefix against actual file size
+        let len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+        if mmap.len() < 8 + len {
+            return Err(SnapshotError::Format(format!(
+                "file truncated: expected {} payload bytes, got {}",
+                len,
+                mmap.len() - 8
+            )));
+        }
+        let payload = &mmap[8..8 + len];
 
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
@@ -237,8 +248,13 @@ impl Snapshot {
             if codecs.has_codec(entry.id) {
                 codecs.register_one(entry.id, &mut world);
             } else {
-                let layout = std::alloc::Layout::from_size_align(entry.size, entry.align)
-                    .unwrap_or(std::alloc::Layout::new::<()>());
+                let layout =
+                    std::alloc::Layout::from_size_align(entry.size, entry.align).map_err(|_| {
+                        SnapshotError::Format(format!(
+                            "invalid layout for component '{}': size={}, align={}",
+                            entry.name, entry.size, entry.align
+                        ))
+                    })?;
                 let name: &'static str = Box::leak(entry.name.clone().into_boxed_str());
                 world.register_component_raw(name, layout);
             }
@@ -304,14 +320,20 @@ impl Snapshot {
             } else {
                 let size: usize = u32::from(entry.size) as usize;
                 let align: usize = u32::from(entry.align) as usize;
-                let layout = std::alloc::Layout::from_size_align(size, align)
-                    .unwrap_or(std::alloc::Layout::new::<()>());
+                let layout = std::alloc::Layout::from_size_align(size, align).map_err(|_| {
+                    SnapshotError::Format(format!(
+                        "invalid layout for component: size={size}, align={align}"
+                    ))
+                })?;
                 let name: &'static str = Box::leak(entry.name.as_str().to_owned().into_boxed_str());
                 world.register_component_raw(name, layout);
             }
         }
 
-        // Restore archetypes — copy archived bytes directly into BlobVec.
+        // Restore archetypes. For components where the archived layout matches
+        // native (raw_copy_size is Some), copy archived bytes directly — no
+        // rkyv::from_bytes, no typed construction. For others, fall back to
+        // full deserialization through the codec.
         for arch_data in data.archetypes.iter() {
             let mut changeset = EnumChangeSet::new();
 
@@ -319,19 +341,28 @@ impl Snapshot {
                 let entity = Entity::from_bits(u64::from(*entity_bits));
                 world.alloc_entity();
 
-                // Build raw component list from archived column data.
-                // archived_value.as_slice() gives the rkyv bytes for this
-                // component — for repr(C) types these ARE the in-memory bytes.
                 let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
                     Vec::new();
                 for col in arch_data.columns.iter() {
                     let comp_id: ComponentId = u32::from(col.component_id) as usize;
                     let archived_bytes: &[u8] = col.values[row].as_slice();
-                    // Deserialize through the codec (handles repr(C) and non-repr(C) alike)
-                    let raw = codecs.deserialize(comp_id, archived_bytes)?;
                     let layout = codecs
                         .layout(comp_id)
                         .ok_or(CodecError::UnregisteredComponent(comp_id))?;
+
+                    let raw = if let Some(size) = codecs.raw_copy_size(comp_id) {
+                        if archived_bytes.len() == size {
+                            // Direct copy — archived bytes match native layout.
+                            // Safe because: bytes were produced by rkyv::to_bytes
+                            // during save, and the envelope was validated by rkyv::access.
+                            archived_bytes.to_vec()
+                        } else {
+                            // Size mismatch — fall back to typed deserialization
+                            codecs.deserialize(comp_id, archived_bytes)?
+                        }
+                    } else {
+                        codecs.deserialize(comp_id, archived_bytes)?
+                    };
                     raw_components.push((comp_id, raw, layout));
                 }
 
@@ -775,6 +806,7 @@ mod tests {
 
         assert_eq!(seq1, seq2);
 
+        // Compare Pos
         let mut pos_std: Vec<(f32, f32)> = w_standard
             .query::<(&Pos,)>()
             .map(|p| (p.0.x, p.0.y))
@@ -786,5 +818,162 @@ mod tests {
         pos_std.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         pos_zc.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert_eq!(pos_std, pos_zc);
+
+        // Compare Vel
+        let mut vel_std: Vec<(f32, f32)> = w_standard
+            .query::<(&Vel,)>()
+            .map(|v| (v.0.dx, v.0.dy))
+            .collect();
+        let mut vel_zc: Vec<(f32, f32)> = w_zero_copy
+            .query::<(&Vel,)>()
+            .map(|v| (v.0.dx, v.0.dy))
+            .collect();
+        vel_std.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        vel_zc.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(vel_std, vel_zc);
+    }
+
+    #[test]
+    fn zero_copy_preserves_component_id_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("zc_gap.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+
+        #[derive(Clone, Copy)]
+        #[allow(dead_code)]
+        struct Hidden(u32);
+        world.register_component::<Hidden>();
+
+        codecs.register::<Pos>(&mut world);
+        let pos_id = world.component_id::<Pos>().unwrap();
+        assert_eq!(pos_id, 1);
+
+        let e = world.spawn((Pos { x: 42.0, y: 99.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        let (world2, _) = snap.load_zero_copy(&snap_path, &codecs).unwrap();
+        let restored_id = world2.component_id::<Pos>().unwrap();
+        assert_eq!(restored_id, pos_id);
+        assert!(world2.is_alive(e));
+        assert_eq!(world2.get::<Pos>(e).unwrap().x, 42.0);
+    }
+
+    #[test]
+    fn zero_copy_plus_wal_recovery() {
+        use crate::wal::Wal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("zc_recovery.snap");
+        let wal_path = dir.path().join("zc_recovery.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.spawn((Pos { x: 3.0, y: 4.0 },));
+
+        let mut wal = Wal::create(&wal_path).unwrap();
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world, &codecs, wal.next_seq())
+            .unwrap();
+
+        // Mutation after snapshot
+        let e3 = world.alloc_entity();
+        let mut cs = minkowski::EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e3, (Pos { x: 5.0, y: 6.0 },));
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world);
+
+        // Recover using zero-copy load + WAL
+        let mut load_codecs = CodecRegistry::new();
+        let mut tmp = World::new();
+        load_codecs.register::<Pos>(&mut tmp);
+
+        let (mut recovered, snap_seq) = snap.load_zero_copy(&snap_path, &load_codecs).unwrap();
+        wal.replay_from(snap_seq, &mut recovered, &load_codecs)
+            .unwrap();
+
+        assert_eq!(recovered.query::<(&Pos,)>().count(), 3);
+    }
+
+    // ── Error path tests ────────────────────────────────────────────
+
+    #[test]
+    fn zero_copy_load_corrupted_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("corrupt.snap");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&snap_path, &world, &codecs, 0).unwrap();
+
+        // Corrupt the payload (flip bytes after the length prefix)
+        let mut data = std::fs::read(&snap_path).unwrap();
+        for byte in data[8..].iter_mut().take(16) {
+            *byte ^= 0xFF;
+        }
+        std::fs::write(&snap_path, &data).unwrap();
+
+        let result = snap.load_zero_copy(&snap_path, &codecs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_copy_load_file_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("tiny.snap");
+
+        std::fs::write(&snap_path, [0u8; 4]).unwrap();
+
+        let snap = Snapshot::new();
+        let codecs = CodecRegistry::new();
+        let result = snap.load_zero_copy(&snap_path, &codecs);
+        assert!(matches!(result, Err(SnapshotError::Format(_))));
+    }
+
+    #[test]
+    fn zero_copy_load_truncated_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("truncated.snap");
+
+        // Write a length prefix claiming 1000 bytes but only 10 bytes of payload
+        let mut data = Vec::new();
+        data.extend_from_slice(&1000u64.to_le_bytes());
+        data.extend_from_slice(&[0u8; 10]);
+        std::fs::write(&snap_path, &data).unwrap();
+
+        let snap = Snapshot::new();
+        let codecs = CodecRegistry::new();
+        let result = snap.load_zero_copy(&snap_path, &codecs);
+        assert!(matches!(result, Err(SnapshotError::Format(_))));
+    }
+
+    #[test]
+    fn zero_copy_load_nonexistent_file() {
+        let snap = Snapshot::new();
+        let codecs = CodecRegistry::new();
+        let result = snap.load_zero_copy(std::path::Path::new("/nonexistent"), &codecs);
+        assert!(matches!(result, Err(SnapshotError::Io(_))));
+    }
+
+    #[test]
+    fn deserialize_corrupted_snapshot_returns_error() {
+        let result = crate::format::deserialize_snapshot(&[0xFF; 64]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_corrupted_record_returns_error() {
+        let result = crate::format::deserialize_record(&[0xFF; 32]);
+        assert!(result.is_err());
     }
 }

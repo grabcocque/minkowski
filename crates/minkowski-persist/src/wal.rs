@@ -98,7 +98,12 @@ impl Wal {
             format::serialize_record(&record).map_err(|e| WalError::Format(e.to_string()))?;
 
         let mut writer = BufWriter::new(&self.file);
-        let len = payload.len() as u32;
+        let len: u32 = payload.len().try_into().map_err(|_| {
+            WalError::Format(format!(
+                "WAL record too large: {} bytes exceeds u32 max",
+                payload.len()
+            ))
+        })?;
         writer.write_all(&len.to_le_bytes())?;
         writer.write_all(&payload)?;
         writer.flush()?;
@@ -146,8 +151,14 @@ impl Wal {
                 Err(e) => return Err(e.into()),
             }
 
-            let record = format::deserialize_record(&payload)
-                .map_err(|e| WalError::Format(e.to_string()))?;
+            let record = match format::deserialize_record(&payload) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Corrupted payload — treat as torn entry, truncate.
+                    self.file.set_len(record_start)?;
+                    break;
+                }
+            };
 
             if record.seq >= from_seq {
                 Self::apply_record(&record, world, codecs)?;
@@ -320,10 +331,20 @@ impl Wal {
                 Err(e) => return Err(e.into()),
             }
 
-            let record = format::deserialize_record(&payload)
-                .map_err(|e| WalError::Format(e.to_string()))?;
-            last_seq = record.seq;
-            valid_end = record_start + 4 + len as u64;
+            match format::deserialize_record(&payload) {
+                Ok(record) => {
+                    last_seq = record.seq;
+                    valid_end = record_start + 4 + len as u64;
+                }
+                Err(_) => {
+                    // Corrupted payload — treat as torn entry, truncate.
+                    // A crash can produce a length-complete but content-corrupt
+                    // record. Truncating to the last valid boundary preserves
+                    // all prior records for replay.
+                    self.file.set_len(record_start)?;
+                    break;
+                }
+            }
         }
 
         Ok(last_seq)
@@ -498,5 +519,84 @@ mod tests {
         let mut world2 = World::new();
         let last = wal2.replay(&mut world2, &codecs).unwrap();
         assert_eq!(last, 0, "should replay the one valid record");
+    }
+
+    #[test]
+    fn corrupted_payload_truncated_on_open() {
+        // Simulate a crash that wrote the full length prefix and all payload
+        // bytes, but the payload content is corrupt (rkyv validation fails).
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("corrupt_payload.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Health>(&mut world);
+
+        {
+            let mut wal = Wal::create(&wal_path).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+        }
+
+        // Read the file, find the start of the third hypothetical record,
+        // and write a valid-looking length prefix with garbage payload.
+        let file_len = std::fs::metadata(&wal_path).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            // Write a length prefix claiming 20 bytes, then 20 bytes of garbage
+            f.write_all(&20u32.to_le_bytes()).unwrap();
+            f.write_all(&[0xDE; 20]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let new_len = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(new_len > file_len, "garbage should have been appended");
+
+        // open() should detect the corrupt record, truncate it, and recover
+        let wal2 = Wal::open(&wal_path).unwrap();
+        assert_eq!(
+            wal2.next_seq(),
+            2,
+            "should see 2 valid records, corrupt payload removed"
+        );
+
+        let after_len = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(
+            after_len, file_len,
+            "file should be truncated to pre-corruption size"
+        );
+    }
+
+    #[test]
+    fn corrupted_payload_truncated_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("corrupt_replay.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Health>(&mut world);
+
+        {
+            let mut wal = Wal::create(&wal_path).unwrap();
+            wal.append(&EnumChangeSet::new(), &codecs).unwrap();
+        }
+
+        let file_len = std::fs::metadata(&wal_path).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            f.write_all(&15u32.to_le_bytes()).unwrap();
+            f.write_all(&[0xAB; 15]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut wal2 = Wal::open(&wal_path).unwrap();
+        let mut world2 = World::new();
+        let last = wal2.replay(&mut world2, &codecs).unwrap();
+        assert_eq!(last, 0, "should replay the one valid record");
+
+        let after_len = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(after_len, file_len, "corrupt record should be truncated");
     }
 }

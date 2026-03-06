@@ -49,7 +49,7 @@ Help write persistence code. Point to relevant examples:
 - **Complete persistence flow**: See `examples/examples/persist.rs` — WAL + rkyv snapshots + recovery + zero-copy load with QueryWriter reducer, 3 archetypes, sparse components
 - **Durable strategy construction**: `Durable::new(Optimistic::new(&world), wal, codec_registry)`
 - **Snapshot save/load**: `snap.save(path, &world, &codecs, wal_seq)` / `snap.load(path, &codecs)` / `snap.load_zero_copy(path, &codecs)`
-- **Component codec registration**: Components must derive `rkyv::{Archive, Serialize, Deserialize}`. Recommend `#[repr(C)]` for zero-copy benefit. Register: `codecs.register::<Pos>(); codecs.register::<Vel>();`
+- **Component codec registration**: Components must derive `rkyv::{Archive, Serialize, Deserialize}`. Recommend `#[repr(C)]` for zero-copy benefit. Register: `codecs.register::<Pos>(&mut world); codecs.register::<Vel>(&mut world);`
 
 **Pitfall alerts:**
 - Forgetting `sync_reserved()` after snapshot restore causes entity ID overlap — new `reserve()` calls hand out indices that collide with restored entities.
