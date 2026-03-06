@@ -345,9 +345,9 @@ fn main() {
                 .collect();
 
             for (entity, pos, _heading) in &worms {
-                // Find closest food within sense radius
+                // Find best food within sense radius (nutrition / distance² gradient)
                 let mut best_dir = Vec2::ZERO;
-                let mut best_dist_sq = f32::MAX;
+                let mut best_score = 0.0_f32;
 
                 for &(_, food_pos, nutrition) in food_grid.neighbors(*pos) {
                     let diff = Vec2::new(
@@ -358,16 +358,15 @@ fn main() {
                     if dist_sq < 1e-6 {
                         continue;
                     }
-                    // Weight by nutrition / distance for gradient sensing
                     let score = nutrition / dist_sq;
-                    if dist_sq < best_dist_sq || score > nutrition / best_dist_sq {
-                        best_dist_sq = dist_sq;
+                    if score > best_score {
+                        best_score = score;
                         best_dir = diff;
                     }
                 }
 
                 if let Some(h) = world.get_mut::<Heading>(*entity) {
-                    if best_dist_sq < params.sense_radius * params.sense_radius {
+                    if best_score > 0.0 {
                         // Turn toward food
                         let target_angle = best_dir.y.atan2(best_dir.x);
                         // Normalize delta to [-pi, pi] via modular arithmetic
