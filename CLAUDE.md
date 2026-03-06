@@ -25,6 +25,7 @@ cargo run -p minkowski-examples --example battle --release   # Multi-threaded En
 cargo run -p minkowski-examples --example persist --release   # Durable QueryWriter reducer: WAL + rkyv snapshots + zero-copy load (100 entities, 3 archetypes, 10 frames)
 cargo run -p minkowski-examples --example reducer --release   # Typed reducer system: entity/query/spawner/query-writer/dynamic handles + structural mutations + conflict detection
 cargo run -p minkowski-examples --example index --release   # B-tree range queries + hash exact lookups (200 entities)
+cargo run -p minkowski-examples --example flatworm --release   # Flatworm (planarian) simulator: chemotaxis, fission, starvation, spatial grid (200 worms, 1K frames)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
