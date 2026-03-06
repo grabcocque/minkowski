@@ -72,6 +72,20 @@ impl OrphanQueue {
     }
 }
 
+/// The central data store. Holds all entities, components, archetype metadata,
+/// and the query cache.
+///
+/// Most operations start here: [`spawn`](World::spawn) creates entities,
+/// [`query`](World::query) iterates them, [`insert`](World::insert)/[`remove`](World::remove)
+/// alter component sets, and [`get`](World::get)/[`get_mut`](World::get_mut) access
+/// individual components by [`Entity`] handle. For schema-declared access,
+/// [`query_table`](World::query_table) and [`query_table_mut`](World::query_table_mut)
+/// skip archetype matching entirely.
+///
+/// For concurrent access, combine with a [`ReducerRegistry`](crate::ReducerRegistry)
+/// and a [`Transact`](crate::Transact) strategy. World itself is not `Sync` —
+/// concurrency is achieved through the split-phase transaction protocol where
+/// multiple [`Tx`](crate::Tx) objects read via `&World` concurrently.
 pub struct World {
     pub(crate) id: WorldId,
     pub(crate) entities: EntityAllocator,

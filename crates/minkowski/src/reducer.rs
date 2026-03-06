@@ -18,7 +18,11 @@ use crate::world::World;
 // ── ComponentSet & Contains ──────────────────────────────────────────
 
 /// Declares a set of component types with pre-resolved IDs.
-/// Macro-generated for tuples 1–12.
+///
+/// Macro-generated for tuples of 1-12 `Component` types.
+/// Used as the type parameter `C` on [`EntityRef<C>`](EntityRef) and
+/// [`EntityMut<C>`](EntityMut) to constrain which components the handle can access.
+/// See [`ReducerRegistry`] for usage.
 pub trait ComponentSet: 'static {
     const COUNT: usize;
 
@@ -105,11 +109,20 @@ impl DynamicResolved {
 
 // ── DynamicCtx ───────────────────────────────────────────────────────
 
-/// Runtime context for dynamic reducer closures. Provides component
-/// access gated by the builder-declared upper bounds in `DynamicResolved`.
+/// Runtime-validated access handle for dynamic reducer closures.
 ///
-/// Reads go directly to World; writes buffer into an `EnumChangeSet`
-/// applied atomically on commit.
+/// Provides [`read`](DynamicCtx::read)/[`try_read`](DynamicCtx::try_read),
+/// [`write`](DynamicCtx::write)/[`try_write`](DynamicCtx::try_write),
+/// [`spawn`](DynamicCtx::spawn), [`remove`](DynamicCtx::remove)/[`try_remove`](DynamicCtx::try_remove),
+/// [`despawn`](DynamicCtx::despawn), and [`for_each`](DynamicCtx::for_each).
+/// Every operation validates at runtime that the accessed component type
+/// was declared on the [`DynamicReducerBuilder`] — accessing undeclared
+/// types, writing to read-only components, or despawning without declaration
+/// panics in all builds.
+///
+/// Reads go directly to World; writes buffer into an [`EnumChangeSet`]
+/// applied atomically on commit. Component IDs are pre-resolved at
+/// registration time for O(log n) lookup by `TypeId`.
 pub struct DynamicCtx<'a> {
     world: &'a World,
     changeset: &'a mut EnumChangeSet,
@@ -384,7 +397,12 @@ impl_component_set!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 
 
 // ── Typed entity handles (transactional) ─────────────────────────────
 
-/// Read-only entity access. `get::<T>()` is gated by `C: Contains<T, IDX>`.
+/// Read-only single-entity handle for transactional reducers.
+///
+/// Provides [`get::<T>()`](EntityRef::get) to read a component, gated by
+/// `C: Contains<T, IDX>` so only components in the declared set are accessible.
+/// Created inside [`ReducerRegistry::register_entity`] closures. For read-write
+/// access, see [`EntityMut`].
 pub struct EntityRef<'a, C: ComponentSet> {
     entity: Entity,
     resolved: &'a ResolvedComponents,
@@ -425,11 +443,18 @@ impl<'a, C: ComponentSet> EntityRef<'a, C> {
     }
 }
 
-/// Read-write entity access. `get::<T>()` reads live, `set::<T>()` buffers
-/// writes into the transaction's changeset.
+/// Read-write single-entity handle for transactional reducers.
 ///
-/// Holds `&mut EnumChangeSet` (not `&mut Tx`) to avoid lifetime entanglement
-/// with the Tx's cleanup lifetime — enables construction inside transact closures.
+/// [`get::<T>()`](EntityMut::get) reads the live value from the archetype column.
+/// [`set::<T>()`](EntityMut::set) buffers a write into the transaction's
+/// [`EnumChangeSet`], applied atomically on commit. [`remove::<T>()`](EntityMut::remove)
+/// buffers a component removal, and [`despawn()`](EntityMut::despawn) buffers entity
+/// destruction (requires [`register_entity_despawn`](ReducerRegistry::register_entity_despawn)).
+///
+/// All operations are gated by [`Contains<T, IDX>`](Contains) so only components
+/// in the declared set `C` are accessible. Holds `&mut EnumChangeSet` (not
+/// `&mut Tx`) for clean borrow splitting inside transact closures. For
+/// read-only access, see [`EntityRef`].
 pub struct EntityMut<'a, C: ComponentSet> {
     entity: Entity,
     resolved: &'a ResolvedComponents,
@@ -507,8 +532,14 @@ impl<'a, C: ComponentSet> EntityMut<'a, C> {
     }
 }
 
-/// Spawn capability. Each `spawn(bundle)` atomically reserves an entity ID
-/// and buffers the bundle into the transaction's changeset.
+/// Entity creation handle for transactional reducers.
+///
+/// Each call to [`spawn(bundle)`](Spawner::spawn) atomically reserves an entity
+/// ID via lock-free `EntityAllocator::reserve` and buffers the bundle's
+/// components into the transaction's [`EnumChangeSet`]. On successful commit the
+/// entities are placed; on abort their IDs are reclaimed via the orphan queue.
+///
+/// Created inside [`ReducerRegistry::register_spawner`] closures.
 pub struct Spawner<'a, B: Bundle> {
     changeset: &'a mut EnumChangeSet,
     allocated: &'a mut Vec<Entity>,
@@ -799,12 +830,19 @@ impl_writer_query_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 /// Transactional query iteration with buffered writes.
 ///
 /// Iterates matching archetypes **without** marking columns as changed
-/// (unlike `world.query()`). Writes go through `WritableRef<T>` into an
-/// `EnumChangeSet` that is applied atomically on commit. This avoids
+/// (unlike [`World::query`]). `&T` items are read directly from archetype
+/// columns; `&mut T` items become [`WritableRef<T>`] handles whose
+/// [`set`](WritableRef::set)/[`modify`](WritableRef::modify) methods buffer
+/// writes into an [`EnumChangeSet`] applied atomically on commit. This avoids
 /// self-conflict with optimistic tick-based validation.
 ///
+/// Compatible with `minkowski_persist::Durable` for WAL logging — the
+/// motivating use case for buffered iteration.
+///
 /// Each `QueryWriter` reducer stores a per-reducer `last_read_tick` in an
-/// `Arc<AtomicU64>` for `Changed<T>` filter support.
+/// `Arc<AtomicU64>` for `Changed<T>` filter support. Registered via
+/// [`ReducerRegistry::register_query_writer`], dispatched via
+/// [`ReducerRegistry::call`].
 pub struct QueryWriter<'a, Q: WriterQuery> {
     world: &'a mut World,
     changeset: *mut EnumChangeSet,
@@ -894,11 +932,15 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
 
 // ── Typed query handles (scheduled) ──────────────────────────────────
 
-/// Read-only query iteration. Hides `&mut World`.
+/// Read-only query iteration handle for scheduled reducers.
 ///
-/// Uses the full `world.query()` path (with tick management and filter
-/// support including `Changed<T>`). The `ReadOnlyWorldQuery` bound
-/// guarantees no `&mut T` access through the query.
+/// Uses the full [`World::query`] path with tick management and filter
+/// support (including `Changed<T>`). The [`ReadOnlyWorldQuery`] bound
+/// guarantees no `&mut T` access through the query. Provides [`for_each`](QueryRef::for_each)
+/// and [`count`](QueryRef::count). For read-write iteration, see [`QueryMut`].
+///
+/// Registered via [`ReducerRegistry::register_query_ref`], dispatched
+/// via [`ReducerRegistry::run`].
 pub struct QueryRef<'a, Q: ReadOnlyWorldQuery> {
     world: &'a mut World,
     _marker: PhantomData<Q>,
@@ -922,7 +964,14 @@ impl<'a, Q: ReadOnlyWorldQuery + 'static> QueryRef<'a, Q> {
     }
 }
 
-/// Read-write query iteration. Hides `&mut World`.
+/// Read-write query iteration handle for scheduled reducers.
+///
+/// Same as [`QueryRef`] but allows `&mut T` in the query type, enabling
+/// direct in-place mutation during iteration. Provides [`for_each`](QueryMut::for_each),
+/// [`for_each_chunk`](QueryMut::for_each_chunk), and [`count`](QueryMut::count).
+///
+/// Registered via [`ReducerRegistry::register_query`], dispatched
+/// via [`ReducerRegistry::run`].
 pub struct QueryMut<'a, Q: WorldQuery> {
     world: &'a mut World,
     _marker: PhantomData<Q>,
@@ -952,7 +1001,12 @@ impl<'a, Q: WorldQuery + 'static> QueryMut<'a, Q> {
 
 // ── ReducerRegistry ──────────────────────────────────────────────────
 
-/// Opaque identifier for a transactional reducer (entity/pair/spawner).
+/// Typed handle for dispatching transactional reducers via [`ReducerRegistry::call`].
+///
+/// Obtained from [`ReducerRegistry::register_entity`],
+/// [`register_entity_despawn`](ReducerRegistry::register_entity_despawn),
+/// [`register_spawner`](ReducerRegistry::register_spawner), or
+/// [`register_query_writer`](ReducerRegistry::register_query_writer).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ReducerId(pub(crate) usize);
 
@@ -963,7 +1017,10 @@ impl ReducerId {
     }
 }
 
-/// Opaque identifier for a scheduled query reducer.
+/// Typed handle for dispatching scheduled query reducers via [`ReducerRegistry::run`].
+///
+/// Obtained from [`ReducerRegistry::register_query`] or
+/// [`register_query_ref`](ReducerRegistry::register_query_ref).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct QueryReducerId(pub(crate) usize);
 
@@ -974,7 +1031,9 @@ impl QueryReducerId {
     }
 }
 
-/// Opaque identifier for a dynamic reducer.
+/// Typed handle for dispatching dynamic reducers via [`ReducerRegistry::dynamic_call`].
+///
+/// Obtained from [`DynamicReducerBuilder::build`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DynamicReducerId(pub(crate) usize);
 
@@ -1069,9 +1128,31 @@ enum ReducerSlot {
     Dynamic(usize),
 }
 
-/// External registry of typed reducers. Owns closures, Access metadata,
-/// and pre-resolved ComponentIds. Composes with World + Transact strategies
-/// the same way SpatialIndex composes with World — no World API growth.
+/// Central registry for typed reducer closures with conflict analysis.
+///
+/// Owns closures, [`Access`] metadata, and pre-resolved `ComponentId`s.
+/// Composes with [`World`] and [`Transact`] strategies the same way
+/// [`SpatialIndex`](crate::SpatialIndex) composes with World — no World API growth.
+///
+/// ## Registration
+///
+/// - [`register_entity`](ReducerRegistry::register_entity) / [`register_entity_despawn`](ReducerRegistry::register_entity_despawn) — single-entity read-write via [`EntityMut`]
+/// - [`register_spawner`](ReducerRegistry::register_spawner) — entity creation via [`Spawner`]
+/// - [`register_query_writer`](ReducerRegistry::register_query_writer) — buffered query iteration via [`QueryWriter`]
+/// - [`register_query`](ReducerRegistry::register_query) — direct mutable iteration via [`QueryMut`]
+/// - [`register_query_ref`](ReducerRegistry::register_query_ref) — read-only iteration via [`QueryRef`]
+/// - [`dynamic`](ReducerRegistry::dynamic) — runtime-validated access via [`DynamicReducerBuilder`]
+///
+/// ## Dispatch
+///
+/// - [`call`](ReducerRegistry::call) — transactional reducers (entity, spawner, query writer), runs through `strategy.transact()`
+/// - [`run`](ReducerRegistry::run) — scheduled query reducers, direct `&mut World`
+/// - [`dynamic_call`](ReducerRegistry::dynamic_call) — dynamic reducers, routes through `strategy.transact()`
+///
+/// ## Conflict analysis
+///
+/// - [`reducer_access`](ReducerRegistry::reducer_access) / [`query_reducer_access`](ReducerRegistry::query_reducer_access) / [`dynamic_access`](ReducerRegistry::dynamic_access) — retrieve [`Access`] bitsets for scheduler conflict detection
+/// - [`reducer_id_by_name`](ReducerRegistry::reducer_id_by_name) / [`query_reducer_id_by_name`](ReducerRegistry::query_reducer_id_by_name) / [`dynamic_id_by_name`](ReducerRegistry::dynamic_id_by_name) — name-based lookup for network dispatch
 pub struct ReducerRegistry {
     reducers: Vec<ReducerEntry>,
     dynamic_reducers: Vec<DynamicReducerEntry>,
@@ -1569,9 +1650,17 @@ impl Default for ReducerRegistry {
 
 // ── DynamicReducerBuilder ────────────────────────────────────────────
 
-/// Builder for registering a dynamic reducer. Declare upper-bound access
-/// with `can_read`, `can_write`, `can_spawn`, `can_remove`, and `can_despawn`,
-/// then finalize with `build`.
+/// Builder for registering a dynamic reducer.
+///
+/// Declare upper-bound access with [`can_read`](DynamicReducerBuilder::can_read),
+/// [`can_write`](DynamicReducerBuilder::can_write),
+/// [`can_spawn`](DynamicReducerBuilder::can_spawn),
+/// [`can_remove`](DynamicReducerBuilder::can_remove), and
+/// [`can_despawn`](DynamicReducerBuilder::can_despawn), then finalize with
+/// [`build`](DynamicReducerBuilder::build). The resulting [`DynamicCtx`]
+/// enforces these bounds at runtime.
+///
+/// Obtained via [`ReducerRegistry::dynamic`].
 pub struct DynamicReducerBuilder<'a> {
     registry: &'a mut ReducerRegistry,
     world: &'a mut World,

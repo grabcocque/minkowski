@@ -123,13 +123,25 @@ pub(crate) enum Mutation {
 }
 
 /// Data-driven mutation buffer. Records structural mutations as an enum vec
-/// with component bytes stored in a contiguous Arena.
+/// with component bytes stored in a contiguous arena.
 ///
-/// Implements `Drop`: if the changeset is discarded without calling `apply()`,
-/// destructors are run for any values whose ownership was transferred in via
-/// typed helpers (`insert`, `spawn_bundle`). Values recorded through the raw
-/// API (`record_insert`, `record_spawn`) are borrowed, not owned, so their
-/// callers remain responsible for cleanup.
+/// [`apply()`](EnumChangeSet::apply) executes all buffered mutations against a
+/// [`World`] and returns a **reverse** `EnumChangeSet` — applying the reverse
+/// undoes the original changes, enabling rollback and undo/redo.
+///
+/// Typed helpers — [`insert`](EnumChangeSet::insert), [`remove`](EnumChangeSet::remove),
+/// [`spawn_bundle`](EnumChangeSet::spawn_bundle) — auto-register component types and
+/// take ownership via `ManuallyDrop` (drop entries registered for cleanup).
+/// Raw methods ([`record_insert`](EnumChangeSet::record_insert),
+/// [`record_spawn`](EnumChangeSet::record_spawn)) copy bytes without taking ownership —
+/// the caller remains responsible for the source data's lifetime.
+///
+/// Used internally by [`Tx`](crate::Tx) for transactional writes and by
+/// `minkowski_persist::Durable` as the WAL serialization boundary.
+/// For closure-based deferred mutations, see [`CommandBuffer`](crate::CommandBuffer).
+///
+/// Implements `Drop`: if discarded without calling `apply()`, destructors
+/// are run for any values whose ownership was transferred via typed helpers.
 pub struct EnumChangeSet {
     pub(crate) mutations: Vec<Mutation>,
     pub(crate) arena: Arena,
