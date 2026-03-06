@@ -107,5 +107,34 @@ fn main() {
     println!("  After rebuild: stale entry cleaned up");
     println!();
 
+    // -- Batch fetch: index -> get_batch composition --
+    // Rebuild btree (it was rebuilt after despawn above)
+    let low_scores: Vec<_> = btree
+        .range(Score(10)..Score(20))
+        .flat_map(|(_, entities)| entities.iter().copied())
+        .collect();
+
+    println!(
+        "Batch fetch: {} entities with Score in [10..20)",
+        low_scores.len()
+    );
+
+    // Batch read — one call instead of N individual get() calls.
+    // Groups by archetype internally for cache locality.
+    let names = world.get_batch::<Name>(&low_scores);
+    let mut named = 0;
+    let mut unnamed = 0;
+    for name in &names {
+        match name {
+            Some(_) => named += 1,
+            None => unnamed += 1,
+        }
+    }
+    println!(
+        "  {} with Name component, {} without (different archetypes)",
+        named, unnamed
+    );
+    println!();
+
     println!("Done.");
 }

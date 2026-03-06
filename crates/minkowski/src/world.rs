@@ -419,6 +419,152 @@ impl World {
         }
     }
 
+    /// Fetch a component for multiple entities, grouped by archetype for
+    /// cache locality. Returns results in the same order as the input slice.
+    /// Dead entities and entities missing the component yield `None`.
+    ///
+    /// This amortises the per-entity overhead of [`get`](Self::get): the
+    /// `ComponentId` is resolved once, entities are grouped by archetype,
+    /// and all rows in each archetype are fetched together.
+    pub fn get_batch<T: Component>(&self, entities: &[Entity]) -> Vec<Option<&T>> {
+        let mut results = vec![None; entities.len()];
+        if entities.is_empty() {
+            return results;
+        }
+
+        let comp_id = match self.components.id::<T>() {
+            Some(id) => id,
+            None => return results,
+        };
+
+        // Sparse fast path — no archetype grouping benefit
+        if self.components.is_sparse(comp_id) {
+            for (i, &entity) in entities.iter().enumerate() {
+                if self.entities.is_alive(entity) {
+                    results[i] = self.sparse.get::<T>(comp_id, entity);
+                }
+            }
+            return results;
+        }
+
+        // Group by archetype for cache locality.
+        let mut by_arch: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for (i, &entity) in entities.iter().enumerate() {
+            if !self.entities.is_alive(entity) {
+                continue;
+            }
+            if let Some(location) = self.entity_locations[entity.index() as usize] {
+                by_arch
+                    .entry(location.archetype_id.0)
+                    .or_default()
+                    .push((i, location.row));
+            }
+        }
+
+        // Fetch per-archetype: one column lookup per archetype, not per entity.
+        for (arch_idx, rows) in &by_arch {
+            let arch = &self.archetypes.archetypes[*arch_idx];
+            if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                for &(result_idx, row) in rows {
+                    results[result_idx] = unsafe {
+                        let ptr = arch.columns[col_idx].get_ptr(row) as *const T;
+                        Some(&*ptr)
+                    };
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Mutable batch fetch — same archetype-grouped pattern as
+    /// [`get_batch`](Self::get_batch), but returns `&mut T` and marks
+    /// accessed columns as changed for [`Changed<T>`](crate::query::fetch::Changed)
+    /// detection.
+    ///
+    /// **Note:** Sparse components do not participate in [`Changed<T>`](crate::query::fetch::Changed)
+    /// detection (this matches the behavior of [`get_mut`](Self::get_mut)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the same entity appears more than once in `entities`.
+    /// Aliased `&mut T` is undefined behaviour — this check is unconditional.
+    pub fn get_batch_mut<T: Component>(&mut self, entities: &[Entity]) -> Vec<Option<&mut T>> {
+        self.drain_orphans();
+
+        let mut results: Vec<Option<&mut T>> = (0..entities.len()).map(|_| None).collect();
+        if entities.is_empty() {
+            return results;
+        }
+
+        let comp_id = match self.components.id::<T>() {
+            Some(id) => id,
+            None => return results,
+        };
+
+        // Sparse fast path — duplicate check via sorted indices.
+        if self.components.is_sparse(comp_id) {
+            let mut alive_indices: Vec<u32> = entities
+                .iter()
+                .filter(|e| self.entities.is_alive(**e))
+                .map(|e| e.index())
+                .collect();
+            alive_indices.sort_unstable();
+            for w in alive_indices.windows(2) {
+                assert!(w[0] != w[1], "duplicate entity in get_batch_mut");
+            }
+            for (i, &entity) in entities.iter().enumerate() {
+                if self.entities.is_alive(entity) {
+                    if let Some(val) = self.sparse.get_mut::<T>(comp_id, entity) {
+                        // SAFETY: the duplicate check above guarantees each entity
+                        // appears at most once, so no two results alias.
+                        results[i] = Some(unsafe { &mut *(val as *mut T) });
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Group by archetype for cache locality.
+        let mut by_arch: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for (i, &entity) in entities.iter().enumerate() {
+            if !self.entities.is_alive(entity) {
+                continue;
+            }
+            if let Some(location) = self.entity_locations[entity.index() as usize] {
+                by_arch
+                    .entry(location.archetype_id.0)
+                    .or_default()
+                    .push((i, location.row));
+            }
+        }
+
+        // Duplicate check: sort each group by row, check adjacent pairs.
+        // Same row in same archetype = same entity (each row holds exactly one entity).
+        for rows in by_arch.values_mut() {
+            rows.sort_unstable_by_key(|&(_, row)| row);
+            for w in rows.windows(2) {
+                assert!(w[0].1 != w[1].1, "duplicate entity in get_batch_mut");
+            }
+        }
+
+        // Mark columns changed and fetch per-archetype.
+        let tick = self.next_tick();
+        for (arch_idx, rows) in &by_arch {
+            let arch = &mut self.archetypes.archetypes[*arch_idx];
+            if let Some(&col_idx) = arch.component_index.get(&comp_id) {
+                for &(result_idx, row) in rows {
+                    results[result_idx] = unsafe {
+                        let ptr = arch.columns[col_idx].get_ptr_mut(row, tick) as *mut T;
+                        Some(&mut *ptr)
+                    };
+                }
+            }
+        }
+
+        results
+    }
+
     pub fn query<Q: WorldQuery + 'static>(&mut self) -> QueryIter<'_, Q> {
         self.drain_orphans();
         let type_id = TypeId::of::<Q>();
@@ -1628,5 +1774,234 @@ mod tests {
         struct Unknown;
         let changed = world.query_changed_since::<Unknown>(crate::tick::ChangeTick::default());
         assert!(changed.is_empty());
+    }
+
+    // ── World::get_batch tests ────────────────────────────────────
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    struct Health(u32);
+
+    #[test]
+    fn get_batch_basic() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(100),));
+        let e2 = world.spawn((Health(50),));
+        let e3 = world.spawn((Health(25),));
+
+        let results = world.get_batch::<Health>(&[e1, e2, e3]);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], Some(&Health(100)));
+        assert_eq!(results[1], Some(&Health(50)));
+        assert_eq!(results[2], Some(&Health(25)));
+    }
+
+    #[test]
+    fn get_batch_dead_entity() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(100),));
+        let e2 = world.spawn((Health(50),));
+        world.despawn(e1);
+
+        let results = world.get_batch::<Health>(&[e1, e2]);
+        assert_eq!(results[0], None);
+        assert_eq!(results[1], Some(&Health(50)));
+    }
+
+    #[test]
+    fn get_batch_missing_component() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(100),));
+        let e2 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        let results = world.get_batch::<Health>(&[e1, e2]);
+        assert_eq!(results[0], Some(&Health(100)));
+        assert_eq!(results[1], None);
+    }
+
+    #[test]
+    fn get_batch_empty_input() {
+        let world = World::new();
+        let results = world.get_batch::<Health>(&[]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn get_batch_unregistered_type() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let results = world.get_batch::<Health>(&[e]);
+        assert_eq!(results[0], None);
+    }
+
+    #[test]
+    fn get_batch_multi_archetype() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(10),));
+        let e2 = world.spawn((Health(20), Pos { x: 0.0, y: 0.0 }));
+        let e3 = world.spawn((Health(30),));
+
+        let results = world.get_batch::<Health>(&[e1, e2, e3]);
+        assert_eq!(results[0], Some(&Health(10)));
+        assert_eq!(results[1], Some(&Health(20)));
+        assert_eq!(results[2], Some(&Health(30)));
+    }
+
+    #[test]
+    fn get_batch_duplicate_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Health(42),));
+
+        let results = world.get_batch::<Health>(&[e, e]);
+        assert_eq!(results[0], Some(&Health(42)));
+        assert_eq!(results[1], Some(&Health(42)));
+    }
+
+    #[test]
+    fn get_batch_preserves_order() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(1),));
+        let e2 = world.spawn((Health(2),));
+        let e3 = world.spawn((Health(3),));
+
+        let results = world.get_batch::<Health>(&[e3, e1, e2]);
+        assert_eq!(results[0], Some(&Health(3)));
+        assert_eq!(results[1], Some(&Health(1)));
+        assert_eq!(results[2], Some(&Health(2)));
+    }
+
+    #[test]
+    fn get_batch_sparse() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e1 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let e2 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        world.insert_sparse(e1, Health(100));
+        world.insert_sparse(e2, Health(50));
+
+        let results = world.get_batch::<Health>(&[e1, e2]);
+        assert_eq!(results[0], Some(&Health(100)));
+        assert_eq!(results[1], Some(&Health(50)));
+    }
+
+    #[test]
+    fn get_batch_mut_basic() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(100),));
+        let e2 = world.spawn((Health(50),));
+
+        let mut results = world.get_batch_mut::<Health>(&[e1, e2]);
+        assert_eq!(results.len(), 2);
+        *results[0].take().unwrap() = Health(200);
+        *results[1].take().unwrap() = Health(75);
+        drop(results);
+
+        assert_eq!(world.get::<Health>(e1), Some(&Health(200)));
+        assert_eq!(world.get::<Health>(e2), Some(&Health(75)));
+    }
+
+    #[test]
+    fn get_batch_mut_marks_changed() {
+        let mut world = World::new();
+        let e = world.spawn((Health(100),));
+        let spawn_tick = world.archetypes.archetypes[0].columns[0].changed_tick;
+
+        let _results = world.get_batch_mut::<Health>(&[e]);
+
+        let loc = world.entity_locations[e.index() as usize].unwrap();
+        let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+        let comp_id = world.components.id::<Health>().unwrap();
+        let col_idx = arch.component_index[&comp_id];
+        assert!(arch.columns[col_idx].changed_tick.is_newer_than(spawn_tick));
+    }
+
+    #[test]
+    fn get_batch_mut_dead_entity() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(100),));
+        let e2 = world.spawn((Health(50),));
+        world.despawn(e1);
+
+        let mut results = world.get_batch_mut::<Health>(&[e1, e2]);
+        assert!(results[0].is_none());
+        assert_eq!(*results[1].take().unwrap(), Health(50));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate entity")]
+    fn get_batch_mut_duplicate_panics() {
+        let mut world = World::new();
+        let e = world.spawn((Health(42),));
+        let _results = world.get_batch_mut::<Health>(&[e, e]);
+    }
+
+    #[test]
+    fn get_batch_mut_sparse() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e1 = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        let e2 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        world.insert_sparse(e1, Health(100));
+        world.insert_sparse(e2, Health(50));
+
+        let mut results = world.get_batch_mut::<Health>(&[e1, e2]);
+        *results[0].take().unwrap() = Health(200);
+        *results[1].take().unwrap() = Health(75);
+        drop(results);
+
+        assert_eq!(world.get::<Health>(e1), Some(&Health(200)));
+        assert_eq!(world.get::<Health>(e2), Some(&Health(75)));
+    }
+
+    #[test]
+    fn get_batch_mut_multi_archetype() {
+        let mut world = World::new();
+        let e1 = world.spawn((Health(10),));
+        let e2 = world.spawn((Health(20), Pos { x: 0.0, y: 0.0 }));
+
+        let mut results = world.get_batch_mut::<Health>(&[e1, e2]);
+        *results[0].take().unwrap() = Health(11);
+        *results[1].take().unwrap() = Health(21);
+        drop(results);
+
+        assert_eq!(world.get::<Health>(e1), Some(&Health(11)));
+        assert_eq!(world.get::<Health>(e2), Some(&Health(21)));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate entity")]
+    fn get_batch_mut_sparse_duplicate_panics() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert_sparse(e, Health(42));
+        let _results = world.get_batch_mut::<Health>(&[e, e]);
+    }
+
+    #[test]
+    fn get_batch_mut_same_index_different_generation_no_panic() {
+        let mut world = World::new();
+        let old = world.spawn((Health(1),));
+        world.despawn(old);
+        let new = world.spawn((Health(2),));
+        // After despawn + respawn, the free list reuses the same index
+        assert_eq!(old.index(), new.index());
+        let results = world.get_batch_mut::<Health>(&[old, new]);
+        assert!(results[0].is_none()); // dead
+        assert_eq!(*results[1].as_ref().unwrap(), &Health(2));
+    }
+
+    #[test]
+    fn get_batch_mut_unregistered_type() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let results = world.get_batch_mut::<Health>(&[e]);
+        assert_eq!(results[0], None);
+    }
+
+    #[test]
+    fn get_batch_mut_empty_input() {
+        let mut world = World::new();
+        let results = world.get_batch_mut::<Health>(&[]);
+        assert!(results.is_empty());
     }
 }

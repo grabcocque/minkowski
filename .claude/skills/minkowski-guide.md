@@ -110,6 +110,16 @@ uniform density, tree for clustered.
 - After snapshot restore -> `restore_allocator_state()` calls `sync_reserved()` internally; custom restoration paths must call it manually
 - Mutation path -> `QueryWriter` reducer (buffers writes, changeset goes to WAL)
 
+### Column Indexes
+
+- Need all entities with component value in a range? -> `BTreeIndex<T>` (T: Ord)
+- Need all entities with exact component value? -> `HashIndex<T>` (T: Hash + Eq)
+- After index lookup, need component data for results? -> `world.get_batch::<T>(&entities)`
+- Need mutable access to results? -> `world.get_batch_mut::<T>(&entities)` (panics on duplicates)
+- Multiple component types? -> call `get_batch` once per type
+- Incremental updates? -> each index owns a `ChangeTick`, uses `world.query_changed_since()`
+- Stale entries from despawn/remove? -> `get_valid()`/`range_valid()` filter via `world.has::<T>()`
+
 ### Spatial Indexing
 
 - Do you need spatial neighbor queries at all? -> only if yes, implement `SpatialIndex`
@@ -276,19 +286,26 @@ Each example demonstrates specific patterns. Read the source for concrete API us
 | `transaction` | Three strategies (Sequential/Optimistic/Pessimistic), raw Tx + reducer comparison | `examples/examples/transaction.rs` |
 | `battle` | EntityMut reducers, rayon parallel snapshot computation, sequential dispatch, tunable conflict rates | `examples/examples/battle.rs` |
 | `persist` | QueryWriter + Durable, WAL, snapshots, crash recovery | `examples/examples/persist.rs` |
+| `index` | BTreeIndex range queries, HashIndex exact lookups, incremental update, batch fetch | `examples/examples/index.rs` |
 
 ### Pattern Quick-Find
 
-- **Registering an entity reducer:** `reducer.rs` lines 37-44 (`register_entity`)
-- **Registering a query reducer:** `reducer.rs` lines 59-67 (`register_query`)
+- **Entity reducer (register + dispatch):** `reducer.rs` lines 37-44 (`register_entity`)
+- **Query reducer (bulk mutable):** `reducer.rs` lines 59-67 (`register_query`)
+- **Read-only query reducer:** `reducer.rs` lines 71-78 (`register_query_ref`)
+- **Spawner reducer:** `reducer.rs` lines 82-89 (`register_spawner`)
 - **QueryWriter with WritableRef:** `reducer.rs` lines 141-149 (`register_query_writer`)
 - **Dynamic reducer with builder:** `reducer.rs` lines 185-215 (`registry.dynamic()`)
-- **Spawner reducer:** `reducer.rs` lines 82-89 (`register_spawner`)
-- **Conflict detection:** `reducer.rs` lines 283-355 (`conflicts_with`)
+- **Dynamic for_each + despawn:** `reducer.rs` lines 255-270 (reaper pattern)
+- **Name-based reducer lookup:** `reducer.rs` lines 166-171 (`reducer_id_by_name`)
+- **Conflict detection:** `reducer.rs` lines 282-355 (`conflicts_with`)
 - **SpatialIndex trait impl:** `boids.rs` (SpatialGrid), `nbody.rs` (BarnesHutTree)
 - **Table derive + query_table:** `life.rs`
 - **Durable transactions:** `persist.rs`
 - **Parallel dispatch with rayon:** `battle.rs`
+- **BTreeIndex range + HashIndex exact:** `index.rs` lines 40-63
+- **Incremental index update (ChangeTick):** `index.rs` lines 65-89
+- **Index -> get_batch composition:** `index.rs` lines 110-137
 
 ## Common Patterns
 
