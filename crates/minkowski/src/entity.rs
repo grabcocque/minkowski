@@ -1,4 +1,14 @@
-/// A unique entity identifier: 32-bit index + 32-bit generation packed into u64.
+/// A unique entity identifier: 32-bit index + 32-bit generation packed into a u64.
+///
+/// The low 32 bits store the index (slot in the entity allocator), and the
+/// high 32 bits store the generation (incremented each time the slot is
+/// recycled). This makes stale handles detectable: after an entity is
+/// despawned and its slot reused, the old handle's generation no longer
+/// matches, so [`World::is_alive`](crate::World::is_alive) returns false.
+///
+/// [`Entity::DANGLING`] is a sentinel value (`u64::MAX`) used as a
+/// placeholder before a real entity is assigned. Use [`to_bits`](Entity::to_bits)
+/// / [`from_bits`](Entity::from_bits) for serialization.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(transparent)]
 pub struct Entity(u64);

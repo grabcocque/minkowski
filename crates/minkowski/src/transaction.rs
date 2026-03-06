@@ -72,7 +72,11 @@ use crate::world::{World, WorldId};
 /// Unique transaction identifier, monotonically increasing per strategy.
 pub type TxId = u64;
 
-/// Conflict information returned when a transaction commit fails.
+/// Returned when an optimistic transaction commit fails validation.
+///
+/// Contains the set of component columns that had conflicting concurrent
+/// modifications. Returned by [`Transact::transact`] after exhausting retries,
+/// or by [`Transact::try_commit`] on a single failed attempt. See [`Optimistic`].
 #[derive(Debug)]
 pub struct Conflict {
     /// Which component columns had conflicting concurrent modifications.
@@ -175,17 +179,20 @@ impl TxCleanup for PessimisticCleanup<'_> {
     }
 }
 
-/// Unified transaction object. Holds a buffered changeset and tracks
-/// entity IDs allocated during the transaction. Strategy-specific
-/// teardown is delegated to a boxed `TxCleanup` implementor.
+/// Unified transaction handle. Holds a buffered [`EnumChangeSet`] and tracks
+/// entity IDs allocated during the transaction.
 ///
-/// Does not hold a World reference — methods take `&World` or
-/// `&mut World` as parameters, enabling split-phase execution where
-/// multiple transactions read concurrently and commit sequentially.
+/// Does **not** hold `&mut World` — methods take `&World` or `&mut World`
+/// as parameters. This split-phase design enables concurrent reads:
+/// [`query(&world)`](Tx::query) uses `World::query_raw` (shared-ref, no ticks/cache)
+/// and requires [`ReadOnlyWorldQuery`] to prevent aliased `&mut T`.
+/// Writes go through [`write`](Tx::write), [`remove`](Tx::remove), and
+/// [`spawn`](Tx::spawn), which buffer into the internal changeset.
 ///
 /// Drop without [`mark_committed`](Tx::mark_committed) triggers abort:
 /// the cleanup callback runs and spawned entity IDs are pushed to the
-/// orphan queue for reclamation.
+/// orphan queue for reclamation. Strategy-specific teardown (e.g. lock
+/// release for [`Pessimistic`]) is handled by an internal cleanup trait.
 pub struct Tx<'a> {
     archetype_count: usize,
     changeset: EnumChangeSet,
@@ -379,8 +386,11 @@ impl Sequential {
     }
 }
 
-/// Transaction object for the [`Sequential`] strategy.
-/// Zero-state unit struct — all methods delegate directly to World.
+/// Transaction handle for the [`Sequential`] strategy.
+///
+/// Zero-state unit struct — all methods delegate directly to [`World`].
+/// No buffering, no validation, no conflict detection. Commit always succeeds
+/// and returns an empty reverse changeset.
 pub struct SequentialTx;
 
 impl SequentialTx {

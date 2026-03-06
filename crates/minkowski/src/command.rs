@@ -3,8 +3,15 @@ use crate::component::Component;
 use crate::entity::Entity;
 use crate::world::World;
 
-/// Deferred mutation buffer. Records commands during iteration,
-/// applies them all at once to &mut World.
+/// Deferred structural mutation buffer for use during query iteration.
+///
+/// Records [`spawn`](CommandBuffer::spawn), [`despawn`](CommandBuffer::despawn),
+/// [`insert`](CommandBuffer::insert), and [`remove`](CommandBuffer::remove)
+/// commands as boxed closures. Call [`apply`](CommandBuffer::apply) after
+/// iteration to execute them all against `&mut World`.
+///
+/// For a data-driven alternative with rollback support and WAL
+/// serialization, see [`EnumChangeSet`](crate::EnumChangeSet).
 pub struct CommandBuffer {
     #[allow(clippy::type_complexity)]
     commands: Vec<Box<dyn FnOnce(&mut World) + Send>>,
