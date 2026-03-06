@@ -9,7 +9,7 @@ Minkowski combines ECS patterns with database semantics -- an unusual combinatio
 
 ## Decision
 
-One auto-triggering skill (`minkowski-guide.md`) provides passive expertise as users write code, activating on relevant keywords. Eight slash commands guide specific decisions: data modeling, query patterns, reducer selection, concurrency model, mutation strategy, persistence setup, spatial indexing, and performance optimization. Skills reference `CLAUDE.md` architecture but teach the paradigm through decision flowcharts and anti-pattern warnings.
+One auto-triggering skill (`minkowski-guide.md`) provides passive expertise as users write code, activating on relevant keywords. Eight domain-specific slash commands guide paradigm decisions: data modeling, query patterns, reducer selection, concurrency model, mutation strategy, persistence setup, spatial indexing, and performance optimization. Five additional utility commands handle design docs, soundness audits, API validation, macro validation, and PR creation. Skills reference `CLAUDE.md` architecture but teach the paradigm through decision flowcharts and anti-pattern warnings.
 
 **Key insight: meet users where they are -- skills auto-trigger on relevant keywords, commands provide Socratic guidance for key decisions.**
 

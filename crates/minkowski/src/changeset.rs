@@ -131,8 +131,10 @@ pub(crate) enum Mutation {
 ///
 /// Typed helpers — [`insert`](EnumChangeSet::insert), [`remove`](EnumChangeSet::remove),
 /// [`spawn_bundle`](EnumChangeSet::spawn_bundle) — auto-register component types and
-/// handle ownership transfer. Raw methods ([`record_insert`](EnumChangeSet::record_insert),
-/// [`record_spawn`](EnumChangeSet::record_spawn)) are available for pre-resolved paths.
+/// take ownership via `ManuallyDrop` (drop entries registered for cleanup).
+/// Raw methods ([`record_insert`](EnumChangeSet::record_insert),
+/// [`record_spawn`](EnumChangeSet::record_spawn)) copy bytes without taking ownership —
+/// the caller remains responsible for the source data's lifetime.
 ///
 /// Used internally by [`Tx`](crate::Tx) for transactional writes and by
 /// `minkowski_persist::Durable` as the WAL serialization boundary.
