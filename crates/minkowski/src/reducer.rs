@@ -52,7 +52,11 @@ pub(crate) struct ResolvedComponents(pub(crate) Vec<ComponentId>);
 /// Pre-resolved component lookup for dynamic reducers.
 /// Entries sorted by TypeId for O(log n) binary search at runtime.
 pub(crate) struct DynamicResolved {
-    entries: Vec<(TypeId, ComponentId)>,
+    // PERF: HashMap for O(1) TypeId → ComponentId lookup. Replaces sorted
+    // Vec + binary search (O(log n) per ctx.read/write/remove call).
+    entries: HashMap<TypeId, ComponentId>,
+    /// All declared ComponentIds for fast membership checks.
+    comp_ids: HashSet<ComponentId>,
     access: Access,
     spawn_bundles: HashSet<TypeId>,
     remove_ids: HashSet<TypeId>,
@@ -60,21 +64,16 @@ pub(crate) struct DynamicResolved {
 
 impl DynamicResolved {
     pub(crate) fn new(
-        mut entries: Vec<(TypeId, ComponentId)>,
+        entries: Vec<(TypeId, ComponentId)>,
         access: Access,
         spawn_bundles: HashSet<TypeId>,
         remove_ids: HashSet<TypeId>,
     ) -> Self {
-        entries.sort_by_key(|(tid, _)| *tid);
-        assert!(
-            entries
-                .windows(2)
-                .all(|w| w[0].0 != w[1].0 || w[0].1 == w[1].1),
-            "DynamicResolved: duplicate TypeId with different ComponentIds"
-        );
-        entries.dedup_by_key(|(tid, _)| *tid);
+        let comp_ids: HashSet<ComponentId> = entries.iter().map(|(_, cid)| *cid).collect();
+        let entries: HashMap<TypeId, ComponentId> = entries.into_iter().collect();
         Self {
             entries,
+            comp_ids,
             access,
             spawn_bundles,
             remove_ids,
@@ -82,11 +81,7 @@ impl DynamicResolved {
     }
 
     pub(crate) fn lookup<T: 'static>(&self) -> Option<ComponentId> {
-        let tid = TypeId::of::<T>();
-        self.entries
-            .binary_search_by_key(&tid, |(t, _)| *t)
-            .ok()
-            .map(|idx| self.entries[idx].1)
+        self.entries.get(&TypeId::of::<T>()).copied()
     }
 
     pub(crate) fn access(&self) -> &Access {
@@ -103,7 +98,7 @@ impl DynamicResolved {
 
     /// Check if a ComponentId is in the declared set.
     pub(crate) fn contains_comp_id(&self, comp_id: ComponentId) -> bool {
-        self.entries.iter().any(|(_, cid)| *cid == comp_id)
+        self.comp_ids.contains(&comp_id)
     }
 }
 
