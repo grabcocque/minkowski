@@ -2,11 +2,11 @@
 
 A column-oriented database engine built from scratch by one human and one AI.
 
-Minkowski is an archetype ECS that doubles as a transactional database engine. Its typed reducer system proves conflict freedom from closure signatures alone -- no runtime checks needed for scheduled reducers. Split-phase transactions enable safe concurrent reads by keeping `Tx` separate from `&mut World`, and WAL persistence composes with any transaction strategy via a single wrapper type. The engine ships with 295 tests across 4 crates, 8 runnable examples, and passes Miri under Tree Borrows -- all built in one week across 26 PRs.
+Minkowski is an [archetype][archetype] [ECS][ecs] that doubles as a transactional database engine. Its typed [reducer](#typed-reducers) system proves conflict freedom from closure signatures alone -- no runtime checks needed for scheduled reducers. [Split-phase transactions](#transactions) enable safe concurrent reads by keeping `Tx` separate from `&mut World`, and [WAL][wal] persistence composes with any transaction strategy via a single wrapper type. The engine ships with 295 tests across 4 crates, 8 runnable examples, and passes [Miri][miri] under [Tree Borrows][tree-borrows] -- all built in one week across 26 PRs.
 
 ## What makes this interesting
 
-- **Column-oriented ECS that's also a transactional database engine** -- three mutation tiers (direct, transactional, durable) over the same columnar storage
+- **[Column-oriented][column-store] ECS that's also a transactional database engine** -- three mutation tiers (direct, transactional, durable) over the same columnar storage
 - **Typed reducers** -- closures whose type signatures prove conflict freedom, enabling compile-time scheduling without runtime validation
 - **Split-phase transactions** -- `Tx` does not hold `&mut World`, so concurrent reads via `&World` are sound by construction
 - **AI-powered developer tooling** -- an auto-triggering skill provides passive expertise; 13 slash commands guide design decisions across the paradigm
@@ -48,9 +48,9 @@ registry.run(&mut world, move_id, ());
 
 ## Column-Oriented Storage
 
-Each unique combination of component types gets an archetype -- a struct of arrays where each column is a `BlobVec` (type-erased growable byte array with 64-byte alignment). Queries match archetypes via `FixedBitSet` subset checks, then iterate columns with raw pointer arithmetic. No virtual dispatch in the hot path.
+Each unique combination of [component][component] types gets an [archetype][archetype] -- a [struct of arrays][soa] where each column is a `BlobVec` (type-erased growable byte array with 64-byte alignment). Queries match archetypes via [bitset][bitset] subset checks, then iterate columns with raw pointer arithmetic. No virtual dispatch in the hot path.
 
-Entities are generational `u64` IDs (32-bit index + 32-bit generation). Recycled indices get bumped generations to prevent use-after-free. O(1) lookup from entity to archetype row via `Vec<Option<EntityLocation>>`. Sparse components (`HashMap<Entity, T>`) are opt-in for tags and rarely-queried data, preventing archetype fragmentation.
+Entities are [generational][generational-index] `u64` IDs (32-bit index + 32-bit generation). Recycled indices get bumped generations to prevent use-after-free. O(1) lookup from entity to archetype row via `Vec<Option<EntityLocation>>`. Sparse components (`HashMap<Entity, T>`) are opt-in for tags and rarely-queried data, preventing archetype fragmentation.
 
 ```rust
 let mut world = World::new();
@@ -63,7 +63,7 @@ world.remove::<Health>(e);      // migrates it back
 
 Two-tier query system with incremental caching. Dynamic queries (`world.query::<(&mut Pos, &Vel)>()`) cache matched archetype IDs per query type -- repeat calls skip the archetype scan entirely, and only new archetypes are scanned incrementally. Static table queries (`world.query_table::<Transform>()`) bypass archetype matching altogether via pre-resolved column offsets.
 
-`Changed<T>` filters skip entire archetypes whose column was not mutably accessed since the last read. Ticks auto-advance on every mutation and query -- there is no manual `world.tick()` call. Parallel iteration via `par_for_each` (rayon) and chunk-based `for_each_chunk` yielding `&[T]`/`&mut [T]` slices for SIMD auto-vectorization.
+`Changed<T>` filters skip entire archetypes whose column was not mutably accessed since the last read. Ticks auto-advance on every mutation and query -- there is no manual `world.tick()` call. Parallel iteration via `par_for_each` ([rayon][rayon]) and chunk-based `for_each_chunk` yielding `&[T]`/`&mut [T]` slices for [SIMD][simd] auto-vectorization.
 
 ```rust
 // Dynamic query -- cached, skips archetype scan on repeat calls
@@ -104,8 +104,8 @@ Scheduled reducers (QueryRef, QueryMut) run with direct world access -- conflict
 Three strategies over a unified `Transact` trait. `Tx` does not hold `&mut World` -- methods take world as a parameter, enabling split-phase execution where multiple transactions read concurrently via `&World` before committing sequentially.
 
 - **Sequential** -- zero-cost passthrough, all ops delegate directly to World
-- **Optimistic** -- live reads via `query_raw(&self)`, buffered writes, tick-based validation at commit
-- **Pessimistic** -- cooperative per-column locks acquired at begin, buffered writes, commit always succeeds
+- **[Optimistic][occ]** -- live reads via `query_raw(&self)`, buffered writes, tick-based validation at commit
+- **[Pessimistic][pcc]** -- cooperative per-column locks acquired at begin, buffered writes, commit always succeeds
 
 Lock granularity is per-column `(ArchetypeId, ComponentId)`. The lock table is owned by the strategy, not World -- concurrency policy is external to storage.
 
@@ -113,7 +113,7 @@ Entity IDs allocated during a transaction are tracked automatically. On abort, o
 
 ## Persistence
 
-The `minkowski-persist` crate provides WAL (write-ahead log) and bincode snapshots. `Durable<S, W>` wraps any `Transact` strategy -- on successful commit, the forward changeset is written to the WAL before being applied to World. Failed attempts (retries) are not logged. WAL write failure panics -- the durability invariant is non-negotiable. Recovery loads the latest snapshot and replays subsequent WAL entries.
+The `minkowski-persist` crate provides [WAL][wal] (write-ahead log) and [bincode][bincode] snapshots. `Durable<S, W>` wraps any `Transact` strategy -- on successful commit, the forward changeset is written to the WAL before being applied to World. Failed attempts (retries) are not logged. WAL write failure panics -- the durability invariant is non-negotiable. Recovery loads the latest snapshot and replays subsequent WAL entries.
 
 ```rust
 // Durable wraps any strategy -- Optimistic, Pessimistic, or Sequential
@@ -145,7 +145,7 @@ for row in world.query_table::<Transform>() {
 
 `SpatialIndex` is a lifecycle trait for user-owned spatial data structures. Indexes are fully external to World -- they compose from existing query primitives. The trait has two methods: `rebuild` (full reconstruction) and `update` (optional, for incremental updates via `Changed<T>`). Stale entity references are caught by generational validation at query time.
 
-Two implementations ship as examples: a uniform grid for O(N*k) neighbor search (boids) and a Barnes-Hut quadtree for O(N log N) force approximation (nbody). Both demonstrate that the trait accommodates structurally different algorithms without friction.
+Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) neighbor search (boids) and a [Barnes-Hut][barnes-hut] quadtree for O(N log N) force approximation (nbody). Both demonstrate that the trait accommodates structurally different algorithms without friction.
 
 ## Examples
 
@@ -194,6 +194,47 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 | rkyv zero-copy snapshots | Zero-copy deserialization matching BlobVec layout |
 | Replication & sync | Filtered WAL replay for read replicas and client mirrors |
 
+## Glossary
+
+| Term | Definition |
+|---|---|
+| [Archetype][archetype] | A unique combination of component types. Entities with the same components share an archetype, enabling contiguous column storage. |
+| [Barnes-Hut][barnes-hut] | An O(N log N) approximation algorithm for N-body force computation using a quadtree to aggregate distant particles. |
+| [Bitset][bitset] | A compact array of bits used here for fast archetype matching -- query matching is a bitwise subset check. |
+| [Column store][column-store] | A storage layout where each field is stored in its own contiguous array, enabling cache-friendly sequential access and SIMD vectorization. |
+| [Component][component] | A data type attached to an entity. Any `'static + Send + Sync` Rust type qualifies. Stored in BlobVec columns within archetypes. |
+| [ECS][ecs] | Entity-Component System -- an architectural pattern where entities are IDs, components are data, and systems are logic. Decouples data layout from behavior. |
+| [Generational index][generational-index] | An ID scheme pairing an array index with a generation counter. Reusing an index bumps the generation, so stale handles are detected without a free-list scan. |
+| [Miri][miri] | An interpreter for Rust's Mid-level IR that detects undefined behavior (aliasing violations, use-after-free, data races) at runtime. |
+| [OCC][occ] | Optimistic concurrency control -- transactions execute without locks, then validate at commit that no conflicting writes occurred. |
+| [PCC][pcc] | Pessimistic concurrency control -- transactions acquire locks before accessing data, preventing conflicts at the cost of potential contention. |
+| [Rayon][rayon] | A Rust library for data parallelism. Used here for `par_for_each` parallel query iteration. |
+| [Reducer](#typed-reducers) | A registered closure whose type signature declares its data access. The registry extracts conflict metadata at registration time. |
+| [SIMD][simd] | Single Instruction, Multiple Data -- CPU instructions that process multiple values in parallel. Minkowski's 64-byte column alignment enables auto-vectorization. |
+| [SoA][soa] | Struct of Arrays -- storing each field in a separate array rather than interleaving fields per record. The storage layout archetypes use. |
+| [Tree Borrows][tree-borrows] | An experimental Rust aliasing model (stricter than Stacked Borrows) that Miri can check. Minkowski passes under this model. |
+| [Uniform grid][uniform-grid] | A spatial index dividing space into fixed-size cells. O(1) cell lookup, O(k) neighbor iteration where k is the number of occupied neighbor cells. |
+| [WAL][wal] | Write-ahead log -- an append-only file where every mutation is recorded before being applied. Enables crash recovery by replaying the log. |
+
 ## License
 
 This project is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/).
+
+<!-- Link definitions -->
+[archetype]: https://en.wikipedia.org/wiki/Archetype_pattern
+[barnes-hut]: https://en.wikipedia.org/wiki/Barnes%E2%80%93Hut_simulation
+[bincode]: https://github.com/bincode-org/bincode
+[bitset]: https://en.wikipedia.org/wiki/Bit_array
+[column-store]: https://en.wikipedia.org/wiki/Column-oriented_DBMS
+[component]: https://en.wikipedia.org/wiki/Entity_component_system#Components
+[ecs]: https://en.wikipedia.org/wiki/Entity_component_system
+[generational-index]: https://lucassardois.medium.com/generational-indices-guide-8e3c5f7fd594
+[miri]: https://github.com/rust-lang/miri
+[occ]: https://en.wikipedia.org/wiki/Optimistic_concurrency_control
+[pcc]: https://en.wikipedia.org/wiki/Lock_(database)
+[rayon]: https://github.com/rayon-rs/rayon
+[simd]: https://en.wikipedia.org/wiki/Single_instruction,_multiple_data
+[soa]: https://en.wikipedia.org/wiki/AoS_and_SoA#Structure_of_arrays
+[tree-borrows]: https://perso.crans.org/vanille/treebor/
+[uniform-grid]: https://en.wikipedia.org/wiki/Grid_(spatial_index)
+[wal]: https://en.wikipedia.org/wiki/Write-ahead_logging
