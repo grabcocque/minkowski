@@ -43,6 +43,9 @@ Determine which files to analyze:
 - `codec.rs` — `serialize`, `deserialize`, `raw_copy_size` usage
 - `format.rs` — `serialize_record`, `deserialize_record`
 
+**Entity allocation (concurrent spawner path)** — `crates/minkowski/src/`
+- `entity.rs` — `EntityAllocator::reserve` (atomic), `alloc`, `materialize_reserved`
+
 **Transaction (commit path)** — `crates/minkowski/src/`
 - `transaction.rs` — `try_commit`, `begin`, tick validation, changeset apply
 - `lock_table.rs` — `acquire`, `release`
