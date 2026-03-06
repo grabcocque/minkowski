@@ -56,6 +56,10 @@ impl Entity {
 pub(crate) struct EntityAllocator {
     pub(crate) generations: Vec<u32>,
     pub(crate) free_list: Vec<u32>,
+    // PERF: Padding isolates the atomic from Vec fields on separate cache
+    // lines. Prevents false sharing when concurrent spawners (via reserve())
+    // contend with sequential alloc()/materialize() which mutate the Vecs.
+    _pad: [u8; 64],
     /// Atomic counter for lock-free entity index reservation.
     next_reserved: std::sync::atomic::AtomicU32,
 }
@@ -65,6 +69,7 @@ impl EntityAllocator {
         Self {
             generations: Vec::new(),
             free_list: Vec::new(),
+            _pad: [0; 64],
             next_reserved: std::sync::atomic::AtomicU32::new(0),
         }
     }
