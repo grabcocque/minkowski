@@ -344,7 +344,7 @@ fn main() {
                 .map(|(e, p, h, _)| (e, p.0, h.0))
                 .collect();
 
-            for (entity, pos, heading) in &worms {
+            for (entity, pos, _heading) in &worms {
                 // Find closest food within sense radius
                 let mut best_dir = Vec2::ZERO;
                 let mut best_dist_sq = f32::MAX;
@@ -370,18 +370,17 @@ fn main() {
                     if best_dist_sq < params.sense_radius * params.sense_radius {
                         // Turn toward food
                         let target_angle = best_dir.y.atan2(best_dir.x);
-                        let mut delta = target_angle - *heading;
-                        // Normalize to [-pi, pi]
-                        if delta > std::f32::consts::PI {
-                            delta -= std::f32::consts::TAU;
-                        } else if delta < -std::f32::consts::PI {
-                            delta += std::f32::consts::TAU;
-                        }
+                        // Normalize delta to [-pi, pi] via modular arithmetic
+                        let delta = (target_angle - h.0 + std::f32::consts::PI)
+                            .rem_euclid(std::f32::consts::TAU)
+                            - std::f32::consts::PI;
                         h.0 += delta * params.turn_rate;
                     } else {
                         // Random wander
                         h.0 += (fastrand::f32() - 0.5) * params.wander_strength;
                     }
+                    // Keep heading in [0, TAU) to prevent unbounded drift
+                    h.0 = h.0.rem_euclid(std::f32::consts::TAU);
                 }
             }
         }
