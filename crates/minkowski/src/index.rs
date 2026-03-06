@@ -4,7 +4,7 @@ use std::ops::RangeBounds;
 
 use crate::component::Component;
 use crate::entity::Entity;
-use crate::query::fetch::Changed;
+use crate::tick::ChangeTick;
 use crate::world::World;
 
 /// A secondary spatial index that can be rebuilt from world state.
@@ -62,10 +62,10 @@ pub trait SpatialIndex {
 ///
 /// # Incremental updates
 ///
-/// [`SpatialIndex::update`] uses [`Changed<T>`] to scan only entities whose
-/// indexed component was mutated since the last call, making incremental
-/// maintenance proportional to the number of changes rather than total
-/// entity count.
+/// [`SpatialIndex::update`] uses per-index tick state to scan only entities
+/// whose indexed component was mutated since the last call. Each index
+/// instance tracks its own [`ChangeTick`], so multiple indexes on the same
+/// component type can call `update` independently without interfering.
 ///
 /// # Stale entries after despawn
 ///
@@ -77,6 +77,7 @@ pub trait SpatialIndex {
 pub struct BTreeIndex<T: Component + Ord + Clone> {
     tree: BTreeMap<T, Vec<Entity>>,
     reverse: HashMap<Entity, T>,
+    last_sync: ChangeTick,
 }
 
 impl<T: Component + Ord + Clone> BTreeIndex<T> {
@@ -85,6 +86,7 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
         Self {
             tree: BTreeMap::new(),
             reverse: HashMap::new(),
+            last_sync: ChangeTick::default(),
         }
     }
 
@@ -130,13 +132,16 @@ impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
         for (entity, value) in world.query::<(Entity, &T)>() {
             self.insert_entity(entity, value.clone());
         }
+        self.last_sync = world.change_tick();
     }
 
     fn update(&mut self, world: &mut World) {
-        for (entity, value, _) in world.query::<(Entity, &T, Changed<T>)>() {
+        let changed = world.query_changed_since::<T>(self.last_sync);
+        for (entity, value) in changed {
             self.remove_entity(entity);
-            self.insert_entity(entity, value.clone());
+            self.insert_entity(entity, value);
         }
+        self.last_sync = world.change_tick();
     }
 }
 
@@ -147,10 +152,10 @@ impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
 ///
 /// # Incremental updates
 ///
-/// [`SpatialIndex::update`] uses [`Changed<T>`] to scan only entities whose
-/// indexed component was mutated since the last call, making incremental
-/// maintenance proportional to the number of changes rather than total
-/// entity count.
+/// [`SpatialIndex::update`] uses per-index tick state to scan only entities
+/// whose indexed component was mutated since the last call. Each index
+/// instance tracks its own [`ChangeTick`], so multiple indexes on the same
+/// component type can call `update` independently without interfering.
 ///
 /// # Stale entries after despawn
 ///
@@ -162,6 +167,7 @@ impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
 pub struct HashIndex<T: Component + Hash + Eq + Clone> {
     map: HashMap<T, Vec<Entity>>,
     reverse: HashMap<Entity, T>,
+    last_sync: ChangeTick,
 }
 
 impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
@@ -170,6 +176,7 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
         Self {
             map: HashMap::new(),
             reverse: HashMap::new(),
+            last_sync: ChangeTick::default(),
         }
     }
 
@@ -210,13 +217,16 @@ impl<T: Component + Hash + Eq + Clone> SpatialIndex for HashIndex<T> {
         for (entity, value) in world.query::<(Entity, &T)>() {
             self.insert_entity(entity, value.clone());
         }
+        self.last_sync = world.change_tick();
     }
 
     fn update(&mut self, world: &mut World) {
-        for (entity, value, _) in world.query::<(Entity, &T, Changed<T>)>() {
+        let changed = world.query_changed_since::<T>(self.last_sync);
+        for (entity, value) in changed {
             self.remove_entity(entity);
-            self.insert_entity(entity, value.clone());
+            self.insert_entity(entity, value);
         }
+        self.last_sync = world.change_tick();
     }
 }
 
@@ -505,5 +515,31 @@ mod tests {
         for idx in &mut indexes {
             idx.update(&mut world);
         }
+    }
+
+    #[test]
+    fn two_indexes_same_component_independent_update() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let _e2 = world.spawn((Score(20),));
+
+        let mut btree = BTreeIndex::<Score>::new();
+        let mut hash = HashIndex::<Score>::new();
+        btree.rebuild(&mut world);
+        hash.rebuild(&mut world);
+
+        // Mutate e1
+        *world.get_mut::<Score>(e1).unwrap() = Score(30);
+
+        // Both indexes update sequentially — each has its own tick
+        btree.update(&mut world);
+        hash.update(&mut world);
+
+        // Both should see the change
+        assert!(btree.get(&Score(10)).is_empty());
+        assert_eq!(btree.get(&Score(30)).len(), 1);
+
+        assert!(hash.get(&Score(10)).is_empty());
+        assert_eq!(hash.get(&Score(30)).len(), 1);
     }
 }

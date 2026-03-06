@@ -68,15 +68,10 @@ fn main() {
         *world.get_mut::<Score>(e).unwrap() = Score(1000 + i as u32);
     }
 
-    // Incremental update — only changed archetypes rescanned.
-    //
-    // Note: Changed<T> is per-query-type, so BTreeIndex and HashIndex share
-    // the same query signature internally. Calling update on both would cause
-    // the second to miss the changes (the first already advanced the tick).
-    // In practice you'd pick one index type per component, or use rebuild for
-    // the second. Here we demonstrate update on btree, then rebuild on hash.
+    // Incremental update — each index tracks its own ChangeTick, so both
+    // see the same changes independently.
     btree.update(&mut world);
-    hash.rebuild(&mut world);
+    hash.update(&mut world);
 
     let high_scores: Vec<_> = btree
         .range(Score(1000)..)

@@ -82,7 +82,7 @@ pub mod query;
 pub mod reducer;
 pub mod storage;
 pub mod table;
-pub(crate) mod tick;
+pub mod tick;
 pub mod transaction;
 pub mod world;
 
@@ -99,5 +99,6 @@ pub use reducer::{
     EntityRef, QueryMut, QueryReducerId, QueryRef, QueryWriter, ReducerId, ReducerRegistry,
     Spawner, WritableRef, WriterQuery,
 };
+pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
 pub use world::World;

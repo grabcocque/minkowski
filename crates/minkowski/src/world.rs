@@ -143,6 +143,51 @@ impl World {
         self.id
     }
 
+    /// Return the current change tick. Secondary indexes store this to
+    /// track their sync point — see [`BTreeIndex`](crate::BTreeIndex).
+    pub fn change_tick(&self) -> crate::tick::ChangeTick {
+        crate::tick::ChangeTick(self.current_tick)
+    }
+
+    /// Iterate entities whose `T` column was mutably accessed after `since`.
+    ///
+    /// Unlike [`query::<Changed<T>>`](World::query), this method does **not**
+    /// use the shared query cache — the caller owns the tick, so multiple
+    /// indexes on the same component type can call this independently.
+    ///
+    /// Returns `(Entity, &T)` pairs from all matching archetypes.
+    pub fn query_changed_since<T: Component + Clone>(
+        &mut self,
+        since: crate::tick::ChangeTick,
+    ) -> Vec<(Entity, T)> {
+        self.drain_orphans();
+        let comp_id = match self.components.id::<T>() {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        let since_tick = since.0;
+        let mut results = Vec::new();
+
+        for arch in &self.archetypes.archetypes {
+            let col_idx = match arch.component_index.get(&comp_id) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if !arch.columns[col_idx].changed_tick.is_newer_than(since_tick) {
+                continue;
+            }
+            for row in 0..arch.len() {
+                let entity = arch.entities[row];
+                let ptr = unsafe { arch.columns[col_idx].get_ptr(row) as *const T };
+                let value = unsafe { (*ptr).clone() };
+                results.push((entity, value));
+            }
+        }
+
+        results
+    }
+
     /// Look up the ComponentId for a type. Returns None if the type has
     /// never been spawned or registered.
     pub fn component_id<T: Component>(&self) -> Option<ComponentId> {
