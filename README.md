@@ -188,7 +188,7 @@ Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each record
 ## Building & Testing
 
 ```
-cargo test -p minkowski                # 305 tests
+cargo test -p minkowski                # 320 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -200,7 +200,6 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 | Feature | Rationale |
 |---|---|
-| Query planning (Volcano model) | Optimize complex queries across indexes |
 | rkyv zero-copy snapshots | Zero-copy deserialization matching BlobVec layout |
 | Replication & sync | Filtered WAL replay for read replicas and client mirrors |
 
