@@ -386,8 +386,12 @@ impl BoidsSim {
             .map(|(p, v)| (p.x, p.y, v.x, v.y))
             .collect();
 
-        // Build grid
-        let cell_size = params.cohesion_radius;
+        // Build grid — cell size must cover the largest interaction radius
+        // so the 3x3 neighbor search finds all relevant boids.
+        let cell_size = params
+            .separation_radius
+            .max(params.alignment_radius)
+            .max(params.cohesion_radius);
         let grid_w = (params.world_size / cell_size).ceil() as usize;
         let mut cells: Vec<Vec<usize>> = vec![Vec::new(); grid_w * grid_w];
         for (i, &(x, y, _, _)) in snapshot.iter().enumerate() {
