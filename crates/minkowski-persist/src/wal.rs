@@ -287,6 +287,14 @@ impl Wal {
                     break;
                 }
             }
+            // If no mutations found anywhere (e.g. all earlier segments
+            // were truncated), the active segment's start_seq is the
+            // minimum safe next_seq — it was assigned from next_seq at
+            // rollover time, so reusing anything below it would collide
+            // with already-issued sequence numbers.
+            if wal.next_seq < wal.active_start_seq {
+                wal.next_seq = wal.active_start_seq;
+            }
         }
 
         Ok(wal)
@@ -1358,5 +1366,50 @@ mod tests {
         let mut cs = EnumChangeSet::new();
         cs.spawn_bundle(&mut world, e, (Pos { x: 99.0, y: 99.0 },));
         wal.append(&cs, &codecs).unwrap();
+    }
+
+    #[test]
+    fn open_after_truncate_all_does_not_reuse_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let last_seq;
+        {
+            let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
+
+            // Write enough to cause rollover into multiple segments
+            for i in 0..20 {
+                let e = world.alloc_entity();
+                let mut cs = EnumChangeSet::new();
+                cs.spawn_bundle(
+                    &mut world,
+                    e,
+                    (Pos {
+                        x: i as f32,
+                        y: 0.0,
+                    },),
+                );
+                wal.append(&cs, &codecs).unwrap();
+                cs.apply(&mut world);
+            }
+            assert!(wal.segment_count() > 1);
+
+            // Delete all old segments, leaving only the active one
+            wal.delete_segments_before(u64::MAX).unwrap();
+            last_seq = wal.next_seq();
+        }
+
+        // Reopen — next_seq must not regress below active_start_seq
+        let wal2 = Wal::open(&wal_dir, &codecs, small_config()).unwrap();
+        assert!(
+            wal2.next_seq() >= last_seq,
+            "next_seq {} regressed below {} after reopen with truncated segments",
+            wal2.next_seq(),
+            last_seq,
+        );
     }
 }
