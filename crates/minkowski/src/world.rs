@@ -343,11 +343,18 @@ impl World {
         let mut by_archetype: HashMap<usize, Vec<(usize, Entity)>> = HashMap::new();
         let mut to_dealloc: Vec<Entity> = Vec::new();
 
+        let mut seen = FixedBitSet::new();
         for &entity in entities {
             if !self.entities.is_alive(entity) {
                 continue;
             }
             let index = entity.index() as usize;
+            // Deduplicate: skip if we've already recorded this entity index
+            seen.grow(index + 1);
+            if seen.contains(index) {
+                continue;
+            }
+            seen.insert(index);
             let location = match self.entity_locations[index] {
                 Some(loc) => loc,
                 None => continue,
@@ -434,7 +441,7 @@ impl World {
             None => return false,
         };
         if self.components.is_sparse(comp_id) {
-            return self.sparse.contains::<T>(comp_id, entity);
+            return self.sparse.contains(comp_id, entity);
         }
         let archetype = &self.archetypes.archetypes[location.archetype_id.0];
         archetype.component_ids.contains(comp_id)
@@ -2068,9 +2075,9 @@ mod tests {
         let entity = world.spawn((Pos { x: 0.0, y: 0.0 },));
         world.insert_sparse(entity, Health(42));
         let comp_id = world.components.id::<Health>().unwrap();
-        assert!(world.sparse.contains::<Health>(comp_id, entity));
+        assert!(world.sparse.contains(comp_id, entity));
         world.despawn(entity);
-        assert!(!world.sparse.contains::<Health>(comp_id, entity));
+        assert!(!world.sparse.contains(comp_id, entity));
     }
 
     #[test]
@@ -2168,6 +2175,64 @@ mod tests {
         let comp_id = world.components.id::<Health>().unwrap();
         let count = world.despawn_batch(&[a, b]);
         assert_eq!(count, 2);
-        assert!(!world.sparse.contains::<Health>(comp_id, a));
+        assert!(!world.sparse.contains(comp_id, a));
+    }
+
+    #[test]
+    fn despawn_batch_duplicate_entity() {
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        // Same entity twice — must not double-drop
+        let count = world.despawn_batch(&[a, a, b]);
+        assert_eq!(count, 2); // a counted once
+        assert!(!world.is_alive(a));
+        assert!(!world.is_alive(b));
+    }
+
+    #[test]
+    fn despawn_batch_back_to_front_correctness() {
+        // Regression guard: if rows were processed front-to-back,
+        // the swap-remove would invalidate subsequent row indices.
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        let c = world.spawn((Pos { x: 3.0, y: 0.0 },));
+        let d = world.spawn((Pos { x: 4.0, y: 0.0 },));
+        let e = world.spawn((Pos { x: 5.0, y: 0.0 },));
+
+        // Despawn b(row 1) and c(row 2) — adjacent middle rows
+        // Front-to-back would: remove row 1 (e swaps in), then
+        // remove row 2 which is now d, not c. Back-to-front is correct.
+        world.despawn_batch(&[b, c]);
+
+        assert!(world.is_alive(a));
+        assert!(!world.is_alive(b));
+        assert!(!world.is_alive(c));
+        assert!(world.is_alive(d));
+        assert!(world.is_alive(e));
+        // Verify survivors have correct data
+        assert_eq!(world.get::<Pos>(a).unwrap().x, 1.0);
+        assert_eq!(world.get::<Pos>(d).unwrap().x, 4.0);
+        assert_eq!(world.get::<Pos>(e).unwrap().x, 5.0);
+    }
+
+    #[test]
+    fn despawn_batch_query_after() {
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let _b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        let c = world.spawn((Pos { x: 3.0, y: 0.0 },));
+        let _d = world.spawn((Pos { x: 4.0, y: 0.0 },));
+
+        world.despawn_batch(&[a, c]);
+
+        // Query iteration must yield exactly the survivors with correct values
+        let mut values = Vec::new();
+        world.query::<(&Pos,)>().for_each(|(pos,)| {
+            values.push(pos.x);
+        });
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, vec![2.0, 4.0]);
     }
 }

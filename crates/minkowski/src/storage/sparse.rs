@@ -15,7 +15,7 @@ const EMPTY: u32 = u32::MAX;
 pub(crate) struct PagedSparseSet {
     pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>,
     dense_entities: Vec<Entity>,
-    dense_values: BlobVec,
+    pub(crate) dense_values: BlobVec,
 }
 
 #[allow(dead_code)]
@@ -55,10 +55,10 @@ impl PagedSparseSet {
     }
 
     /// Returns a mutable pointer to the entity's value, or `None` if absent.
-    /// Semantically identical to `get` since BlobVec pointers are `*mut u8`,
-    /// but exists for API clarity.
-    pub fn get_mut(&self, entity: Entity) -> Option<*mut u8> {
-        self.get(entity)
+    /// Takes `&mut self` to prevent aliased `&mut T` from concurrent callers.
+    pub fn get_mut(&mut self, entity: Entity) -> Option<*mut u8> {
+        let dense = self.dense_index(entity)?;
+        Some(unsafe { self.dense_values.get_ptr(dense) })
     }
 
     /// Inserts a value for the given entity. If the entity already has a value,
@@ -80,6 +80,11 @@ impl PagedSparseSet {
             }
         } else {
             // New entry
+            debug_assert!(
+                self.dense_entities.len() < EMPTY as usize,
+                "PagedSparseSet overflow: {} entries exceeds u32 index space",
+                self.dense_entities.len()
+            );
             let dense = self.dense_entities.len() as u32;
             let idx = entity.index() as usize;
             let page_idx = idx / PAGE_SIZE;
@@ -221,6 +226,11 @@ impl SparseStorage {
 
     pub fn get<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> Option<&T> {
         let set = self.storages.get(&comp_id)?;
+        debug_assert_eq!(
+            set.dense_values.item_layout,
+            Layout::new::<T>(),
+            "SparseStorage type mismatch for ComponentId {comp_id}"
+        );
         let ptr = set.get(entity)?;
         Some(unsafe { &*(ptr as *const T) })
     }
@@ -230,13 +240,17 @@ impl SparseStorage {
         comp_id: ComponentId,
         entity: Entity,
     ) -> Option<&mut T> {
-        let set = self.storages.get(&comp_id)?;
+        let set = self.storages.get_mut(&comp_id)?;
+        debug_assert_eq!(
+            set.dense_values.item_layout,
+            Layout::new::<T>(),
+            "SparseStorage type mismatch for ComponentId {comp_id}"
+        );
         let ptr = set.get_mut(entity)?;
         Some(unsafe { &mut *(ptr as *mut T) })
     }
 
-    #[allow(clippy::extra_unused_type_parameters)]
-    pub fn contains<T: Component>(&self, comp_id: ComponentId, entity: Entity) -> bool {
+    pub fn contains(&self, comp_id: ComponentId, entity: Entity) -> bool {
         self.storages
             .get(&comp_id)
             .is_some_and(|set| set.contains(entity))
@@ -244,6 +258,11 @@ impl SparseStorage {
 
     pub fn remove<T: Component>(&mut self, comp_id: ComponentId, entity: Entity) -> Option<T> {
         let set = self.storages.get_mut(&comp_id)?;
+        debug_assert_eq!(
+            set.dense_values.item_layout,
+            Layout::new::<T>(),
+            "SparseStorage type mismatch for ComponentId {comp_id}"
+        );
         let ptr = set.get(entity)?;
         let value = unsafe { std::ptr::read(ptr as *const T) };
         set.remove_no_drop(entity);
@@ -410,6 +429,36 @@ mod tests {
             assert_eq!(collected[i].0, e);
             assert_eq!(collected[i].1, (i as u32) * 10);
         }
+    }
+
+    #[test]
+    fn insert_overwrite_drops_old_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Tracked(u32);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let mut set = make_set::<Tracked>();
+            let e = Entity::new(0, 0);
+            unsafe {
+                insert_val(&mut set, e, Tracked(1));
+                insert_val(&mut set, e, Tracked(2)); // overwrite — old dropped
+            }
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1); // old Tracked(1) dropped
+            let ptr = set.get(e).unwrap();
+            assert_eq!(unsafe { (*(ptr as *const Tracked)).0 }, 2);
+            // set drops here — Tracked(2) dropped
+        }
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
     }
 
     // ── SparseStorage tests ─────────────────────────────────────────
