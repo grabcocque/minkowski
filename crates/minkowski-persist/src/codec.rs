@@ -38,6 +38,16 @@ pub enum CodecError {
          call `codecs.register::<T>(&mut world)` for each component type before persisting"
     )]
     UnregisteredComponent(ComponentId),
+    #[error("schema mismatch for component '{name}': sender has size={sender_size} align={sender_align}, receiver has size={receiver_size} align={receiver_align}")]
+    SchemaMismatch {
+        name: String,
+        sender_size: usize,
+        sender_align: usize,
+        receiver_size: usize,
+        receiver_align: usize,
+    },
+    #[error("unknown component name in schema: '{0}'")]
+    UnknownComponentName(String),
 }
 
 struct ComponentCodec {
@@ -315,6 +325,37 @@ impl CodecRegistry {
             (codec.register_fn)(world);
         }
     }
+
+    /// Build a remap table from a sender's schema to the receiver's local IDs.
+    ///
+    /// For each entry in the sender's schema, resolves the stable name to a
+    /// local ComponentId and validates that size and align match. Returns a
+    /// mapping from sender ComponentId → receiver ComponentId.
+    pub fn build_remap(
+        &self,
+        schema: &[crate::record::WalComponentDef],
+    ) -> Result<HashMap<ComponentId, ComponentId>, CodecError> {
+        let mut remap = HashMap::new();
+        for def in schema {
+            let local_id = self
+                .resolve_name(&def.name)
+                .ok_or_else(|| CodecError::UnknownComponentName(def.name.clone()))?;
+            let local_layout = self
+                .layout(local_id)
+                .ok_or(CodecError::UnregisteredComponent(local_id))?;
+            if def.size != local_layout.size() || def.align != local_layout.align() {
+                return Err(CodecError::SchemaMismatch {
+                    name: def.name.clone(),
+                    sender_size: def.size,
+                    sender_align: def.align,
+                    receiver_size: local_layout.size(),
+                    receiver_align: local_layout.align(),
+                });
+            }
+            remap.insert(def.id, local_id);
+        }
+        Ok(remap)
+    }
 }
 
 impl Default for CodecRegistry {
@@ -442,5 +483,94 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register_as::<Pos>("collision", &mut world);
         codecs.register_as::<Vel>("collision", &mut world);
+    }
+
+    use crate::record::WalComponentDef;
+
+    #[test]
+    fn build_remap_same_order() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Vel>("vel", &mut world);
+
+        let schema = vec![
+            WalComponentDef {
+                id: 0,
+                name: "pos".into(),
+                size: std::mem::size_of::<Pos>(),
+                align: std::mem::align_of::<Pos>(),
+            },
+            WalComponentDef {
+                id: 1,
+                name: "vel".into(),
+                size: std::mem::size_of::<Vel>(),
+                align: std::mem::align_of::<Vel>(),
+            },
+        ];
+        let remap = codecs.build_remap(&schema).unwrap();
+        assert_eq!(remap.get(&0), Some(&0));
+        assert_eq!(remap.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn build_remap_different_order() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Vel>("vel", &mut world); // id=0 locally
+        codecs.register_as::<Pos>("pos", &mut world); // id=1 locally
+
+        // Sender had Pos=0, Vel=1
+        let schema = vec![
+            WalComponentDef {
+                id: 0,
+                name: "pos".into(),
+                size: std::mem::size_of::<Pos>(),
+                align: std::mem::align_of::<Pos>(),
+            },
+            WalComponentDef {
+                id: 1,
+                name: "vel".into(),
+                size: std::mem::size_of::<Vel>(),
+                align: std::mem::align_of::<Vel>(),
+            },
+        ];
+        let remap = codecs.build_remap(&schema).unwrap();
+        assert_eq!(remap.get(&0), Some(&1)); // sender 0 (pos) → receiver 1
+        assert_eq!(remap.get(&1), Some(&0)); // sender 1 (vel) → receiver 0
+    }
+
+    #[test]
+    fn build_remap_size_mismatch_is_error() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let schema = vec![WalComponentDef {
+            id: 0,
+            name: "pos".into(),
+            size: 999,
+            align: 4,
+        }];
+        let result = codecs.build_remap(&schema);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn build_remap_unknown_name_is_error() {
+        let codecs = CodecRegistry::new();
+        let schema = vec![WalComponentDef {
+            id: 0,
+            name: "nonexistent".into(),
+            size: 8,
+            align: 4,
+        }];
+        let result = codecs.build_remap(&schema);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown component name"));
     }
 }
