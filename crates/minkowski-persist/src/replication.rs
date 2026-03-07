@@ -34,12 +34,12 @@ impl WalCursor {
                     schema = Some(s);
                     pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), _next_pos)) => {
+                Some((WalEntry::Mutations(record), next_pos)) => {
                     if record.seq >= from_seq {
                         // Don't advance past this record — next_batch will read it
                         break;
                     }
-                    pos = _next_pos;
+                    pos = next_pos;
                 }
                 None => break,
             }
@@ -57,16 +57,12 @@ impl WalCursor {
     /// Returns a `ReplicationBatch` with the schema and records.
     /// An empty `records` vec means the cursor has caught up.
     pub fn next_batch(&mut self, limit: usize) -> Result<ReplicationBatch, WalError> {
-        let schema = self
-            .schema
-            .clone()
-            .unwrap_or_else(|| WalSchema { components: vec![] });
-
         let mut records = Vec::new();
 
         while records.len() < limit {
             match read_next_frame(&self.file, self.pos)? {
-                Some((WalEntry::Schema(_), next_pos)) => {
+                Some((WalEntry::Schema(s), next_pos)) => {
+                    self.schema = Some(s);
                     self.pos = next_pos;
                 }
                 Some((WalEntry::Mutations(record), next_pos)) => {
@@ -78,6 +74,10 @@ impl WalCursor {
             }
         }
 
+        let schema = self
+            .schema
+            .clone()
+            .unwrap_or_else(|| WalSchema { components: vec![] });
         Ok(ReplicationBatch { schema, records })
     }
 
@@ -119,22 +119,26 @@ impl ReplicationBatch {
 ///
 /// Builds a component ID remap from the batch schema, then applies each
 /// record atomically (one `EnumChangeSet` per record). Returns the last
-/// applied seq, or 0 if the batch is empty.
+/// applied seq, or `None` if the batch is empty.
+///
+/// Each record is applied as its own `EnumChangeSet` — per-record atomicity,
+/// not per-batch. On error, previously applied records are NOT rolled back;
+/// the caller can use the cursor's `next_seq()` to determine recovery position.
 pub fn apply_batch(
     batch: &ReplicationBatch,
     world: &mut World,
     codecs: &CodecRegistry,
-) -> Result<u64, WalError> {
+) -> Result<Option<u64>, WalError> {
     let remap: Option<HashMap<ComponentId, ComponentId>> = if batch.schema.components.is_empty() {
         None
     } else {
         Some(codecs.build_remap(&batch.schema.components)?)
     };
 
-    let mut last_seq = 0u64;
+    let mut last_seq = None;
     for record in &batch.records {
         apply_record(record, world, codecs, remap.as_ref())?;
-        last_seq = record.seq;
+        last_seq = Some(record.seq);
     }
 
     Ok(last_seq)
@@ -304,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_behind_error() {
+    fn cursor_behind_error_display() {
         let err = WalError::CursorBehind {
             requested: 0,
             oldest: 5,
@@ -331,7 +335,7 @@ mod tests {
 
         let last_seq = apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
 
-        assert_eq!(last_seq, 2);
+        assert_eq!(last_seq, Some(2));
         assert_eq!(replica.query::<(&Pos,)>().count(), 3);
     }
 
@@ -462,7 +466,39 @@ mod tests {
         let codecs = CodecRegistry::new();
 
         let last_seq = apply_batch(&batch, &mut world, &codecs).unwrap();
-        assert_eq!(last_seq, 0);
+        assert_eq!(last_seq, None);
+    }
+
+    // ── Error path tests ─────────────────────────────────────────
+
+    #[test]
+    fn from_bytes_corrupt_returns_error() {
+        let result = ReplicationBatch::from_bytes(&[0xFF; 32]);
+        assert!(matches!(result, Err(WalError::Format(_))));
+    }
+
+    #[test]
+    fn apply_batch_unknown_component_returns_error() {
+        let batch = ReplicationBatch {
+            schema: WalSchema {
+                components: vec![ComponentSchema {
+                    id: 0,
+                    name: "nonexistent_component".into(),
+                    size: 8,
+                    align: 4,
+                }],
+            },
+            records: vec![WalRecord {
+                seq: 0,
+                mutations: vec![],
+            }],
+        };
+
+        let mut world = World::new();
+        let codecs = CodecRegistry::new();
+
+        let result = apply_batch(&batch, &mut world, &codecs);
+        assert!(result.is_err());
     }
 
     // ── Integration test ───────────────────────────────────────────
@@ -526,7 +562,7 @@ mod tests {
         let last = apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
 
         assert_eq!(replica.query::<(&Pos,)>().count(), 8);
-        assert_eq!(last, 2);
+        assert_eq!(last, Some(2));
 
         // Cursor should be caught up
         let batch2 = cursor.next_batch(100).unwrap();

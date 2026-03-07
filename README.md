@@ -274,7 +274,7 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 
 ## License
 
-This project is licensed under the [GNU Affero GPL v3 (AGPL-3.0)](https://www.gnu.org/licenses/agpl-3.0.en.html).
+This project is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/).
 
 <!-- Link definitions -->
 [archetype]: https://ajmmertens.medium.com/building-an-ecs-2-archetypes-and-vectorization-fe21690f6d51

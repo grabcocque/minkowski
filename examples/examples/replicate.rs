@@ -123,7 +123,7 @@ fn main() {
     let batch = ReplicationBatch::from_bytes(&wire_bytes).unwrap();
 
     let last_seq = apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
-    println!("  Applied up to seq {}", last_seq);
+    println!("  Applied up to seq {:?}", last_seq);
 
     // -- Phase 5: Verify convergence --
     println!("Phase 5: Verifying convergence...");

@@ -30,10 +30,15 @@ pub enum WalError {
     CursorBehind { requested: u64, oldest: u64 },
 }
 
+/// Maximum WAL frame size (256 MB). Rejects corrupt length prefixes
+/// that would cause multi-gigabyte allocations.
+const MAX_FRAME_SIZE: usize = 256 * 1024 * 1024;
+
 /// Try to read the next WAL entry at byte offset `pos`.
-/// Returns `Ok(Some((entry, next_pos)))` on success, `Ok(None)` if EOF
-/// or the frame is incomplete/corrupt. Does NOT truncate the file —
-/// callers decide how to handle partial frames.
+/// Returns `Ok(Some((entry, next_pos)))` on success, `Ok(None)` if the
+/// file ends cleanly at a frame boundary or a partial frame is found
+/// (torn write). Returns `Err` on corrupt payload or oversized frame.
+/// Does NOT truncate the file — callers decide how to handle errors.
 pub(crate) fn read_next_frame(file: &File, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
     let mut len_buf = [0u8; 4];
     match read_exact_at(file, pos, &mut len_buf) {
@@ -42,16 +47,20 @@ pub(crate) fn read_next_frame(file: &File, pos: u64) -> Result<Option<(WalEntry,
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(WalError::Format(format!(
+            "WAL frame at offset {pos} claims {len} bytes, exceeding maximum {MAX_FRAME_SIZE}"
+        )));
+    }
     let mut payload = vec![0u8; len];
     match read_exact_at(file, pos + 4, &mut payload) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    match rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload) {
-        Ok(entry) => Ok(Some((entry, pos + 4 + len as u64))),
-        Err(_) => Ok(None),
-    }
+    let entry = rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload)
+        .map_err(|e| WalError::Format(format!("corrupt WAL entry at byte offset {pos}: {e}")))?;
+    Ok(Some((entry, pos + 4 + len as u64)))
 }
 
 /// Apply a single WAL record to a World, optionally remapping component IDs.
@@ -79,6 +88,11 @@ pub(crate) fn apply_record(
         match mutation {
             SerializedMutation::Spawn { entity, components } => {
                 let entity = Entity::from_bits(*entity);
+                // Ensure the entity's allocator slot exists so that
+                // subsequent mutations (Insert, etc.) can pass is_alive
+                // checks. The changeset Spawn path only checks
+                // !is_placed, but Insert checks is_alive which requires
+                // the generation entry.
                 world.alloc_entity();
 
                 let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
@@ -255,14 +269,16 @@ impl Wal {
     }
 
     /// Try to read and deserialize the next WAL entry starting at `pos`.
-    /// On EOF or corrupt data, truncates the file to `pos` (crash recovery).
+    /// On EOF, partial frame, or corrupt data, truncates the file to `pos`
+    /// (crash recovery) and returns `Ok(None)`.
     fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
-        match read_next_frame(&self.file, pos)? {
-            Some(result) => Ok(Some(result)),
-            None => {
+        match read_next_frame(&self.file, pos) {
+            Ok(Some(result)) => Ok(Some(result)),
+            Ok(None) | Err(WalError::Format(_)) => {
                 self.file.set_len(pos)?;
                 Ok(None)
             }
+            Err(e) => Err(e),
         }
     }
 
