@@ -12,10 +12,12 @@ mod pyregistry;
 mod pyworld;
 mod reducers;
 mod schema;
+mod spatial;
 
 #[pymodule]
 fn _minkowski(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pyworld::PyWorld>()?;
     m.add_class::<pyregistry::PyReducerRegistry>()?;
+    m.add_class::<spatial::PySpatialGrid>()?;
     Ok(())
 }

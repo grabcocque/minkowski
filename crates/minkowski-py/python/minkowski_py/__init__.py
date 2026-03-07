@@ -18,12 +18,12 @@ Quick start::
 """
 
 try:
-    from minkowski_py._minkowski import ReducerRegistry, World
+    from minkowski_py._minkowski import ReducerRegistry, SpatialGrid, World
 except ImportError as e:
     raise ImportError(
         "Failed to import Minkowski native module. "
         "Build with: cd crates/minkowski-py && maturin develop --release"
     ) from e
 
-__all__ = ["ReducerRegistry", "World"]
+__all__ = ["ReducerRegistry", "SpatialGrid", "World"]
 __version__ = "0.2.0"
