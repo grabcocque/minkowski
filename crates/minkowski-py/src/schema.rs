@@ -11,6 +11,7 @@ pub struct ComponentSchema {
     /// Minkowski ComponentId (resolved at registration)
     pub component_id: ComponentId,
     /// Size of the Rust struct in bytes
+    #[allow(dead_code)]
     pub size: usize,
     /// Arrow fields with byte offsets into the struct
     pub fields: Vec<FieldMapping>,
@@ -59,6 +60,7 @@ impl SchemaRegistry {
         names
     }
 
+    #[allow(dead_code)]
     pub fn name_for_id(&self, id: ComponentId) -> Option<&'static str> {
         self.id_to_name.get(&id).copied()
     }
