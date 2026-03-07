@@ -8,11 +8,14 @@ use pyo3::prelude::*;
 
 mod bridge;
 mod components;
+mod pyregistry;
 mod pyworld;
+mod reducers;
 mod schema;
 
 #[pymodule]
 fn _minkowski(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pyworld::PyWorld>()?;
+    m.add_class::<pyregistry::PyReducerRegistry>()?;
     Ok(())
 }
