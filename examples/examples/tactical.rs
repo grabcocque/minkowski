@@ -856,6 +856,14 @@ fn main() {
         let bits = entity.to_bits();
         let restored = Entity::from_bits(bits);
         assert_eq!(entity, restored, "entity bit round-trip failed");
+        // Demonstrate index() and generation() accessors
+        println!(
+            "    entity {:?}: index={}, generation={}, bits=0x{:016x}",
+            entity,
+            entity.index(),
+            entity.generation(),
+            bits
+        );
     }
     println!("  entity bit-packing round-trip: OK");
 
