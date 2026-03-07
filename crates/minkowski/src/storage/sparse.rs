@@ -280,6 +280,11 @@ impl SparseStorage {
         comp_id: ComponentId,
     ) -> Option<impl Iterator<Item = (Entity, &T)>> {
         let set = self.storages.get(&comp_id)?;
+        debug_assert_eq!(
+            set.dense_values.item_layout,
+            Layout::new::<T>(),
+            "SparseStorage type mismatch for ComponentId {comp_id}"
+        );
         let mut items = Vec::with_capacity(set.len());
         set.iter(|entity, ptr| {
             items.push((entity, unsafe { &*(ptr as *const T) }));
