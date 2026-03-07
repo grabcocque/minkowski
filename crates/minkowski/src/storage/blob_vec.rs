@@ -6,8 +6,8 @@ use crate::tick::Tick;
 /// Type-erased growable array. Stores raw bytes with a known `Layout`.
 /// Used as the column storage inside archetypes.
 pub(crate) struct BlobVec {
-    item_layout: Layout,
-    drop_fn: Option<unsafe fn(*mut u8)>,
+    pub(crate) item_layout: Layout,
+    pub(crate) drop_fn: Option<unsafe fn(*mut u8)>,
     data: NonNull<u8>,
     len: usize,
     capacity: usize,
