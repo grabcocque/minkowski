@@ -1,0 +1,14 @@
+[package]
+name = "minkowski-py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "_minkowski"
+crate-type = ["cdylib"]
+
+[dependencies]
+minkowski = { path = "../minkowski" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+fastrand = "2"

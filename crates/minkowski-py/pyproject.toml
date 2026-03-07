@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "minkowski-py"
+version = "0.1.0"
+description = "Python bindings for the Minkowski ECS engine"
+requires-python = ">=3.9"
+dependencies = [
+    "pyarrow>=14.0",
+    "polars>=0.20",
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+jupyter = ["jupyter", "ipywidgets"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "minkowski_py._minkowski"
