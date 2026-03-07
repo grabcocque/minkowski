@@ -92,40 +92,6 @@ pub fn register_all(
     // ── boids_forces ──
     // Snapshot positions+velocities, build spatial grid, compute
     // separation/alignment/cohesion forces, write accelerations.
-    let id = registry.register_query::<(&mut Acceleration, Entity), BoidsForceParams, _>(
-        world,
-        "boids_forces",
-        |mut query: QueryMut<'_, (&mut Acceleration, Entity)>, params: BoidsForceParams| {
-            // Snapshot all boid positions and velocities for neighbor lookup.
-            // We need Position and Velocity but the query only borrows Acceleration mutably.
-            // Build snapshot by collecting entity -> (pos, vel) from the query's world
-            // indirectly. Since QueryMut holds &mut World, we cannot query other components
-            // simultaneously. Instead, we do a two-pass approach:
-            //   Pass 1: zero accelerations and collect entities
-            //   Pass 2: done outside via a separate mechanism
-            //
-            // Actually, the QueryMut only locks Acceleration+Entity columns. We need to
-            // snapshot Position+Velocity before we start writing. The cleanest approach:
-            // collect entities first, then do force computation.
-            //
-            // But QueryMut<(&mut Acceleration, Entity)> gives us mutable Acceleration
-            // and Entity. We can't also query Position/Velocity through the same QueryMut.
-            //
-            // Solution: the reducer takes a wider query that includes all needed components.
-            // We'll re-register with the full query type.
-            //
-            // This is a placeholder — see the actual registration below.
-            query.for_each(|(acc, _entity)| {
-                acc.x = 0.0;
-                acc.y = 0.0;
-            });
-            let _ = params;
-        },
-    );
-    // Drop the placeholder and re-register with the correct query type.
-    let _ = id;
-
-    // Re-register boids_forces with the full query type.
     let id = registry
         .register_query::<(&mut Acceleration, &Position, &Velocity, Entity), BoidsForceParams, _>(
             world,
