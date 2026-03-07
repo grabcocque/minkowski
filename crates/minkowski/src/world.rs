@@ -333,6 +333,85 @@ impl World {
         true
     }
 
+    /// Despawn multiple entities efficiently. Groups by archetype, sorts rows
+    /// descending, and sweeps back-to-front so that swap-remove indices stay valid.
+    /// Returns the number of entities actually despawned (skips dead/unplaced).
+    pub fn despawn_batch(&mut self, entities: &[Entity]) -> usize {
+        self.drain_orphans();
+
+        // Phase 1: Filter alive+placed, group by archetype
+        let mut by_archetype: HashMap<usize, Vec<(usize, Entity)>> = HashMap::new();
+        let mut to_dealloc: Vec<Entity> = Vec::new();
+
+        for &entity in entities {
+            if !self.entities.is_alive(entity) {
+                continue;
+            }
+            let index = entity.index() as usize;
+            let location = match self.entity_locations[index] {
+                Some(loc) => loc,
+                None => continue,
+            };
+            by_archetype
+                .entry(location.archetype_id.0)
+                .or_default()
+                .push((location.row, entity));
+            to_dealloc.push(entity);
+        }
+
+        // Phase 2: Sparse cleanup BEFORE dealloc bumps generations
+        for &entity in &to_dealloc {
+            self.sparse.remove_all(entity);
+        }
+
+        // Phase 3: For each archetype, sort rows descending, sweep back-to-front
+        for (arch_idx, mut row_entities) in by_archetype {
+            row_entities.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let archetype = &mut self.archetypes.archetypes[arch_idx];
+
+            for &(row, _entity) in &row_entities {
+                let last = archetype.entities.len() - 1;
+
+                // Drop component data at this row
+                for col in &mut archetype.columns {
+                    unsafe {
+                        col.drop_in_place(row);
+                    }
+                }
+
+                // If not last, copy last element into gap
+                if row < last {
+                    for col in &mut archetype.columns {
+                        unsafe {
+                            col.copy_unchecked(last, row);
+                        }
+                    }
+                    let moved_entity = archetype.entities[last];
+                    archetype.entities[row] = moved_entity;
+                    self.entity_locations[moved_entity.index() as usize] = Some(EntityLocation {
+                        archetype_id: ArchetypeId(arch_idx),
+                        row,
+                    });
+                }
+
+                archetype.entities.truncate(last);
+                for col in &mut archetype.columns {
+                    unsafe {
+                        col.set_len(last);
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Dealloc entities and clear locations
+        for &entity in &to_dealloc {
+            self.entity_locations[entity.index() as usize] = None;
+            self.entities.dealloc(entity);
+        }
+
+        to_dealloc.len()
+    }
+
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.is_alive(entity)
     }
@@ -2020,5 +2099,75 @@ mod tests {
         let mut world = World::new();
         let results = world.get_batch_mut::<Health>(&[]);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn despawn_batch_multiple_same_archetype() {
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 2.0 },));
+        let c = world.spawn((Pos { x: 3.0, y: 3.0 },));
+        let d = world.spawn((Pos { x: 4.0, y: 4.0 },));
+        let count = world.despawn_batch(&[b, d]);
+        assert_eq!(count, 2);
+        assert!(!world.is_alive(b));
+        assert!(!world.is_alive(d));
+        assert!(world.is_alive(a));
+        assert!(world.is_alive(c));
+        assert_eq!(world.get::<Pos>(a).unwrap().x, 1.0);
+        assert_eq!(world.get::<Pos>(c).unwrap().x, 3.0);
+    }
+
+    #[test]
+    fn despawn_batch_multiple_archetypes() {
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+        let c = world.spawn((Pos { x: 3.0, y: 0.0 },));
+        let d = world.spawn((Pos { x: 4.0, y: 0.0 }, Vel { dx: 2.0, dy: 0.0 }));
+        let count = world.despawn_batch(&[a, d]);
+        assert_eq!(count, 2);
+        assert!(!world.is_alive(a));
+        assert!(!world.is_alive(d));
+        assert!(world.is_alive(b));
+        assert!(world.is_alive(c));
+    }
+
+    #[test]
+    fn despawn_batch_skips_dead() {
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        world.despawn(a);
+        let count = world.despawn_batch(&[a, b]);
+        assert_eq!(count, 1);
+        assert!(!world.is_alive(b));
+    }
+
+    #[test]
+    fn despawn_batch_single_entity() {
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.despawn_batch(&[a]), 1);
+        assert!(!world.is_alive(a));
+    }
+
+    #[test]
+    fn despawn_batch_empty() {
+        let mut world = World::new();
+        assert_eq!(world.despawn_batch(&[]), 0);
+    }
+
+    #[test]
+    fn despawn_batch_cleans_sparse() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        world.insert_sparse(a, Health(42));
+        let comp_id = world.components.id::<Health>().unwrap();
+        let count = world.despawn_batch(&[a, b]);
+        assert_eq!(count, 2);
+        assert!(!world.sparse.contains::<Health>(comp_id, a));
     }
 }
