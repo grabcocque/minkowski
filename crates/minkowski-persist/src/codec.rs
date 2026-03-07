@@ -38,10 +38,20 @@ pub enum CodecError {
          call `codecs.register::<T>(&mut world)` for each component type before persisting"
     )]
     UnregisteredComponent(ComponentId),
+    #[error("schema mismatch for component '{name}': sender has size={sender_size} align={sender_align}, receiver has size={receiver_size} align={receiver_align}")]
+    SchemaMismatch {
+        name: String,
+        sender_size: usize,
+        sender_align: usize,
+        receiver_size: usize,
+        receiver_align: usize,
+    },
+    #[error("unknown component name in schema: '{0}'")]
+    UnknownComponentName(String),
 }
 
 struct ComponentCodec {
-    name: &'static str,
+    name: String,
     layout: Layout,
     serialize_fn: SerializeFn,
     deserialize_fn: DeserializeFn,
@@ -59,17 +69,20 @@ struct ComponentCodec {
 /// different concerns, different crates, different lifetimes.
 pub struct CodecRegistry {
     codecs: HashMap<ComponentId, ComponentCodec>,
+    by_name: HashMap<String, ComponentId>,
 }
 
 impl CodecRegistry {
     pub fn new() -> Self {
         Self {
             codecs: HashMap::new(),
+            by_name: HashMap::new(),
         }
     }
 
     /// Register a component type for persistence.
     /// Requires rkyv Archive + Serialize + Deserialize bounds.
+    /// Uses `std::any::type_name::<T>()` as the default stable name.
     pub fn register<T>(&mut self, world: &mut World)
     where
         T: Component
@@ -80,9 +93,61 @@ impl CodecRegistry {
         T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
             + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
     {
+        let name = std::any::type_name::<T>().to_owned();
+        self.register_with_name::<T>(name, world);
+    }
+
+    /// Register a component type for persistence with an explicit stable name.
+    /// The name must be unique across all registered components — duplicate
+    /// names mapped to different ComponentIds will panic.
+    pub fn register_as<T>(&mut self, stable_name: &str, world: &mut World)
+    where
+        T: Component
+            + Archive
+            + for<'a> RkyvSerialize<
+                rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
+            > + Clone,
+        T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+    {
+        self.register_with_name::<T>(stable_name.to_owned(), world);
+    }
+
+    fn register_with_name<T>(&mut self, stable_name: String, world: &mut World)
+    where
+        T: Component
+            + Archive
+            + for<'a> RkyvSerialize<
+                rkyv::api::high::HighSerializer<Vec<u8>, ArenaHandle<'a>, rancor::Error>,
+            > + Clone,
+        T::Archived: RkyvDeserialize<T, rancor::Strategy<Pool, rancor::Error>>
+            + for<'a> CheckBytes<HighValidator<'a, rancor::Error>>,
+    {
         let comp_id = world.register_component::<T>();
+
+        // Idempotent: same type re-registered with same name is a no-op.
+        if let Some(existing) = self.codecs.get(&comp_id) {
+            assert!(
+                existing.name == stable_name,
+                "component already registered with name {:?}, cannot re-register as {:?}",
+                existing.name,
+                stable_name
+            );
+            return;
+        }
+
+        // Duplicate name to a different ComponentId is a hard error.
+        if let Some(&existing_id) = self.by_name.get(&stable_name) {
+            if existing_id != comp_id {
+                panic!(
+                    "duplicate stable name {:?}: already registered for ComponentId {}, \
+                     cannot register for ComponentId {}",
+                    stable_name, existing_id, comp_id
+                );
+            }
+        }
+
         let layout = Layout::new::<T>();
-        let name = std::any::type_name::<T>();
 
         // If the archived type has the same size as the native type, archived
         // bytes can be copied directly into BlobVec without rkyv::from_bytes.
@@ -143,10 +208,11 @@ impl CodecRegistry {
             Ok(())
         };
 
+        self.by_name.insert(stable_name.clone(), comp_id);
         self.codecs.insert(
             comp_id,
             ComponentCodec {
-                name,
+                name: stable_name,
                 layout,
                 serialize_fn,
                 deserialize_fn,
@@ -191,9 +257,15 @@ impl CodecRegistry {
         self.codecs.get(&id).map(|c| c.layout)
     }
 
-    /// Get the type name for a registered component.
-    pub fn name(&self, id: ComponentId) -> Option<&'static str> {
-        self.codecs.get(&id).map(|c| c.name)
+    /// Get the stable name for a registered component (explicit name from
+    /// `register_as`, or `type_name` default from `register`).
+    pub fn stable_name(&self, id: ComponentId) -> Option<&str> {
+        self.codecs.get(&id).map(|c| c.name.as_str())
+    }
+
+    /// Resolve a stable name to its ComponentId.
+    pub fn resolve_name(&self, name: &str) -> Option<ComponentId> {
+        self.by_name.get(name).copied()
     }
 
     /// Check if a component has a registered codec.
@@ -210,7 +282,9 @@ impl CodecRegistry {
 
     /// All registered ComponentIds.
     pub fn registered_ids(&self) -> Vec<ComponentId> {
-        self.codecs.keys().copied().collect()
+        let mut ids: Vec<_> = self.codecs.keys().copied().collect();
+        ids.sort();
+        ids
     }
 
     /// Serialize all entries for a sparse component.
@@ -248,6 +322,37 @@ impl CodecRegistry {
         if let Some(codec) = self.codecs.get(&id) {
             (codec.register_fn)(world);
         }
+    }
+
+    /// Build a remap table from a sender's schema to the receiver's local IDs.
+    ///
+    /// For each entry in the sender's schema, resolves the stable name to a
+    /// local ComponentId and validates that size and align match. Returns a
+    /// mapping from sender ComponentId → receiver ComponentId.
+    pub fn build_remap(
+        &self,
+        schema: &[crate::record::ComponentSchema],
+    ) -> Result<HashMap<ComponentId, ComponentId>, CodecError> {
+        let mut remap = HashMap::new();
+        for def in schema {
+            let local_id = self
+                .resolve_name(&def.name)
+                .ok_or_else(|| CodecError::UnknownComponentName(def.name.clone()))?;
+            let local_layout = self
+                .layout(local_id)
+                .ok_or(CodecError::UnregisteredComponent(local_id))?;
+            if def.size != local_layout.size() || def.align != local_layout.align() {
+                return Err(CodecError::SchemaMismatch {
+                    name: def.name.clone(),
+                    sender_size: def.size,
+                    sender_align: def.align,
+                    receiver_size: local_layout.size(),
+                    receiver_align: local_layout.align(),
+                });
+            }
+            remap.insert(def.id, local_id);
+        }
+        Ok(remap)
     }
 }
 
@@ -334,6 +439,171 @@ mod tests {
             codecs.layout(id).unwrap().size(),
             std::mem::size_of::<Pos>()
         );
-        assert!(codecs.name(id).unwrap().contains("Pos"));
+        assert!(codecs.stable_name(id).unwrap().contains("Pos"));
+    }
+
+    #[test]
+    fn register_as_assigns_stable_name() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        let id = world.component_id::<Pos>().unwrap();
+        assert_eq!(codecs.stable_name(id), Some("pos"));
+    }
+
+    #[test]
+    fn register_defaults_to_type_name() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        let id = world.component_id::<Pos>().unwrap();
+        let name = codecs.stable_name(id).unwrap();
+        assert!(
+            name.contains("Pos"),
+            "default name should contain type name, got: {name}"
+        );
+    }
+
+    #[test]
+    fn resolve_name_returns_component_id() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        let id = world.component_id::<Pos>().unwrap();
+        assert_eq!(codecs.resolve_name("pos"), Some(id));
+        assert_eq!(codecs.resolve_name("nonexistent"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate stable name")]
+    fn duplicate_name_panics() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("collision", &mut world);
+        codecs.register_as::<Vel>("collision", &mut world);
+    }
+
+    #[test]
+    fn register_as_idempotent_same_name() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("pos", &mut world); // no-op
+        assert_eq!(codecs.registered_ids().len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered with name")]
+    fn register_as_same_type_different_name_panics() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Pos>("position", &mut world);
+    }
+
+    use crate::record::ComponentSchema;
+
+    #[test]
+    fn build_remap_same_order() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Vel>("vel", &mut world);
+
+        let schema = vec![
+            ComponentSchema {
+                id: 0,
+                name: "pos".into(),
+                size: std::mem::size_of::<Pos>(),
+                align: std::mem::align_of::<Pos>(),
+            },
+            ComponentSchema {
+                id: 1,
+                name: "vel".into(),
+                size: std::mem::size_of::<Vel>(),
+                align: std::mem::align_of::<Vel>(),
+            },
+        ];
+        let remap = codecs.build_remap(&schema).unwrap();
+        assert_eq!(remap.get(&0), Some(&0));
+        assert_eq!(remap.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn build_remap_different_order() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Vel>("vel", &mut world); // id=0 locally
+        codecs.register_as::<Pos>("pos", &mut world); // id=1 locally
+
+        // Sender had Pos=0, Vel=1
+        let schema = vec![
+            ComponentSchema {
+                id: 0,
+                name: "pos".into(),
+                size: std::mem::size_of::<Pos>(),
+                align: std::mem::align_of::<Pos>(),
+            },
+            ComponentSchema {
+                id: 1,
+                name: "vel".into(),
+                size: std::mem::size_of::<Vel>(),
+                align: std::mem::align_of::<Vel>(),
+            },
+        ];
+        let remap = codecs.build_remap(&schema).unwrap();
+        assert_eq!(remap.get(&0), Some(&1)); // sender 0 (pos) → receiver 1
+        assert_eq!(remap.get(&1), Some(&0)); // sender 1 (vel) → receiver 0
+    }
+
+    #[test]
+    fn build_remap_size_mismatch_is_error() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let schema = vec![ComponentSchema {
+            id: 0,
+            name: "pos".into(),
+            size: 999,
+            align: 4,
+        }];
+        let result = codecs.build_remap(&schema);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn build_remap_align_mismatch_is_error() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let schema = vec![ComponentSchema {
+            id: 0,
+            name: "pos".into(),
+            size: std::mem::size_of::<Pos>(),
+            align: 16, // wrong alignment
+        }];
+        let result = codecs.build_remap(&schema);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn build_remap_unknown_name_is_error() {
+        let codecs = CodecRegistry::new();
+        let schema = vec![ComponentSchema {
+            id: 0,
+            name: "nonexistent".into(),
+            size: 8,
+            align: 4,
+        }];
+        let result = codecs.build_remap(&schema);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown component name"));
     }
 }

@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use minkowski::{Entity, EnumChangeSet, MutationRef, World};
+use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
 use crate::codec::{CodecError, CodecRegistry};
 use crate::format;
-use crate::record::SerializedMutation;
+use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 
 // WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
 // Each payload is a `WalRecord` serialized through rkyv.
@@ -36,26 +37,25 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Create a new WAL file. Fails if the file already exists.
-    pub fn create(path: &Path) -> Result<Self, WalError> {
+    /// Create a new WAL file with a schema preamble. Fails if the file already exists.
+    pub fn create(path: &Path, codecs: &CodecRegistry) -> Result<Self, WalError> {
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(path)?;
-        Ok(Self { file, next_seq: 0 })
+        let mut wal = Self { file, next_seq: 0 };
+        wal.write_schema_preamble(codecs)?;
+        Ok(wal)
     }
 
     /// Open an existing WAL file. Scans to find the next sequence number.
-    pub fn open(path: &Path) -> Result<Self, WalError> {
+    pub fn open(path: &Path, codecs: &CodecRegistry) -> Result<Self, WalError> {
+        let _ = codecs; // accepted for API symmetry; schema parsed during replay
         let file = OpenOptions::new().read(true).append(true).open(path)?;
         let mut wal = Self { file, next_seq: 0 };
-        let last = wal.scan_last_seq()?;
-        wal.next_seq = if last > 0 || wal.has_records()? {
-            last + 1
-        } else {
-            0
-        };
+        let (last, has_mutations) = wal.scan_last_seq()?;
+        wal.next_seq = if has_mutations { last + 1 } else { 0 };
         Ok(wal)
     }
 
@@ -73,8 +73,9 @@ impl Wal {
     ) -> Result<u64, WalError> {
         let seq = self.next_seq;
         let record = Self::changeset_to_record(seq, changeset, codecs)?;
+        let entry = WalEntry::Mutations(record);
         let payload =
-            format::serialize_record(&record).map_err(|e| WalError::Format(e.to_string()))?;
+            format::serialize_wal_entry(&entry).map_err(|e| WalError::Format(e.to_string()))?;
 
         let mut writer = BufWriter::new(&self.file);
         let len: u32 = payload.len().try_into().map_err(|_| {
@@ -99,6 +100,8 @@ impl Wal {
 
     /// Replay records starting from (and including) a given sequence number.
     /// If a torn entry is found, it is truncated and replay stops cleanly.
+    /// If the WAL contains a schema preamble, component IDs are remapped
+    /// from the sender's ID space to the receiver's via stable names.
     pub fn replay_from(
         &mut self,
         from_seq: u64,
@@ -107,11 +110,19 @@ impl Wal {
     ) -> Result<u64, WalError> {
         let mut pos: u64 = 0;
         let mut last_seq = if from_seq > 0 { from_seq - 1 } else { 0 };
+        let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
 
-        while let Some((record, next_pos)) = self.read_next_record(pos)? {
-            if record.seq >= from_seq {
-                Self::apply_record(&record, world, codecs)?;
-                last_seq = record.seq;
+        while let Some((entry, next_pos)) = self.read_next_entry(pos)? {
+            match entry {
+                WalEntry::Schema(schema) => {
+                    remap = Some(codecs.build_remap(&schema.components)?);
+                }
+                WalEntry::Mutations(record) => {
+                    if record.seq >= from_seq {
+                        Self::apply_record(&record, world, codecs, remap.as_ref())?;
+                        last_seq = record.seq;
+                    }
+                }
             }
             pos = next_pos;
         }
@@ -121,15 +132,39 @@ impl Wal {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    /// Try to read and deserialize the next WAL record starting at `pos`.
+    /// Write a schema preamble as the first entry in a new WAL file.
+    fn write_schema_preamble(&mut self, codecs: &CodecRegistry) -> Result<(), WalError> {
+        let mut components = Vec::new();
+        for &id in &codecs.registered_ids() {
+            let name = codecs.stable_name(id).unwrap().to_string();
+            let layout = codecs.layout(id).unwrap();
+            components.push(ComponentSchema {
+                id,
+                name,
+                size: layout.size(),
+                align: layout.align(),
+            });
+        }
+        let entry = WalEntry::Schema(WalSchema { components });
+        let payload =
+            format::serialize_wal_entry(&entry).map_err(|e| WalError::Format(e.to_string()))?;
+        let mut writer = BufWriter::new(&self.file);
+        let len: u32 = payload
+            .len()
+            .try_into()
+            .map_err(|_| WalError::Format("schema preamble too large".into()))?;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(&payload)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Try to read and deserialize the next WAL entry starting at `pos`.
     ///
-    /// Returns `Ok(Some((record, next_pos)))` on success, `Ok(None)` if the
+    /// Returns `Ok(Some((entry, next_pos)))` on success, `Ok(None)` if the
     /// file ends cleanly or a torn/corrupt entry was found (truncated to
     /// `pos`).
-    fn read_next_record(
-        &mut self,
-        pos: u64,
-    ) -> Result<Option<(crate::record::WalRecord, u64)>, WalError> {
+    fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
         let mut len_buf = [0u8; 4];
         match read_exact_at(&self.file, pos, &mut len_buf) {
             Ok(()) => {}
@@ -149,8 +184,12 @@ impl Wal {
             }
             Err(e) => return Err(e.into()),
         }
-        match format::deserialize_record(&payload) {
-            Ok(record) => Ok(Some((record, pos + 4 + len as u64))),
+        // NOTE: This intentionally does NOT fall back to deserialize_record().
+        // Pre-stable-identity WAL files used a different rkyv root type (bare
+        // WalRecord) and are not compatible with the WalEntry envelope. This is
+        // an intentional format break — there are no deployed WAL files to migrate.
+        match format::deserialize_wal_entry(&payload) {
+            Ok(entry) => Ok(Some((entry, pos + 4 + len as u64))),
             Err(_) => {
                 self.file.set_len(pos)?;
                 Ok(None)
@@ -224,7 +263,21 @@ impl Wal {
         record: &crate::record::WalRecord,
         world: &mut World,
         codecs: &CodecRegistry,
+        remap: Option<&HashMap<ComponentId, ComponentId>>,
     ) -> Result<(), WalError> {
+        // When no schema preamble exists (legacy WAL), use identity mapping.
+        // When a schema exists, unmapped IDs are an error — the sender wrote
+        // a mutation for a component not in its own preamble, which is corrupt.
+        let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
+            match remap {
+                None => Ok(id),
+                Some(r) => r
+                    .get(&id)
+                    .copied()
+                    .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
+            }
+        };
+
         let mut changeset = EnumChangeSet::new();
         for mutation in &record.mutations {
             match mutation {
@@ -244,11 +297,12 @@ impl Wal {
                         std::alloc::Layout,
                     )> = Vec::new();
                     for (comp_id, data) in components {
-                        let raw = codecs.deserialize(*comp_id, data)?;
+                        let local_id = remap_id(*comp_id)?;
+                        let raw = codecs.deserialize(local_id, data)?;
                         let layout = codecs
-                            .layout(*comp_id)
-                            .ok_or(CodecError::UnregisteredComponent(*comp_id))?;
-                        raw_components.push((*comp_id, raw, layout));
+                            .layout(local_id)
+                            .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                        raw_components.push((local_id, raw, layout));
                     }
                     let ptrs: Vec<_> = raw_components
                         .iter()
@@ -264,13 +318,14 @@ impl Wal {
                     component_id,
                     data,
                 } => {
-                    let raw = codecs.deserialize(*component_id, data)?;
+                    let local_id = remap_id(*component_id)?;
+                    let raw = codecs.deserialize(local_id, data)?;
                     let layout = codecs
-                        .layout(*component_id)
-                        .ok_or(CodecError::UnregisteredComponent(*component_id))?;
+                        .layout(local_id)
+                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
                     changeset.record_insert(
                         Entity::from_bits(*entity),
-                        *component_id,
+                        local_id,
                         raw.as_ptr(),
                         layout,
                     );
@@ -279,7 +334,7 @@ impl Wal {
                     entity,
                     component_id,
                 } => {
-                    changeset.record_remove(Entity::from_bits(*entity), *component_id);
+                    changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
                 }
             }
         }
@@ -293,22 +348,23 @@ impl Wal {
     // PERF: Full scan on open is required for crash recovery — the WAL has no
     // index or footer, so the only way to find the last valid record is linear
     // scan. This runs once at startup, not per-frame.
-    fn scan_last_seq(&mut self) -> Result<u64, WalError> {
+    /// Scan the WAL file to find the last valid mutation sequence number.
+    /// Returns `(last_seq, has_mutations)`. Schema entries are skipped.
+    fn scan_last_seq(&mut self) -> Result<(u64, bool), WalError> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut last_seq = 0u64;
+        let mut has_mutations = false;
         let mut pos: u64 = 0;
 
-        while let Some((record, next_pos)) = self.read_next_record(pos)? {
-            last_seq = record.seq;
+        while let Some((entry, next_pos)) = self.read_next_entry(pos)? {
+            if let WalEntry::Mutations(record) = entry {
+                last_seq = record.seq;
+                has_mutations = true;
+            }
             pos = next_pos;
         }
 
-        Ok(last_seq)
-    }
-
-    fn has_records(&mut self) -> Result<bool, WalError> {
-        let pos = self.file.seek(SeekFrom::End(0))?;
-        Ok(pos > 0)
+        Ok((last_seq, has_mutations))
     }
 }
 
@@ -342,7 +398,7 @@ mod tests {
         cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
 
         // Write the changeset to WAL before applying
-        let mut wal = Wal::create(&wal_path).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
         let seq = wal.append(&cs, &codecs).unwrap();
         assert_eq!(seq, 0);
         assert_eq!(wal.next_seq(), 1);
@@ -362,14 +418,14 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path).unwrap();
+            let mut wal = Wal::create(&wal_path, &codecs).unwrap();
             for _ in 0..3 {
                 let cs = EnumChangeSet::new(); // empty changeset
                 wal.append(&cs, &codecs).unwrap();
             }
         }
 
-        let wal2 = Wal::open(&wal_path).unwrap();
+        let wal2 = Wal::open(&wal_path, &codecs).unwrap();
         assert_eq!(wal2.next_seq(), 3);
     }
 
@@ -382,7 +438,7 @@ mod tests {
         let mut codecs = CodecRegistry::new();
         codecs.register::<Health>(&mut world);
 
-        let mut wal = Wal::create(&wal_path).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
 
         // Append 3 empty records
         for _ in 0..3 {
@@ -403,7 +459,7 @@ mod tests {
         let mut world = World::new();
         let codecs = CodecRegistry::new();
 
-        let mut wal = Wal::create(&wal_path).unwrap();
+        let mut wal = Wal::create(&wal_path, &codecs).unwrap();
         let last = wal.replay(&mut world, &codecs).unwrap();
         assert_eq!(last, 0);
     }
@@ -420,7 +476,7 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path).unwrap();
+            let mut wal = Wal::create(&wal_path, &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
         }
@@ -437,7 +493,7 @@ mod tests {
         let file_len_before = std::fs::metadata(&wal_path).unwrap().len();
 
         // open() should detect the torn entry, truncate it, and recover
-        let wal2 = Wal::open(&wal_path).unwrap();
+        let wal2 = Wal::open(&wal_path, &codecs).unwrap();
         assert_eq!(
             wal2.next_seq(),
             2,
@@ -459,7 +515,7 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path).unwrap();
+            let mut wal = Wal::create(&wal_path, &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
         }
 
@@ -471,7 +527,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let mut wal2 = Wal::open(&wal_path).unwrap();
+        let mut wal2 = Wal::open(&wal_path, &codecs).unwrap();
         let mut world2 = World::new();
         let last = wal2.replay(&mut world2, &codecs).unwrap();
         assert_eq!(last, 0, "should replay the one valid record");
@@ -489,7 +545,7 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path).unwrap();
+            let mut wal = Wal::create(&wal_path, &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
         }
@@ -510,7 +566,7 @@ mod tests {
         assert!(new_len > file_len, "garbage should have been appended");
 
         // open() should detect the corrupt record, truncate it, and recover
-        let wal2 = Wal::open(&wal_path).unwrap();
+        let wal2 = Wal::open(&wal_path, &codecs).unwrap();
         assert_eq!(
             wal2.next_seq(),
             2,
@@ -534,7 +590,7 @@ mod tests {
         codecs.register::<Health>(&mut world);
 
         {
-            let mut wal = Wal::create(&wal_path).unwrap();
+            let mut wal = Wal::create(&wal_path, &codecs).unwrap();
             wal.append(&EnumChangeSet::new(), &codecs).unwrap();
         }
 
@@ -547,12 +603,168 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let mut wal2 = Wal::open(&wal_path).unwrap();
+        let mut wal2 = Wal::open(&wal_path, &codecs).unwrap();
         let mut world2 = World::new();
         let last = wal2.replay(&mut world2, &codecs).unwrap();
         assert_eq!(last, 0, "should replay the one valid record");
 
         let after_len = std::fs::metadata(&wal_path).unwrap().len();
         assert_eq!(after_len, file_len, "corrupt record should be truncated");
+    }
+
+    #[test]
+    fn create_writes_schema_preamble() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("schema.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+        codecs.register_as::<Health>("health", &mut world);
+
+        let _wal = Wal::create(&wal_path, &codecs).unwrap();
+
+        // Re-open and verify schema is readable and seq starts at 0
+        let wal2 = Wal::open(&wal_path, &codecs).unwrap();
+        assert_eq!(wal2.next_seq(), 0);
+    }
+
+    #[test]
+    fn wal_without_schema_preamble_replays_with_identity_mapping() {
+        // WAL with Mutations entries but no Schema preamble — replay uses
+        // identity mapping (no remap). Note: this is NOT backwards-compatible
+        // with pre-stable-identity WAL files (which used a different rkyv root
+        // type). This tests the "no schema" branch of the new format.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("legacy.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        // Manually write a WAL with only Mutations (no Schema preamble)
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .read(true)
+                .open(&wal_path)
+                .unwrap();
+
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(&mut world, e, (Pos { x: 42.0, y: 99.0 },));
+
+            // Build mutation record manually
+            let mut mutations = Vec::new();
+            for m in cs.iter_mutations() {
+                mutations.push(Wal::serialize_mutation(&m, &codecs).unwrap());
+            }
+            let record = crate::record::WalRecord { seq: 0, mutations };
+            let entry = WalEntry::Mutations(record);
+            let payload = crate::format::serialize_wal_entry(&entry).unwrap();
+
+            let mut writer = std::io::BufWriter::new(&file);
+            writer
+                .write_all(&(payload.len() as u32).to_le_bytes())
+                .unwrap();
+            writer.write_all(&payload).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Open and replay — should work without schema (no remapping)
+        let mut wal = Wal::open(&wal_path, &codecs).unwrap();
+        let mut world2 = World::new();
+        codecs.register_one(world.component_id::<Pos>().unwrap(), &mut world2);
+
+        let last = wal.replay(&mut world2, &codecs).unwrap();
+        assert_eq!(last, 0);
+        assert_eq!(world2.query::<(&Pos,)>().count(), 1);
+        let p = world2.query::<(&Pos,)>().next().unwrap().0;
+        assert_eq!(p.x, 42.0);
+        assert_eq!(p.y, 99.0);
+    }
+
+    #[test]
+    fn wal_cross_process_different_registration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("cross.wal");
+
+        // "Process A": Pos=0, Health=1
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Health>("health", &mut world_a);
+
+        let mut wal = Wal::create(&wal_path, &codecs_a).unwrap();
+
+        let e = world_a.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 }, Health(100)));
+        wal.append(&cs, &codecs_a).unwrap();
+        cs.apply(&mut world_a);
+
+        drop(wal);
+
+        // "Process B": Health=0, Pos=1 (opposite order)
+        let mut world_b = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Health>("health", &mut world_b);
+        codecs_b.register_as::<Pos>("pos", &mut world_b);
+
+        let mut wal_b = Wal::open(&wal_path, &codecs_b).unwrap();
+        wal_b.replay(&mut world_b, &codecs_b).unwrap();
+
+        // Verify: data is correct despite different registration order
+        let positions: Vec<(f32, f32)> =
+            world_b.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions, vec![(1.0, 2.0)]);
+
+        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        assert_eq!(health, vec![100]);
+    }
+
+    #[test]
+    fn wal_cross_process_insert_and_remove_remapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("cross_insert.wal");
+
+        // "Process A": Pos=0, Health=1
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Health>("health", &mut world_a);
+
+        let mut wal = Wal::create(&wal_path, &codecs_a).unwrap();
+
+        // Spawn with Pos only
+        let e = world_a.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world_a, e, (Pos { x: 1.0, y: 2.0 },));
+        wal.append(&cs, &codecs_a).unwrap();
+        cs.apply(&mut world_a);
+
+        // Insert Health, then Remove Pos
+        let mut cs2 = EnumChangeSet::new();
+        cs2.insert::<Health>(&mut world_a, e, Health(50));
+        cs2.remove::<Pos>(&mut world_a, e);
+        wal.append(&cs2, &codecs_a).unwrap();
+        cs2.apply(&mut world_a);
+
+        drop(wal);
+
+        // "Process B": opposite order
+        let mut world_b = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Health>("health", &mut world_b);
+        codecs_b.register_as::<Pos>("pos", &mut world_b);
+
+        let mut wal_b = Wal::open(&wal_path, &codecs_b).unwrap();
+        wal_b.replay(&mut world_b, &codecs_b).unwrap();
+
+        // Entity should have Health(50) but no Pos
+        let health: Vec<u32> = world_b.query::<(&Health,)>().map(|h| h.0 .0).collect();
+        assert_eq!(health, vec![50]);
+        assert_eq!(world_b.query::<(&Pos,)>().count(), 0);
     }
 }
