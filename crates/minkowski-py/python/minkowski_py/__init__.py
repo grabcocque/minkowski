@@ -1,37 +1,29 @@
-"""Minkowski ECS — Python bindings for high-performance entity-component simulations.
+"""Minkowski ECS — Python bindings for the Minkowski entity-component system.
 
 Quick start::
 
     import minkowski_py as mk
 
-    # Boids flocking simulation
-    sim = mk.BoidsSim(n=2000, world_size=500.0)
-    sim.step(100, record=True)
-    df = sim.to_polars()          # Polars DataFrame
-    history = sim.history_to_polars()
+    world = mk.World()
+    registry = mk.ReducerRegistry(world)
 
-    # N-body gravity
-    sim = mk.NBodySim(n=500)
-    sim.step(200, record=True)
-    df = sim.to_polars()
+    # Spawn entities
+    world.spawn("Position,Velocity", pos_x=0.0, pos_y=0.0, vel_x=1.0, vel_y=0.0)
 
-    # Game of Life
-    sim = mk.LifeSim(width=64, height=64)
-    sim.step(100, record=True)
-    df = sim.to_polars()
+    # Query as Polars DataFrame
+    df = world.query("Position", "Velocity")
 
-All simulations export data via Apache Arrow for efficient columnar handoff
-to Polars DataFrames. Use ``to_arrow()`` for PyArrow tables, ``to_polars()``
-for current state, and ``history_to_polars()`` for recorded trajectory data.
+    # Run a Rust reducer
+    registry.run("movement", world, dt=0.016)
 """
 
 try:
-    from minkowski_py._minkowski import BoidsSim, LifeSim, NBodySim
+    from minkowski_py._minkowski import ReducerRegistry, World
 except ImportError as e:
     raise ImportError(
         "Failed to import Minkowski native module. "
         "Build with: cd crates/minkowski-py && maturin develop --release"
     ) from e
 
-__all__ = ["BoidsSim", "LifeSim", "NBodySim"]
-__version__ = "0.1.0"
+__all__ = ["ReducerRegistry", "World"]
+__version__ = "0.2.0"
