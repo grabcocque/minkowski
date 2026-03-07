@@ -26,6 +26,102 @@ pub enum WalError {
     Codec(#[from] CodecError),
     #[error("WAL format error: {0}")]
     Format(String),
+    #[error("cursor behind: requested seq {requested} but oldest available is {oldest}")]
+    CursorBehind { requested: u64, oldest: u64 },
+}
+
+/// Try to read the next WAL entry at byte offset `pos`.
+/// Returns `Ok(Some((entry, next_pos)))` on success, `Ok(None)` if EOF
+/// or the frame is incomplete/corrupt. Does NOT truncate the file —
+/// callers decide how to handle partial frames.
+pub(crate) fn read_next_frame(file: &File, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
+    let mut len_buf = [0u8; 4];
+    match read_exact_at(file, pos, &mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    match read_exact_at(file, pos + 4, &mut payload) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    match rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload) {
+        Ok(entry) => Ok(Some((entry, pos + 4 + len as u64))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Apply a single WAL record to a World, optionally remapping component IDs.
+pub(crate) fn apply_record(
+    record: &crate::record::WalRecord,
+    world: &mut World,
+    codecs: &CodecRegistry,
+    remap: Option<&HashMap<ComponentId, ComponentId>>,
+) -> Result<(), WalError> {
+    // When no schema preamble exists (legacy WAL), use identity mapping.
+    // When a schema exists, unmapped IDs are an error — the sender wrote
+    // a mutation for a component not in its own preamble, which is corrupt.
+    let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
+        match remap {
+            None => Ok(id),
+            Some(r) => r
+                .get(&id)
+                .copied()
+                .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
+        }
+    };
+
+    let mut changeset = EnumChangeSet::new();
+    for mutation in &record.mutations {
+        match mutation {
+            SerializedMutation::Spawn { entity, components } => {
+                let entity = Entity::from_bits(*entity);
+                world.alloc_entity();
+
+                let mut raw_components: Vec<(minkowski::ComponentId, Vec<u8>, std::alloc::Layout)> =
+                    Vec::new();
+                for (comp_id, data) in components {
+                    let local_id = remap_id(*comp_id)?;
+                    let raw = codecs.deserialize(local_id, data)?;
+                    let layout = codecs
+                        .layout(local_id)
+                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                    raw_components.push((local_id, raw, layout));
+                }
+                let ptrs: Vec<_> = raw_components
+                    .iter()
+                    .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
+                    .collect();
+                changeset.record_spawn(entity, &ptrs);
+            }
+            SerializedMutation::Despawn { entity } => {
+                changeset.record_despawn(Entity::from_bits(*entity));
+            }
+            SerializedMutation::Insert {
+                entity,
+                component_id,
+                data,
+            } => {
+                let local_id = remap_id(*component_id)?;
+                let raw = codecs.deserialize(local_id, data)?;
+                let layout = codecs
+                    .layout(local_id)
+                    .ok_or(CodecError::UnregisteredComponent(local_id))?;
+                changeset.record_insert(Entity::from_bits(*entity), local_id, raw.as_ptr(), layout);
+            }
+            SerializedMutation::Remove {
+                entity,
+                component_id,
+            } => {
+                changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
+            }
+        }
+    }
+    changeset.apply(world);
+    Ok(())
 }
 
 /// Append-only write-ahead log. Each record is an rkyv-serialized changeset
@@ -118,7 +214,7 @@ impl Wal {
                 }
                 WalEntry::Mutations(record) => {
                     if record.seq >= from_seq {
-                        Self::apply_record(&record, world, codecs, remap.as_ref())?;
+                        apply_record(&record, world, codecs, remap.as_ref())?;
                         last_seq = record.seq;
                     }
                 }
@@ -159,37 +255,11 @@ impl Wal {
     }
 
     /// Try to read and deserialize the next WAL entry starting at `pos`.
-    ///
-    /// Returns `Ok(Some((entry, next_pos)))` on success, `Ok(None)` if the
-    /// file ends cleanly or a torn/corrupt entry was found (truncated to
-    /// `pos`).
+    /// On EOF or corrupt data, truncates the file to `pos` (crash recovery).
     fn read_next_entry(&mut self, pos: u64) -> Result<Option<(WalEntry, u64)>, WalError> {
-        let mut len_buf = [0u8; 4];
-        match read_exact_at(&self.file, pos, &mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                self.file.set_len(pos)?;
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        match read_exact_at(&self.file, pos + 4, &mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                self.file.set_len(pos)?;
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
-        }
-        // NOTE: This intentionally does NOT fall back to deserialize_record().
-        // Pre-stable-identity WAL files used a different rkyv root type (bare
-        // WalRecord) and are not compatible with the WalEntry envelope. This is
-        // an intentional format break — there are no deployed WAL files to migrate.
-        match rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&payload) {
-            Ok(entry) => Ok(Some((entry, pos + 4 + len as u64))),
-            Err(_) => {
+        match read_next_frame(&self.file, pos)? {
+            Some(result) => Ok(Some(result)),
+            None => {
                 self.file.set_len(pos)?;
                 Ok(None)
             }
@@ -256,89 +326,6 @@ impl Wal {
                 component_id: *component_id,
             }),
         }
-    }
-
-    fn apply_record(
-        record: &crate::record::WalRecord,
-        world: &mut World,
-        codecs: &CodecRegistry,
-        remap: Option<&HashMap<ComponentId, ComponentId>>,
-    ) -> Result<(), WalError> {
-        // When no schema preamble exists (legacy WAL), use identity mapping.
-        // When a schema exists, unmapped IDs are an error — the sender wrote
-        // a mutation for a component not in its own preamble, which is corrupt.
-        let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
-            match remap {
-                None => Ok(id),
-                Some(r) => r
-                    .get(&id)
-                    .copied()
-                    .ok_or(WalError::Codec(CodecError::UnregisteredComponent(id))),
-            }
-        };
-
-        let mut changeset = EnumChangeSet::new();
-        for mutation in &record.mutations {
-            match mutation {
-                SerializedMutation::Spawn { entity, components } => {
-                    let entity = Entity::from_bits(*entity);
-
-                    // Ensure the entity's allocator slot exists so that
-                    // subsequent mutations (Insert, etc.) can pass is_alive
-                    // checks. The changeset Spawn path only checks
-                    // !is_placed, but Insert checks is_alive which requires
-                    // the generation entry.
-                    world.alloc_entity();
-
-                    let mut raw_components: Vec<(
-                        minkowski::ComponentId,
-                        Vec<u8>,
-                        std::alloc::Layout,
-                    )> = Vec::new();
-                    for (comp_id, data) in components {
-                        let local_id = remap_id(*comp_id)?;
-                        let raw = codecs.deserialize(local_id, data)?;
-                        let layout = codecs
-                            .layout(local_id)
-                            .ok_or(CodecError::UnregisteredComponent(local_id))?;
-                        raw_components.push((local_id, raw, layout));
-                    }
-                    let ptrs: Vec<_> = raw_components
-                        .iter()
-                        .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
-                        .collect();
-                    changeset.record_spawn(entity, &ptrs);
-                }
-                SerializedMutation::Despawn { entity } => {
-                    changeset.record_despawn(Entity::from_bits(*entity));
-                }
-                SerializedMutation::Insert {
-                    entity,
-                    component_id,
-                    data,
-                } => {
-                    let local_id = remap_id(*component_id)?;
-                    let raw = codecs.deserialize(local_id, data)?;
-                    let layout = codecs
-                        .layout(local_id)
-                        .ok_or(CodecError::UnregisteredComponent(local_id))?;
-                    changeset.record_insert(
-                        Entity::from_bits(*entity),
-                        local_id,
-                        raw.as_ptr(),
-                        layout,
-                    );
-                }
-                SerializedMutation::Remove {
-                    entity,
-                    component_id,
-                } => {
-                    changeset.record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
-                }
-            }
-        }
-        changeset.apply(world);
-        Ok(())
     }
 
     /// Scan the WAL file to find the last valid sequence number.
