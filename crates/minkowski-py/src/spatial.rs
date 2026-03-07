@@ -72,10 +72,12 @@ impl PySpatialGrid {
         let xw = x.rem_euclid(ws);
         let yw = y.rem_euclid(ws);
 
-        let cells_r = (radius * inv).ceil() as i32;
         let cx = (xw * inv) as i32;
         let cy = (yw * inv) as i32;
         let grid_cells = (ws * inv).ceil() as i32;
+        // Clamp scan radius so we never wrap around and visit the same cell twice.
+        let cells_r = (radius * inv).ceil() as i32;
+        let cells_r = cells_r.min(grid_cells / 2);
 
         let mut result = Vec::new();
         for dx in -cells_r..=cells_r {
