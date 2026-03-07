@@ -6,10 +6,24 @@ use crate::codec::CodecRegistry;
 use crate::snapshot::Snapshot;
 use crate::wal::Wal;
 
-/// Callback invoked by [`Durable`](crate::Durable) when the WAL exceeds
-/// `max_bytes_between_checkpoints` without a snapshot acknowledgment.
+/// Callback invoked when the WAL has accumulated more mutation bytes than
+/// the configured `max_bytes_between_checkpoints` threshold without a
+/// snapshot acknowledgment. The default consumer is [`Durable`](crate::Durable).
+///
+/// Implementations should call [`Wal::acknowledge_snapshot`] on success to
+/// reset the byte counter. If they do not, `checkpoint_needed()` will
+/// remain true and the handler will fire again on the next commit.
+///
+/// Returning `Err` is non-fatal: the transaction that triggered the
+/// checkpoint has already been committed and applied. The engine will
+/// retry on the next commit that exceeds the threshold.
 pub trait CheckpointHandler: Send {
-    fn on_checkpoint_needed(&mut self, world: &mut World, wal: &mut Wal, codecs: &CodecRegistry);
+    fn on_checkpoint_needed(
+        &mut self,
+        world: &mut World,
+        wal: &mut Wal,
+        codecs: &CodecRegistry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Default checkpoint handler: saves a snapshot and acknowledges it.
@@ -28,14 +42,18 @@ impl AutoCheckpoint {
 }
 
 impl CheckpointHandler for AutoCheckpoint {
-    fn on_checkpoint_needed(&mut self, world: &mut World, wal: &mut Wal, codecs: &CodecRegistry) {
+    fn on_checkpoint_needed(
+        &mut self,
+        world: &mut World,
+        wal: &mut Wal,
+        codecs: &CodecRegistry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let seq = wal.next_seq();
         let path = self.snap_dir.join(format!("checkpoint-{seq:06}.snap"));
         let snap = Snapshot::new();
-        snap.save(&path, world, codecs, seq)
-            .expect("checkpoint snapshot failed");
-        wal.acknowledge_snapshot(seq)
-            .expect("checkpoint acknowledge failed");
+        snap.save(&path, world, codecs, seq)?;
+        wal.acknowledge_snapshot(seq)?;
+        Ok(())
     }
 }
 
@@ -89,7 +107,9 @@ mod tests {
         assert!(wal.checkpoint_needed());
 
         let mut handler = AutoCheckpoint::new(&snap_dir);
-        handler.on_checkpoint_needed(&mut world, &mut wal, &codecs);
+        handler
+            .on_checkpoint_needed(&mut world, &mut wal, &codecs)
+            .unwrap();
 
         assert!(!wal.checkpoint_needed());
         assert!(wal.last_checkpoint_seq().is_some());

@@ -90,12 +90,15 @@ impl<S: Transact> Transact for Durable<S> {
                         .expect("WAL write failed — durable commit impossible");
                     forward.apply(world);
 
-                    // Fire checkpoint handler if threshold exceeded
+                    // Fire checkpoint handler if threshold exceeded.
+                    // Checkpoint is best-effort — the transaction is already
+                    // committed and applied. Errors are non-fatal; the handler
+                    // will be retried on the next commit that exceeds the threshold.
                     if let Some(ref handler_mutex) = self.checkpoint_handler {
                         let mut wal = self.wal.lock();
                         if wal.checkpoint_needed() {
                             let mut handler = handler_mutex.lock();
-                            handler.on_checkpoint_needed(world, &mut wal, &self.codecs);
+                            let _ = handler.on_checkpoint_needed(world, &mut wal, &self.codecs);
                         }
                     }
 
@@ -194,9 +197,10 @@ mod tests {
             _world: &mut World,
             wal: &mut Wal,
             _codecs: &CodecRegistry,
-        ) {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            wal.acknowledge_snapshot(wal.next_seq()).unwrap();
+            wal.acknowledge_snapshot(wal.next_seq())?;
+            Ok(())
         }
     }
 

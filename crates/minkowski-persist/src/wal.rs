@@ -8,8 +8,9 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 use crate::codec::{CodecError, CodecRegistry};
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 
-// WAL file format: `[len: u32 LE][payload: len bytes]` repeated.
-// Each payload is a `WalRecord` serialized through rkyv.
+// WAL frame format: `[len: u32 LE][payload: len bytes]` repeated.
+// Each payload is a `WalEntry` (Schema | Mutations | Checkpoint) serialized
+// through rkyv.
 
 /// Read exactly `buf.len()` bytes from `file` starting at byte offset `pos`.
 fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -118,9 +119,9 @@ pub(crate) fn apply_record(
     codecs: &CodecRegistry,
     remap: Option<&HashMap<ComponentId, ComponentId>>,
 ) -> Result<(), WalError> {
-    // When no schema preamble exists (legacy WAL), use identity mapping.
-    // When a schema exists, unmapped IDs are an error — the sender wrote
-    // a mutation for a component not in its own preamble, which is corrupt.
+    // When no remap is provided, use identity mapping (same-process replay).
+    // When a schema-derived remap exists, unmapped IDs are an error — the
+    // sender wrote a mutation for a component not in its own preamble.
     let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
         match remap {
             None => Ok(id),
@@ -238,7 +239,7 @@ impl Wal {
             ));
         }
 
-        let (_last_start_seq, last_path) = segments.last().unwrap().clone();
+        let (last_start_seq, last_path) = segments.last().unwrap().clone();
 
         let file = OpenOptions::new()
             .read(true)
@@ -250,7 +251,7 @@ impl Wal {
         let mut wal = Self {
             dir: dir.to_path_buf(),
             active_file: file,
-            active_start_seq: _last_start_seq,
+            active_start_seq: last_start_seq,
             active_bytes: 0,
             next_seq: 0,
             config,
@@ -305,6 +306,42 @@ impl Wal {
             }
         }
 
+        // If scan_active_segment did not find a checkpoint, scan sealed
+        // segments in reverse to recover the most recent one. Accumulate
+        // mutation bytes between that checkpoint and the active segment
+        // so bytes_since_checkpoint is accurate across segment boundaries.
+        if wal.last_checkpoint_seq.is_none() {
+            for (_, seg_path) in segments.iter().rev().skip(1) {
+                let seg_file = File::open(seg_path)?;
+                let mut pos: u64 = 0;
+                let mut seg_mutation_bytes: u64 = 0;
+                let mut found = false;
+                while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
+                    let frame_bytes = next_pos - pos;
+                    match entry {
+                        WalEntry::Checkpoint { snapshot_seq } => {
+                            wal.last_checkpoint_seq = Some(snapshot_seq);
+                            seg_mutation_bytes = 0;
+                            found = true;
+                        }
+                        WalEntry::Mutations(_) => {
+                            seg_mutation_bytes += frame_bytes;
+                        }
+                        WalEntry::Schema(_) => {}
+                    }
+                    pos = next_pos;
+                }
+                // bytes_since_checkpoint already holds the active segment's
+                // mutation bytes (from scan_active_segment). Add mutation
+                // bytes from this sealed segment that came after the last
+                // checkpoint (or all of them if no checkpoint in this segment).
+                wal.bytes_since_checkpoint += seg_mutation_bytes;
+                if found {
+                    break;
+                }
+            }
+        }
+
         Ok(wal)
     }
 
@@ -330,6 +367,11 @@ impl Wal {
     /// Record that a snapshot was taken at the given seq.
     /// Writes a `Checkpoint` entry to the WAL stream and resets the byte counter.
     pub fn acknowledge_snapshot(&mut self, seq: u64) -> Result<(), WalError> {
+        assert!(
+            seq <= self.next_seq,
+            "cannot checkpoint future sequence {seq}, WAL is at {}",
+            self.next_seq
+        );
         let entry = WalEntry::Checkpoint { snapshot_seq: seq };
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
             .map_err(|e| WalError::Format(e.to_string()))?;
@@ -509,7 +551,8 @@ impl Wal {
         Ok(4 + payload.len() as u64)
     }
 
-    /// Roll to a new segment file.
+    /// Roll to a new segment file. All I/O completes before internal state
+    /// is updated so a failure leaves `self` unchanged.
     fn roll_segment(&mut self) -> Result<(), WalError> {
         let seg_path = self.dir.join(segment_filename(self.next_seq));
         let file = OpenOptions::new()
@@ -517,9 +560,27 @@ impl Wal {
             .write(true)
             .read(true)
             .open(&seg_path)?;
+
+        // Write schema preamble to the NEW file before touching self.
+        let entry = WalEntry::Schema(self.schema.clone());
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+            .map_err(|e| WalError::Format(e.to_string()))?;
+        {
+            let mut writer = BufWriter::new(&file);
+            let len: u32 = payload
+                .len()
+                .try_into()
+                .map_err(|_| WalError::Format("schema preamble too large".into()))?;
+            writer.write_all(&len.to_le_bytes())?;
+            writer.write_all(&payload)?;
+            writer.flush()?;
+        }
+        let preamble_bytes = 4 + payload.len() as u64;
+
+        // All I/O succeeded — atomically update state.
         self.active_file = file;
         self.active_start_seq = self.next_seq;
-        self.active_bytes = self.write_schema_preamble()?;
+        self.active_bytes = preamble_bytes;
         Ok(())
     }
 
@@ -1297,6 +1358,75 @@ mod tests {
         let wal2 = Wal::open(&wal_dir, &codecs, config).unwrap();
         assert_eq!(wal2.last_checkpoint_seq(), Some(1));
         assert!(!wal2.checkpoint_needed());
+    }
+
+    #[test]
+    fn checkpoint_recovered_from_sealed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        // Use small segments so rollover happens quickly
+        let config = WalConfig {
+            max_segment_bytes: 128,
+            max_bytes_between_checkpoints: Some(4096),
+        };
+
+        let mut wal = Wal::create(&wal_dir, &codecs, config.clone()).unwrap();
+
+        // Write some records, then checkpoint
+        for i in 0..3 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        let ckpt_seq = wal.next_seq();
+        wal.acknowledge_snapshot(ckpt_seq).unwrap();
+        assert_eq!(wal.last_checkpoint_seq(), Some(ckpt_seq));
+
+        // Write more records to force rollover past the checkpoint's segment
+        for i in 3..20 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        assert!(wal.segment_count() > 1, "must have rolled over");
+        drop(wal);
+
+        // Reopen — checkpoint was in an earlier sealed segment
+        let wal2 = Wal::open(&wal_dir, &codecs, config).unwrap();
+        assert_eq!(
+            wal2.last_checkpoint_seq(),
+            Some(ckpt_seq),
+            "checkpoint must be recovered from sealed segment"
+        );
+        // bytes_since_checkpoint may differ slightly due to scan granularity
+        // but must be non-zero (mutations were written after checkpoint)
+        assert!(
+            wal2.bytes_since_checkpoint > 0,
+            "bytes_since_checkpoint should count mutations after checkpoint"
+        );
     }
 
     #[test]

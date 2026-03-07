@@ -56,11 +56,11 @@ impl WalCursor {
                     schema = Some(s);
                     pos = next_pos;
                 }
-                Some((WalEntry::Mutations(record), _next_pos)) => {
+                Some((WalEntry::Mutations(record), next_pos)) => {
                     if record.seq >= from_seq {
                         break; // Don't advance past this record
                     }
-                    pos = _next_pos;
+                    pos = next_pos;
                 }
                 Some((WalEntry::Checkpoint { .. }, next_pos)) => {
                     pos = next_pos;
@@ -577,6 +577,87 @@ mod tests {
         assert_eq!(batch.records.len(), 5);
         assert_eq!(batch.records[0].seq, 0);
         assert_eq!(batch.records[4].seq, 4);
+    }
+
+    #[test]
+    fn cursor_reads_across_segment_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        // Small segments to force rollover
+        let config = WalConfig {
+            max_segment_bytes: 128,
+            max_bytes_between_checkpoints: None,
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        for i in 0..20 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        assert!(wal.segment_count() > 1);
+        drop(wal);
+
+        let mut cursor = WalCursor::open(&wal_dir, 0).unwrap();
+        let batch = cursor.next_batch(100).unwrap();
+        assert_eq!(batch.records.len(), 20);
+        assert_eq!(batch.records[0].seq, 0);
+        assert_eq!(batch.records[19].seq, 19);
+        assert_eq!(cursor.next_seq(), 20);
+    }
+
+    #[test]
+    fn cursor_behind_after_segment_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("test.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let config = WalConfig {
+            max_segment_bytes: 128,
+            max_bytes_between_checkpoints: None,
+        };
+        let mut wal = Wal::create(&wal_dir, &codecs, config).unwrap();
+
+        for i in 0..20 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        assert!(wal.segment_count() > 2);
+        wal.delete_segments_before(15).unwrap();
+        drop(wal);
+
+        let result = WalCursor::open(&wal_dir, 0);
+        assert!(
+            matches!(result, Err(WalError::CursorBehind { .. })),
+            "should return CursorBehind when requesting deleted segment"
+        );
     }
 
     // ── Error path tests ─────────────────────────────────────────
