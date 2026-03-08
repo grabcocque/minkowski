@@ -641,6 +641,7 @@ impl EnumChangeSet {
                     offset,
                     layout,
                 } => {
+                    assert!(world.is_alive(*entity), "entity is not alive");
                     let data_ptr = self.arena.get(*offset);
                     let info = world.components.info(*component_id);
                     let drop_fn = info.drop_fn;
@@ -677,6 +678,7 @@ impl EnumChangeSet {
                     entity,
                     component_id,
                 } => {
+                    assert!(world.is_alive(*entity), "entity is not alive");
                     let info = world.components.info(*component_id);
                     let layout = info.layout;
                     let drop_fn = info.drop_fn;
