@@ -10,6 +10,6 @@ pub use checkpoint::{AutoCheckpoint, CheckpointHandler};
 pub use codec::{CodecError, CodecRegistry};
 pub use durable::Durable;
 pub use record::*;
-pub use replication::apply_batch;
+pub use replication::{apply_batch, ReplicationError};
 pub use snapshot::{Snapshot, SnapshotError};
 pub use wal::{Wal, WalConfig, WalCursor, WalError, WalStats};

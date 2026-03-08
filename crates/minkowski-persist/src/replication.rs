@@ -13,22 +13,35 @@ use std::collections::HashMap;
 
 use minkowski::{ComponentId, World};
 
-use crate::codec::CodecRegistry;
+use crate::codec::{CodecError, CodecRegistry};
 use crate::record::ReplicationBatch;
-use crate::wal::{apply_record, WalError};
+use crate::wal::apply_record;
+
+/// Errors from transport-agnostic replication operations.
+///
+/// Deliberately independent of [`WalError`](crate::WalError) — a replica
+/// server that only deserializes and applies batches should not need to
+/// know about WAL file I/O.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicationError {
+    #[error("replication format error: {0}")]
+    Format(String),
+    #[error("replication codec error: {0}")]
+    Codec(#[from] CodecError),
+}
 
 impl ReplicationBatch {
     /// Serialize to bytes via rkyv.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, WalError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ReplicationError> {
         rkyv::to_bytes::<rkyv::rancor::Error>(self)
             .map(|v| v.to_vec())
-            .map_err(|e| WalError::Format(e.to_string()))
+            .map_err(|e| ReplicationError::Format(e.to_string()))
     }
 
     /// Deserialize from bytes via rkyv.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, WalError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplicationError> {
         rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
-            .map_err(|e| WalError::Format(e.to_string()))
+            .map_err(|e| ReplicationError::Format(e.to_string()))
     }
 }
 
@@ -45,7 +58,7 @@ pub fn apply_batch(
     batch: &ReplicationBatch,
     world: &mut World,
     codecs: &CodecRegistry,
-) -> Result<Option<u64>, WalError> {
+) -> Result<Option<u64>, ReplicationError> {
     let remap: Option<HashMap<ComponentId, ComponentId>> = if batch.schema.components.is_empty() {
         None
     } else {
@@ -54,7 +67,8 @@ pub fn apply_batch(
 
     let mut last_seq = None;
     for record in &batch.records {
-        apply_record(record, world, codecs, remap.as_ref())?;
+        apply_record(record, world, codecs, remap.as_ref())
+            .map_err(|e| ReplicationError::Format(e.to_string()))?;
         last_seq = Some(record.seq);
     }
 
@@ -66,7 +80,7 @@ mod tests {
     use super::*;
     use crate::codec::CodecRegistry;
     use crate::record::{ComponentSchema, SerializedMutation, WalRecord, WalSchema};
-    use crate::wal::{Wal, WalConfig, WalCursor};
+    use crate::wal::{Wal, WalConfig, WalCursor, WalError};
     use minkowski::{EnumChangeSet, World};
 
     #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
@@ -524,7 +538,7 @@ mod tests {
     #[test]
     fn from_bytes_corrupt_returns_error() {
         let result = ReplicationBatch::from_bytes(&[0xFF; 32]);
-        assert!(matches!(result, Err(WalError::Format(_))));
+        assert!(matches!(result, Err(ReplicationError::Format(_))));
     }
 
     #[test]
