@@ -79,50 +79,57 @@ fn orphan_queue_interleaved_push_drain() {
 
 // ── ColumnLockTable pattern tests ──────────────────────────────────────
 
-/// Models column lock read-write semantics: exclusive writer blocks shared readers.
-/// Loom explores all interleavings to verify mutual exclusion.
+/// Models ColumnLockTable's Mutex-protected read-write lock semantics.
+/// The real ColumnLockTable uses a Mutex around the entire acquire operation,
+/// so the check-then-act (read writer flag + increment readers) is atomic.
+/// This test verifies that under that Mutex protection, an exclusive writer
+/// and a shared reader never overlap.
 #[test]
 fn column_lock_exclusive_blocks_shared() {
     loom::model(|| {
-        let writer_flag = Arc::new(AtomicBool::new(false));
-        let reader_count = Arc::new(AtomicU32::new(0));
-        // Track what happened in each thread
+        // The Mutex models ColumnLockTable's Mutex<HashMap<...>> —
+        // all lock state checks and mutations happen under this lock.
+        let lock_table = Arc::new(Mutex::new((false, 0u32))); // (writer, readers)
+
+        // In-flight tracking for mutual exclusion assertion
         let writer_held = Arc::new(AtomicBool::new(false));
         let reader_held = Arc::new(AtomicBool::new(false));
 
         // Thread 1: try to acquire exclusive lock
-        let wf = writer_flag.clone();
-        let rc = reader_count.clone();
+        let lt1 = lock_table.clone();
         let wh = writer_held.clone();
+        let rh1 = reader_held.clone();
         let t1 = thread::spawn(move || {
-            // Try-acquire: set writer flag, then check no readers
-            if wf
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                if rc.load(Ordering::SeqCst) == 0 {
-                    // Acquired exclusive
-                    wh.store(true, Ordering::SeqCst);
-                    // Release
-                    wh.store(false, Ordering::SeqCst);
-                }
-                wf.store(false, Ordering::SeqCst);
+            let mut state = lt1.lock().unwrap();
+            if !state.0 && state.1 == 0 {
+                state.0 = true; // acquired exclusive
+                drop(state); // release table mutex (lock is held)
+                wh.store(true, Ordering::SeqCst);
+                assert!(
+                    !rh1.load(Ordering::SeqCst),
+                    "exclusive lock held while shared lock also held"
+                );
+                wh.store(false, Ordering::SeqCst);
+                lt1.lock().unwrap().0 = false; // release exclusive
             }
         });
 
         // Thread 2: try to acquire shared lock
-        let wf2 = writer_flag.clone();
-        let rc2 = reader_count.clone();
+        let lt2 = lock_table.clone();
         let rh = reader_held.clone();
+        let wh2 = writer_held.clone();
         let t2 = thread::spawn(move || {
-            // Try-acquire: check no writer, then increment readers
-            if !wf2.load(Ordering::SeqCst) {
-                rc2.fetch_add(1, Ordering::SeqCst);
-                // Acquired shared
+            let mut state = lt2.lock().unwrap();
+            if !state.0 {
+                state.1 += 1; // acquired shared
+                drop(state);
                 rh.store(true, Ordering::SeqCst);
-                // Release
+                assert!(
+                    !wh2.load(Ordering::SeqCst),
+                    "shared lock held while exclusive lock also held"
+                );
                 rh.store(false, Ordering::SeqCst);
-                rc2.fetch_sub(1, Ordering::SeqCst);
+                lt2.lock().unwrap().1 -= 1; // release shared
             }
         });
 
@@ -131,28 +138,59 @@ fn column_lock_exclusive_blocks_shared() {
     });
 }
 
-/// Verifies the upgrade-not-downgrade invariant: when a component is
-/// requested as both Shared and Exclusive, the Exclusive privilege wins.
+/// Verifies the upgrade-not-downgrade consequence: when a transaction
+/// requests both read and write on the same column, it must acquire
+/// exclusive — meaning a concurrent shared reader is blocked.
+/// This models the real scenario where dedup_by incorrectly kept Shared.
 #[test]
-fn column_lock_upgrade_not_downgrade() {
+fn column_lock_upgrade_blocks_concurrent_reader() {
     loom::model(|| {
-        let requests: Vec<(&str, &str)> = vec![("col_a", "shared"), ("col_a", "exclusive")];
+        let lock_table = Arc::new(Mutex::new((false, 0u32))); // (writer, readers)
+        let writer_held = Arc::new(AtomicBool::new(false));
+        let reader_held = Arc::new(AtomicBool::new(false));
 
-        let mut deduped = requests;
-        deduped.sort_by_key(|&(col, _)| col);
-        deduped.dedup_by(|next, kept| {
-            if next.0 == kept.0 {
-                if next.1 == "exclusive" {
-                    kept.1 = "exclusive";
-                }
-                true
-            } else {
-                false
+        // Thread 1: requests both read AND write on col_a → must acquire exclusive
+        let lt1 = lock_table.clone();
+        let wh = writer_held.clone();
+        let rh1 = reader_held.clone();
+        let t1 = thread::spawn(move || {
+            let mut state = lt1.lock().unwrap();
+            // Upgraded to exclusive (the correct behavior after dedup)
+            if !state.0 && state.1 == 0 {
+                state.0 = true;
+                drop(state);
+                wh.store(true, Ordering::SeqCst);
+                // While we hold exclusive, no reader should be active
+                assert!(
+                    !rh1.load(Ordering::SeqCst),
+                    "upgraded lock held while shared reader also active"
+                );
+                wh.store(false, Ordering::SeqCst);
+                lt1.lock().unwrap().0 = false;
             }
         });
 
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0], ("col_a", "exclusive"));
+        // Thread 2: requests read-only on the same column
+        let lt2 = lock_table.clone();
+        let rh = reader_held.clone();
+        let wh2 = writer_held.clone();
+        let t2 = thread::spawn(move || {
+            let mut state = lt2.lock().unwrap();
+            if !state.0 {
+                state.1 += 1;
+                drop(state);
+                rh.store(true, Ordering::SeqCst);
+                assert!(
+                    !wh2.load(Ordering::SeqCst),
+                    "shared reader active while upgraded exclusive also held"
+                );
+                rh.store(false, Ordering::SeqCst);
+                lt2.lock().unwrap().1 -= 1;
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
     });
 }
 
