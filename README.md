@@ -60,7 +60,17 @@ CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggreg
 - **Split-phase transactions** — `Tx` does not hold `&mut World`. Transactions read concurrently via `&World`, buffer writes privately, and commit sequentially. The borrow checker enforces the phase boundary.
 - **Composable persistence** — `Durable<S>` wraps any transaction strategy to add WAL logging. Zero-copy snapshot loading via mmap + rkyv. The core engine has no serialization dependency.
 - **Mechanisms, not policy** — no built-in scheduler, no application lifecycle. Minkowski provides `Access` bitsets and `is_compatible()` for framework authors to build their own scheduling. Secondary indexes are external consumers of the change detection system.
-- **Miri verified** — full test suite passes under Tree Borrows.
+
+## Soundness
+
+Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration — the performance-critical paths that make an ECS fast. Four layers of verification ensure these paths are correct:
+
+| Layer | What it catches | When it runs |
+|---|---|---|
+| **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
+| **398 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
+| **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
+| **[Fuzz testing][cargo-fuzz]** | Edge cases that structured tests miss: random operation sequences against World, query iteration across varied archetype shapes, malformed snapshot/WAL input. Coverage-guided mutation explores millions of paths. | Manual, pre-release |
 
 ## Storage
 
@@ -240,7 +250,7 @@ The commands teach the paradigm, not just the API — they encode the design pri
 
 ## Architecture Decision Records
 
-Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted.
+Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted. For a comprehensive walkthrough of the internals — storage model, query engine, transaction system, persistence layer — see the [DeepWiki](https://deepwiki.com/Lewdwig-V/minkowski).
 
 ## Glossary
 
@@ -285,4 +295,5 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [soa]: https://en.wikipedia.org/wiki/AoS_and_SoA#Structure_of_arrays
 [tree-borrows]: https://perso.crans.org/vanille/treebor/
 [uniform-grid]: https://en.wikipedia.org/wiki/Grid_(spatial_index)
+[cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging
