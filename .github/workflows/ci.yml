@@ -83,11 +83,11 @@ jobs:
         with:
           shared-key: nightly-tsan
       - name: TSan tests (skip par_for_each)
-        run: cargo +nightly test -p minkowski --lib -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each
+        run: cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
       - name: TSan par_for_each
-        run: cargo +nightly test -p minkowski --lib -Z build-std --target x86_64-unknown-linux-gnu par_for_each
+        run: cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu par_for_each
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
 
