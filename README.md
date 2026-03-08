@@ -71,7 +71,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | **398 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
-| **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Manual, pre-release |
+| **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
 | **[Fuzz testing][cargo-fuzz]** | Edge cases that structured tests miss: random operation sequences against World, query iteration across varied archetype shapes, malformed snapshot/WAL input. Coverage-guided mutation explores millions of paths. | Manual, pre-release |
 
 ## Storage
