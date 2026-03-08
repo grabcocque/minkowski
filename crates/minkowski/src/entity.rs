@@ -330,3 +330,41 @@ mod tests {
         assert_eq!(alloc.total_despawns, 1);
     }
 }
+
+#[cfg(loom)]
+mod loom_tests {
+    use super::EntityAllocator;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Two threads call reserve() concurrently on the same EntityAllocator.
+    /// Verifies all returned entity indices are unique — no duplicate IDs.
+    /// Uses the real EntityAllocator::reserve() (AtomicU32 fetch_add).
+    #[test]
+    fn loom_reserve_no_duplicate_indices() {
+        loom::model(|| {
+            let alloc = Arc::new(EntityAllocator::new());
+
+            let a1 = alloc.clone();
+            let t1 = thread::spawn(move || {
+                let e1 = a1.reserve();
+                let e2 = a1.reserve();
+                vec![e1.index(), e2.index()]
+            });
+
+            let a2 = alloc.clone();
+            let t2 = thread::spawn(move || {
+                let e1 = a2.reserve();
+                let e2 = a2.reserve();
+                vec![e1.index(), e2.index()]
+            });
+
+            let mut indices: Vec<u32> = Vec::new();
+            indices.extend(t1.join().unwrap());
+            indices.extend(t2.join().unwrap());
+
+            indices.sort();
+            assert_eq!(indices, vec![0, 1, 2, 3]);
+        });
+    }
+}
