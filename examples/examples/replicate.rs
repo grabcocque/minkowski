@@ -1,12 +1,11 @@
 //! Replication — pull-based WAL cursor for read replicas.
 //!
-//! Demonstrates the full replication lifecycle:
-//! 1. Create a source world and spawn entities
-//! 2. Take a snapshot
-//! 3. Write post-snapshot mutations to WAL
-//! 4. Open a WalCursor at the snapshot seq
-//! 5. Pull a ReplicationBatch and apply to a replica world
-//! 6. Verify source and replica converge
+//! Simulates a network replication flow using channels as the wire:
+//! - `source_side` spawns entities, takes a snapshot, writes post-snapshot
+//!   mutations to WAL, then sends snapshot bytes + WAL batch bytes over a channel.
+//! - `replica_side` receives the bytes, reconstructs a World from the snapshot,
+//!   applies the WAL batch, and returns the replica World.
+//! - The two sides share no World state — only serialized bytes cross the boundary.
 //!
 //! Run: cargo run -p minkowski-examples --example replicate --release
 
@@ -15,6 +14,7 @@ use minkowski_persist::{
     apply_batch, CodecRegistry, ReplicationBatch, Snapshot, Wal, WalConfig, WalCursor,
 };
 use rkyv::{Archive, Deserialize, Serialize};
+use std::sync::mpsc;
 
 #[derive(Clone, Copy, Archive, Serialize, Deserialize)]
 #[repr(C)]
@@ -30,23 +30,28 @@ struct Vel {
     dy: f32,
 }
 
-fn main() {
-    let dir = std::env::temp_dir().join("minkowski-replicate-example");
+/// Messages sent from source to replica over the "network" (channel).
+enum WireMessage {
+    /// Full snapshot bytes — sent once at the start.
+    Snapshot(Vec<u8>),
+    /// Incremental WAL batch bytes — sent for each batch of mutations.
+    WalBatch(Vec<u8>),
+}
+
+/// Source side: owns the authoritative World and WAL.
+/// Sends snapshot + WAL batches over the channel.
+fn source_side(tx: mpsc::Sender<WireMessage>) {
+    let dir = std::env::temp_dir().join("minkowski-replicate-source");
     std::fs::create_dir_all(&dir).unwrap();
     let wal_dir = dir.join("source.wal");
-    let snap_path = dir.join("source.snap");
-
-    // Clean up from previous runs
     let _ = std::fs::remove_dir_all(&wal_dir);
-    let _ = std::fs::remove_file(&snap_path);
 
-    // -- Phase 1: Source world --
-    println!("Phase 1: Creating source world...");
     let mut world = World::new();
     let mut codecs = CodecRegistry::new();
     codecs.register_as::<Pos>("pos", &mut world);
     codecs.register_as::<Vel>("vel", &mut world);
 
+    // Spawn initial entities
     for i in 0..20 {
         world.spawn((
             Pos {
@@ -56,22 +61,21 @@ fn main() {
             Vel { dx: 1.0, dy: 0.5 },
         ));
     }
-    println!("  Spawned {} entities", world.entity_count());
+    println!("[source] Spawned {} entities", world.entity_count());
 
-    // -- Phase 2: Snapshot --
-    println!("Phase 2: Taking snapshot...");
+    // Take snapshot and send bytes over the wire
     let mut wal = Wal::create(&wal_dir, &codecs, WalConfig::default()).unwrap();
     let snap = Snapshot::new();
-    let header = snap
-        .save(&snap_path, &world, &codecs, wal.next_seq())
-        .unwrap();
+    let (header, snap_bytes) = snap.save_to_bytes(&world, &codecs, wal.next_seq()).unwrap();
     println!(
-        "  Snapshot: {} entities, WAL seq {}",
-        header.entity_count, header.wal_seq
+        "[source] Snapshot: {} entities, {} bytes, WAL seq {}",
+        header.entity_count,
+        snap_bytes.len(),
+        header.wal_seq
     );
+    tx.send(WireMessage::Snapshot(snap_bytes)).unwrap();
 
-    // -- Phase 3: Post-snapshot mutations --
-    println!("Phase 3: Writing post-snapshot mutations...");
+    // Post-snapshot mutations via WAL
     for i in 0..10 {
         let e = world.alloc_entity();
         let mut cs = EnumChangeSet::new();
@@ -90,54 +94,86 @@ fn main() {
         cs.apply(&mut world);
     }
     println!(
-        "  Source now has {} entities, WAL seq {}",
+        "[source] After mutations: {} entities, WAL seq {}",
         world.entity_count(),
         wal.next_seq()
     );
 
     drop(wal);
 
-    // -- Phase 4: Replica via snapshot + cursor --
-    println!("Phase 4: Replicating...");
-    let mut replica_codecs = CodecRegistry::new();
-    let mut tmp = World::new();
-    replica_codecs.register_as::<Pos>("pos", &mut tmp);
-    replica_codecs.register_as::<Vel>("vel", &mut tmp);
-
-    let (mut replica, snap_seq) = snap.load(&snap_path, &replica_codecs).unwrap();
+    // Read WAL batch from cursor and send over the wire
+    let mut cursor = WalCursor::open(&wal_dir, header.wal_seq).unwrap();
+    let batch = cursor.next_batch(100).unwrap();
+    let batch_bytes = batch.to_bytes().unwrap();
     println!(
-        "  Loaded snapshot: {} entities at seq {}",
-        replica.query::<(&Pos,)>().count(),
+        "[source] WAL batch: {} records, {} bytes",
+        batch.records.len(),
+        batch_bytes.len()
+    );
+    tx.send(WireMessage::WalBatch(batch_bytes)).unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("[source] Done — {} entities total", world.entity_count());
+}
+
+/// Replica side: reconstructs World from bytes received over the channel.
+/// Has its own CodecRegistry — no shared state with source.
+fn replica_side(rx: mpsc::Receiver<WireMessage>) -> World {
+    // Replica registers codecs independently (could be different order)
+    let mut codecs = CodecRegistry::new();
+    let mut tmp = World::new();
+    codecs.register_as::<Vel>("vel", &mut tmp);
+    codecs.register_as::<Pos>("pos", &mut tmp);
+    drop(tmp);
+
+    // Receive and load snapshot
+    let snap_bytes = match rx.recv().unwrap() {
+        WireMessage::Snapshot(bytes) => bytes,
+        _ => panic!("expected snapshot"),
+    };
+    println!("[replica] Received snapshot: {} bytes", snap_bytes.len());
+
+    let snap = Snapshot::new();
+    let (mut world, snap_seq) = snap.load_from_bytes(&snap_bytes, &codecs).unwrap();
+    println!(
+        "[replica] Loaded snapshot: {} entities at seq {}",
+        world.entity_count(),
         snap_seq
     );
 
-    let mut cursor = WalCursor::open(&wal_dir, snap_seq).unwrap();
-    let batch = cursor.next_batch(100).unwrap();
+    // Receive and apply WAL batch
+    let batch_bytes = match rx.recv().unwrap() {
+        WireMessage::WalBatch(bytes) => bytes,
+        _ => panic!("expected WAL batch"),
+    };
+    println!("[replica] Received WAL batch: {} bytes", batch_bytes.len());
+
+    let batch = ReplicationBatch::from_bytes(&batch_bytes).unwrap();
+    let last_seq = apply_batch(&batch, &mut world, &codecs).unwrap();
     println!(
-        "  Pulled batch: {} records, schema has {} components",
+        "[replica] Applied {} records up to seq {:?} — {} entities",
         batch.records.len(),
-        batch.schema.components.len()
+        last_seq,
+        world.entity_count()
     );
 
-    // Demonstrate wire format round-trip
-    let wire_bytes = batch.to_bytes().unwrap();
-    println!("  Wire format: {} bytes", wire_bytes.len());
-    let batch = ReplicationBatch::from_bytes(&wire_bytes).unwrap();
+    world
+}
 
-    let last_seq = apply_batch(&batch, &mut replica, &replica_codecs).unwrap();
-    println!("  Applied up to seq {:?}", last_seq);
+fn main() {
+    let (tx, rx) = mpsc::channel();
 
-    // -- Phase 5: Verify convergence --
-    println!("Phase 5: Verifying convergence...");
-    let source_count = world.entity_count();
-    let replica_count = replica.query::<(&Pos,)>().count();
-    println!(
-        "  Source: {} entities, Replica: {} entities",
-        source_count, replica_count
+    // Run source and replica — channel is the "network"
+    source_side(tx);
+    let replica = replica_side(rx);
+
+    // Verify convergence
+    println!("\n=== Convergence check ===");
+    println!("Replica entities: {}", replica.entity_count());
+    assert_eq!(
+        replica.entity_count(),
+        30,
+        "replica should have 20 (snapshot) + 10 (WAL) = 30 entities"
     );
-    assert_eq!(source_count, replica_count, "replica should match source");
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&dir);
-    println!("\nDone. Source and replica converged.");
+    println!("Source and replica converged.");
 }

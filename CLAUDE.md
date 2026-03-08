@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (383 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (387 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -62,7 +62,7 @@ Each unique set of component types gets an **Archetype** — a struct containing
 
 **Entity** = u64 bit-packed: low 32 bits = index, high 32 bits = generation. `EntityAllocator` maintains a generation array + free list. `entity_locations: Vec<Option<EntityLocation>>` maps entity index → (archetype_id, row) for O(1) lookup.
 
-**Sparse components** (`HashMap<Entity, T>` per component behind `Box<dyn Any>`) are opt-in via `register_sparse`. Not stored in archetypes.
+**Sparse components** (`PagedSparseSet` with 4096-entry pages mapped to a dense `BlobVec`) are opt-in via `insert_sparse`. Not stored in archetypes.
 
 ### Data Flow
 

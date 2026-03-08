@@ -2,11 +2,9 @@
 
 A column-oriented database engine built from scratch by one human and one AI.
 
-Minkowski is an [archetype][archetype] [ECS][ecs] that doubles as a transactional database engine. Its typed [reducer](#typed-reducers) system proves conflict freedom from closure signatures alone — no runtime checks needed for scheduled reducers. [Split-phase transactions](#transactions) enable safe concurrent reads by keeping `Tx` separate from `&mut World`, and [WAL][wal] persistence composes with any transaction strategy via a single wrapper type.
+Minkowski is a storage engine for real-time interactive applications — games, simulations, collaborative tools — that need both the iteration speed of an [ECS][ecs] and the transactional guarantees of a database.
 
-**Minkowski** is a storage engine for real-time interactive applications — games, simulations, collaborative tools — that need both the iteration speed of an ECS and the transactional guarantees of a database.
-Most ECS engines give you fast iteration but no persistence, no rollback, no concurrency control. Most databases give you transactions but can't iterate 100,000 components per frame without blowing your cache budget. minkowski gives you both without making you pay for the one you're not using.
-The core insight: archetype-based column storage is already a columnar database. Minkowski makes that explicit. Components are stored in flat, aligned, SIMD-friendly arrays. Queries resolve to bitset comparisons. Change detection uses a monotonic tick counter that provides total ordering without per-entity overhead. Everything you need for a database is already present in a well-designed ECS — you just have to expose the right primitives.
+Most ECS engines give you fast iteration but no persistence, no rollback, no concurrency control. Most databases give you transactions but can't iterate 100,000 components per frame. Minkowski gives you both, and you only pay for the features you use.
 
 ## Quick start
 
@@ -44,22 +42,31 @@ let move_id = registry.register_query::<(&mut Pos, &Vel), (), _>(
 registry.run(&mut world, move_id, ());
 ```
 
-## What makes this interesting
+### Building & testing
 
-- **[Column-oriented][column-store] ECS that's also a transactional database engine** — three mutation tiers (direct, transactional, durable) over the same columnar storage
-- **Typed reducers** — closures whose type signatures prove conflict freedom, enabling compile-time scheduling without runtime validation. A reducer is a function with a declared access pattern encoded in its type signature. The engine extracts read/write bitsets from the types at registration time and uses them for conflict analysis. Two reducers with disjoint component access are proven non-conflicting at compile time — no runtime locks, no optimistic retry, no scheduler overhead. If you try to access a component you didn't declare, the compiler rejects it.
-- **Split-phase transactions** — `Tx` does not hold `&mut World`, so concurrent reads via `&World` are sound by construction. Transactions read from shared &World references and buffer writes into a private changeset. Multiple transactions execute concurrently in a parallel phase, then commit sequentially. The Rust borrow checker enforces the phase boundary — you can't start committing until all shared references are released. No manual synchronization required.
-- **AI-powered developer tooling** — 16 slash commands guide design decisions across the ECS paradigm, from data modeling to concurrency strategy
-- **No undefined behaviour** — Miri verified under Tree Borrows
-- **Composable persistence** — The `Durable<S>` wrapper takes any transaction strategy and guarantees that every committed transaction is WAL-logged before the caller sees the result. If the WAL write fails, the process panics — there's no silent data loss. Crash recovery replays the log from the last snapshot. Zero-copy snapshot loading via mmap + rkyv bypasses envelope deserialization and copies `#[repr(C)]` component bytes directly into columns without typed construction. The core engine has zero dependency on any serialization framework.
-- **Zero-cost tiers** — Users who don't need transactions pay nothing — direct world.get_mut() has no overhead. Users who need transactions but not persistence pay only for the changeset buffer. Users who need durability add the Durable wrapper. Each tier adds cost only for the guarantees it provides.
-- **Mechanisms, not policy** — There's no built-in scheduler, no application lifecycle, no domain-specific component types. Scheduling, system ordering, and parallelism strategy are the framework author's job — minkowski provides `Access` bitsets and `is_compatible()` so they can build their own. Secondary indexes (spatial grids, B-trees) are external consumers of the change detection system, not engine features. The litmus test: "does this require knowledge of what the user's program does?" If yes, it doesn't belong in minkowski.
+```
+cargo test -p minkowski                # 493 tests across 3 crates
+cargo clippy --workspace --all-targets -- -D warnings
+cargo bench -p minkowski               # criterion benchmarks vs hecs
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
+```
 
-## Column-Oriented Storage
+CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggregator job is the single required status check for branch protection.
 
-Each unique combination of [component][component] types gets an [archetype][archetype] — a [struct of arrays][soa] where each column is a `BlobVec` (type-erased growable byte array with 64-byte alignment). Queries match archetypes via [bitset][bitset] subset checks, then iterate columns with raw pointer arithmetic. No virtual dispatch in the hot path.
+## Design Principles
 
-Entities are [generational][generational-index] `u64` IDs (32-bit index + 32-bit generation). Recycled indices get bumped generations to prevent use-after-free. O(1) lookup from entity to archetype row via `Vec<Option<EntityLocation>>`. Sparse components (paged sparse sets with O(1) lookup) are opt-in for tags and rarely-queried data, preventing archetype fragmentation.
+- **Three mutation tiers** — direct `world.get_mut()` (zero overhead), transactional (buffered changeset with conflict detection), durable (WAL-backed via `Durable<S>` wrapper). Each tier adds cost only for the guarantees it provides.
+- **Typed reducers** — closure signatures declare their access pattern. The engine extracts read/write bitsets at registration time. Two reducers with disjoint access are proven non-conflicting at compile time — no runtime locks, no optimistic retry.
+- **Split-phase transactions** — `Tx` does not hold `&mut World`. Transactions read concurrently via `&World`, buffer writes privately, and commit sequentially. The borrow checker enforces the phase boundary.
+- **Composable persistence** — `Durable<S>` wraps any transaction strategy to add WAL logging. Zero-copy snapshot loading via mmap + rkyv. The core engine has no serialization dependency.
+- **Mechanisms, not policy** — no built-in scheduler, no application lifecycle. Minkowski provides `Access` bitsets and `is_compatible()` for framework authors to build their own scheduling. Secondary indexes are external consumers of the change detection system.
+- **Miri verified** — full test suite passes under Tree Borrows.
+
+## Storage
+
+Any Rust type that is `'static + Send + Sync` is a component. Entities with the same set of component types share an [archetype][archetype] — components are stored in contiguous, cache-friendly [column arrays][soa]. Adding or removing a component moves the entity to the matching archetype automatically.
+
+Entity IDs are [generational][generational-index] — recycled IDs get bumped generations, so stale handles are always detected. Sparse components are opt-in for tags and rarely-queried data, preventing archetype fragmentation.
 
 ```rust
 let mut world = World::new();
@@ -68,11 +75,11 @@ world.insert(e, Health(100));   // migrates entity to new archetype
 world.remove::<Health>(e);      // migrates it back
 ```
 
-## Query Engine
+## Queries
 
-Two-tier query system with incremental caching. Dynamic queries (`world.query::<(&mut Pos, &Vel)>()`) cache matched archetype IDs per query type — repeat calls skip the archetype scan entirely, and only new archetypes are scanned incrementally. Static table queries (`world.query_table::<Transform>()`) bypass archetype matching altogether via pre-resolved column offsets.
+Queries are tuple-typed — `world.query::<(&mut Pos, &Vel)>()` iterates all entities with both components, giving mutable access to `Pos` and shared access to `Vel`. Results are cached per query type, so repeat calls are nearly free.
 
-`Changed<T>` filters skip entire archetypes whose column was not mutably accessed since the last read. Ticks auto-advance on every mutation and query — there is no manual `world.tick()` call. Parallel iteration via `par_for_each` ([rayon][rayon]) and chunk-based `for_each_chunk` yielding `&[T]`/`&mut [T]` slices for [SIMD][simd] auto-vectorization.
+`Changed<T>` skips entities whose component hasn't been modified since your last read — useful for incremental processing. `par_for_each` distributes iteration across threads via [rayon][rayon], and `for_each_chunk` yields typed slices for [SIMD][simd] auto-vectorization. Table queries (`world.query_table::<Transform>()`) skip archetype matching entirely when you know the exact schema.
 
 ```rust
 // Dynamic query -- cached, skips archetype scan on repeat calls
@@ -97,33 +104,33 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 
 Reducers are closures registered with the `ReducerRegistry`. The type signature declares exactly what the closure can access, and the registry extracts `Access` metadata at registration time for conflict detection.
 
-| Handle | Access | Execution model |
+| Handle | Use when you need to... | Execution model |
 |---|---|---|
-| `EntityRef<C>` | Read components in set C for one entity | Transactional |
-| `EntityMut<C>` | Read + buffered write + remove for one entity | Transactional |
-| `Spawner<B>` | Create new entities with bundle B | Transactional |
-| `QueryWriter<Q>` | Buffered bulk iteration via `WritableRef<T>` | Transactional |
-| `QueryRef<Q>` | Read-only iteration | Scheduled |
-| `QueryMut<Q>` | Read-write iteration with direct `&mut World` | Scheduled |
-| `DynamicCtx` | Builder-declared upper bounds, buffered writes via `EnumChangeSet` | Dynamic |
+| `EntityRef<C>` | Inspect one entity's components without changing anything | Transactional |
+| `EntityMut<C>` | Update or remove components on a single known entity | Transactional |
+| `Spawner<B>` | Create new entities during a transaction | Transactional |
+| `QueryWriter<Q>` | Iterate many entities and buffer writes for atomic commit | Transactional |
+| `QueryRef<Q>` | Iterate many entities read-only (e.g. logging, census) | Scheduled |
+| `QueryMut<Q>` | Iterate and mutate many entities directly | Scheduled |
+| `DynamicCtx` | Decide which components to access at runtime | Dynamic |
 
-Scheduled reducers (QueryRef, QueryMut) run with direct world access — conflict freedom is proven at registration from the Access bitsets. Transactional reducers (EntityMut, Spawner, QueryWriter) buffer writes into an `EnumChangeSet` and commit through a transaction strategy. Dynamic reducers (`DynamicCtx`) trade compile-time precision for runtime flexibility with builder-declared upper bounds.
+Scheduled reducers (`QueryRef`, `QueryMut`) can run in parallel when their access patterns don't overlap — the registry can prove this at registration time. Transactional reducers (`EntityMut`, `Spawner`, `QueryWriter`) buffer writes and commit atomically through a [transaction strategy](#transactions). Dynamic reducers (`DynamicCtx`) let you choose which components to access at runtime when the set isn't known at compile time.
 
 ## Transactions
 
-Three strategies over a unified `Transact` trait. `Tx` does not hold `&mut World` — methods take world as a parameter, enabling split-phase execution where multiple transactions read concurrently via `&World` before committing sequentially.
+Three strategies over a unified `Transact` trait, so you can swap concurrency policies without changing your reducer logic:
 
-- **Sequential** — zero-cost passthrough, all ops delegate directly to World
-- **[Optimistic][occ]** — live reads via `query_raw(&self)`, buffered writes, tick-based validation at commit
-- **[Pessimistic][pcc]** — cooperative per-column locks acquired at begin, buffered writes, commit always succeeds
+- **Sequential** — zero overhead, direct world access. Use when single-threaded.
+- **[Optimistic][occ]** — concurrent reads, buffered writes, validates at commit. Use when conflicts are rare.
+- **[Pessimistic][pcc]** — acquires locks up front, commit always succeeds. Use when conflicts are frequent.
 
-Lock granularity is per-column `(ArchetypeId, ComponentId)`. The lock table is owned by the strategy, not World — concurrency policy is external to storage.
-
-Entity IDs allocated during a transaction are tracked automatically. On abort, orphaned IDs are pushed to a shared `OrphanQueue` and drained by World at the next `&mut self` call — no entity ID ever leaks, regardless of how the transaction ends. `WorldId` checks prevent cross-world corruption when strategies are shared across threads.
+All strategies handle entity ID cleanup automatically — no IDs leak on abort, no manual drain step required.
 
 ## Persistence
 
-The `minkowski-persist` crate provides [WAL][wal] (write-ahead log) and [rkyv][rkyv]-serialized snapshots. `Durable<S>` wraps any `Transact` strategy — on successful commit, the forward changeset is written to the WAL before being applied to World. Failed attempts (retries) are not logged. WAL write failure panics — the durability invariant is non-negotiable. Recovery loads the latest snapshot and replays subsequent WAL entries. `Snapshot::load_zero_copy` uses mmap + rkyv's archived types to skip envelope deserialization. For `#[repr(C)]` components whose archived layout matches native, archived bytes are copied directly into BlobVec columns without typed construction; other components fall back to `rkyv::from_bytes`.
+The `minkowski-persist` crate adds crash-safe durability. `Durable<S>` wraps any transaction strategy — every committed mutation is [WAL][wal]-logged before the caller sees the result. Recovery loads the latest snapshot and replays subsequent WAL entries.
+
+Snapshots serialize the full world state via [rkyv][rkyv] and can be saved to disk or transferred as bytes (`save_to_bytes` / `load_from_bytes`) for network replication. `WalCursor` and `ReplicationBatch` provide incremental catch-up for read replicas.
 
 ```rust
 // Durable wraps any strategy — Optimistic, Pessimistic, or Sequential
@@ -134,7 +141,7 @@ durable.transact(&mut world, access, |tx, world| { /* ... */ });
 
 ## Schema & Mutation
 
-`#[derive(Table)]` generates compile-time schema declarations with typed row accessors (`FooRef<'w>` / `FooMut<'w>`). Table queries skip archetype matching entirely via pre-resolved column offsets.
+`#[derive(Table)]` declares a named schema with typed row accessors — queries against a table skip archetype matching entirely:
 
 ```rust
 #[derive(Table)]
@@ -143,17 +150,16 @@ struct Transform {
     vel: Vel,
 }
 
-// Table query -- direct pointer arithmetic, zero archetype matching
 for row in world.query_table::<Transform>() {
     println!("{}, {}", row.pos.x, row.vel.dx);
 }
 ```
 
-`EnumChangeSet` records mutations as data with component bytes in a contiguous arena. `apply()` returns a reverse changeset for automatic undo — applying the reverse restores the previous state. Typed helpers (`insert<T>`, `remove<T>`, `spawn_bundle<B>`) handle component registration and raw pointers internally. `CommandBuffer` provides deferred structural changes during iteration.
+`EnumChangeSet` records mutations as data. `apply()` returns a reverse changeset — applying the reverse undoes the original changes, giving you automatic undo/redo. `CommandBuffer` provides deferred structural changes (spawn/despawn/insert/remove) during query iteration.
 
 ## Observability
 
-The `minkowski-observe` crate is a pure consumer companion that captures engine metrics without instrumenting hot paths. Two facade methods — `world.stats()` and `wal.stats()` — copy internal state into plain `Copy` structs (`WorldStats`, `WalStats`). The observe crate composes these into point-in-time snapshots, diffs consecutive captures, and computes deltas.
+The `minkowski-observe` crate captures engine metrics without instrumenting hot paths. `MetricsSnapshot::capture()` takes a point-in-time reading; `MetricsDiff::compute()` compares two snapshots to show what changed.
 
 ```rust
 use minkowski_observe::{MetricsSnapshot, MetricsDiff};
@@ -170,36 +176,30 @@ println!("{diff}");
 //   archetype delta: +1
 ```
 
-Entity churn is exact — monotonic counters in `EntityAllocator` track every spawn (including reserved entities on materialization) and despawn. Per-archetype detail (entity count, component names, estimated byte footprint) is included in every snapshot. `Display` impls on both `MetricsSnapshot` and `MetricsDiff` produce human-readable tables suitable for logging or stderr.
+Entity churn tracking is exact — every spawn and despawn is counted. Per-archetype detail (entity count, component names, estimated byte footprint) is included in every snapshot.
 
-## Spatial Indexing
+`PrometheusExporter` converts snapshots into OpenMetrics text format — 13 gauges covering world state, WAL pressure, and per-archetype breakdowns. No HTTP server included; call `exporter.render()` and mount the result on your own `/metrics` endpoint. Compatible with Grafana, Datadog, or any Prometheus-compatible tool.
 
-`SpatialIndex` is a lifecycle trait for user-owned spatial data structures. Indexes are fully external to World — they compose from existing query primitives. The trait has two methods: `rebuild` (full construction) and `update` (optional, for incremental updates via `Changed<T>`). Stale entity references are caught by generational validation at query time.
+## Indexing
 
-Two implementations ship as examples: a [uniform grid][uniform-grid] for O(N*k) neighbor search (boids) and a [Barnes-Hut][barnes-hut] quadtree for O(N log N) force approximation (nbody). Both demonstrate that the trait accommodates structurally different algorithms without friction. For column-value lookups, `BTreeIndex<T>` provides O(log n) range queries and `HashIndex<T>` provides O(1) exact match — both use `Changed<T>` for incremental updates.
+Spatial indexes are user-owned data structures that compose with the query system. The `SpatialIndex` trait has two methods: `rebuild` (full reconstruction) and `update` (incremental via `Changed<T>`). Stale entity references are caught automatically by generational ID validation.
+
+For column-value lookups, `BTreeIndex<T>` provides O(log n) range queries and `HashIndex<T>` provides O(1) exact match. Examples include a [uniform grid][uniform-grid] for neighbor search and a [Barnes-Hut][barnes-hut] quadtree for force approximation.
 
 ## Examples
 
-| Example | What it does | Run |
-|---|---|---|
-| `boids` | Flocking simulation with 5 000 entities. Registers three `QueryMut` reducers (zero acceleration, compute forces, integrate), rebuilds a `SpatialGrid` each frame for O(k) neighbor lookup, and uses `CommandBuffer` for deferred despawn/respawn churn. Demonstrates SIMD auto-vectorization via `for_each_chunk`. | `cargo run -p minkowski-examples --example boids --release` |
-| `life` | Conway's Game of Life on a 64×64 toroidal grid, running 500 generations with undo/redo. Uses `#[derive(Table)]` for typed row access, a `QueryMut` reducer to update neighbor counts, `Changed<CellState>` for incremental detection, and `EnumChangeSet` to record reversible mutations for 50-generation rewind followed by deterministic replay. | `cargo run -p minkowski-examples --example life --release` |
-| `nbody` | Barnes-Hut N-body gravity simulation with 2 000 entities. Builds a quadtree `SpatialIndex` each frame to approximate O(N log N) force computation, uses rayon snapshot-based parallel force accumulation, and dispatches the integration step through a `QueryMut` reducer. Demonstrates generational entity validation and archetype stability under spawn/despawn churn. | `cargo run -p minkowski-examples --example nbody --release` |
-| `scheduler` | Greedy batch scheduler over 6 registered query reducers. Calls `registry.query_reducer_access(id)` to extract `Access` bitsets, builds a conflict matrix, and assigns systems to non-conflicting batches via graph coloring — producing 3 batches where intra-batch systems touch disjoint components and could run in parallel. | `cargo run -p minkowski-examples --example scheduler --release` |
-| `transaction` | Two-part comparison of raw `Tx` building blocks versus reducer-based dispatch. Part 1 shows `Sequential` begin/commit and `Optimistic` transact closure at the low level. Part 2 registers the same logic as query reducers, gaining strategy-agnostic dispatch and free conflict detection without changing the closure body. | `cargo run -p minkowski-examples --example transaction --release` |
-| `battle` | Multi-threaded arena with 500 entities over 100 frames. Registers `EntityMut` reducers for attack and heal, dispatches them through both `Optimistic` and `Pessimistic` strategies, and uses `rayon::join` for parallel snapshot reads before sequential reducer dispatch. Demonstrates low-conflict (disjoint component sets) versus high-conflict (shared `Health` column) modes and how each strategy handles retry. | `cargo run -p minkowski-examples --example battle --release` |
-| `persist` | Full persistence lifecycle with 100 entities across 3 archetypes. Spawns entities with varied component sets (including sparse components), saves an rkyv `Snapshot`, applies mutations through a `Durable`-wrapped `QueryWriter` reducer (WAL-backed), recovers via snapshot + WAL replay. | `cargo run -p minkowski-examples --example persist --release` |
-| `replicate` | Pull-based WAL replication. Creates a 20-entity source world, takes a snapshot, writes 10 post-snapshot mutations, then replicates to a second world via `WalCursor` → `ReplicationBatch` (with wire-format round-trip) → `apply_batch`. Verifies source and replica converge to 30 entities. | `cargo run -p minkowski-examples --example replicate --release` |
-| `reducer` | Tour of all 7 reducer handle types in one program: `EntityMut` (heal), `QueryMut` (gravity), `QueryRef` (logger), `Spawner` (spawn projectiles), `QueryWriter` (drag), name-based lookup, access conflict detection between registered reducers, `DynamicCtx` (conditional runtime access with builder-declared bounds), and structural despawn via dynamic iteration. | `cargo run -p minkowski-examples --example reducer --release` |
-| `index` | Column index demo on a `Score` component across two archetypes (200 entities). Builds a `BTreeIndex` for O(log n) range queries and a `HashIndex` for O(1) exact lookups, performs incremental updates via per-index `ChangeTick` after mutations, and validates stale-entry detection after despawn. | `cargo run -p minkowski-examples --example index --release` |
-| `flatworm` | Planarian flatworm simulator with 200 worms over 1 000 frames. Implements chemotaxis (nutrition/distance² gradient via `FoodGrid` spatial index), binary fission when energy exceeds a threshold, starvation despawn below minimum energy, and food respawning. Demonstrates `SpatialIndex` trait, `CommandBuffer` for deferred spawn/despawn, and `QueryMut`/`QueryRef` reducers for movement, metabolism, and census. | `cargo run -p minkowski-examples --example flatworm --release` |
-| `circuit` | Analog circuit simulator: 555 astable oscillator → LCR bandpass filter → 741 voltage follower. Circuit nodes are entities with `Voltage` components; elements (resistors, inductors, op-amp) reference node entities for connectivity. Uses symplectic Euler integration for L/C elements, `QueryMut`/`QueryRef` reducers via `ReducerRegistry`, and prints an ASCII waveform of the filter output. 200K steps at 100 ns timestep. | `cargo run -p minkowski-examples --example circuit --release` |
-| `tactical` | Multi-operator tactical map with server-authoritative replication. Exercises 8 previously uncovered API gaps: sparse components (`insert_sparse`/`iter_sparse`), `par_for_each`, `Optimistic` transactions with `Conflict` inspection, `Entity::to_bits`/`from_bits` for wire serialization, world introspection (`archetype_count`, `component_name`), `register_entity_despawn`, `HashIndex::get_valid()` stale filtering, and `EnumChangeSet`/`MutationRef` iteration for replication packets. Two operator threads communicate with the server via `mpsc` channels. | `cargo run -p minkowski-examples --example tactical --release` |
-| `observe` | Observability companion demo. Captures `MetricsSnapshot` at two points in time (before and after entity churn: 20 despawns + 50 spawns across 2 archetypes), computes `MetricsDiff` with exact entity churn, tick delta, WAL sequence delta, and archetype deltas. Displays human-readable output via `Display` impls. | `cargo run -p minkowski-examples --example observe --release` |
+14 examples cover the full API surface — from basic queries to multi-threaded replication. See [`examples/README.md`](examples/README.md) for the full catalogue.
+
+```
+cargo run -p minkowski-examples --example boids --release     # flocking simulation
+cargo run -p minkowski-examples --example persist --release    # WAL + snapshot lifecycle
+cargo run -p minkowski-examples --example replicate --release  # network replication via channels
+cargo run -p minkowski-examples --example reducer --release    # tour of all 7 reducer handles
+```
 
 ## Python / Jupyter Integration
 
-The `minkowski-py` crate exposes the ECS directly to Python via PyO3. Rust owns storage and computation; Python owns orchestration and analysis. Data crosses the boundary as Arrow RecordBatches — one `memcpy` from BlobVec into Arrow, then zero-copy into Polars DataFrames via `pyo3-arrow`.
+The `minkowski-py` crate exposes the ECS to Python via PyO3. Rust owns storage and computation; Python owns orchestration and analysis. Data crosses the boundary as Arrow RecordBatches, which load directly into Polars DataFrames.
 
 ```python
 import minkowski_py as mk
@@ -240,37 +240,7 @@ The commands teach the paradigm, not just the API — they encode the design pri
 
 ## Architecture Decision Records
 
-- Filtering is replaced by Bitset ANDing.
-- Queries don't plan because the memory layout is the plan.
-- Joins don't exist because archetypes are pre-joined.
-- Defragmentation is constant via swap-remove.
-- Vectorization is guaranteed via 64-byte aligned slices.
-- Persistence is zero-copy via rkyv + mmap.
-- Segmented WAL with user-managed rotation and auto-checkpoints provides reliable crash recovery
-- Safety is compile-time via the split-phase transaction model.
-- ACID-lite: Atomicity and isolation via ChangeSet and split-phase transactions.
-- Indices: O(1) Entity Mapping, O(log N) Range-based and O(1) Archetype Bitsets.
-- Storage: 64-byte aligned, dense SoA with Zero-copy Persistence.
-- Execution: Hardware-native SSE via slice-based auto-vectorization.
-
-Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted. Every feature was designed before implementation — the design conversation catches semantic bugs (concurrent state corruption, entity ID leaks, lock privilege errors) that compilation and tests miss.
-
-## Building & Testing
-
-```
-cargo test -p minkowski                # 383 tests
-cargo clippy --workspace --all-targets -- -D warnings
-cargo bench -p minkowski               # criterion benchmarks vs hecs
-MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
-```
-
-CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggregator job is the single required status check for branch protection — it explicitly verifies all four jobs succeeded, avoiding GitHub's "skipped = passed" loophole.
-
-## Roadmap
-
-| Feature | Rationale |
-|---|---|
-| TUI dashboard | [ratatui][ratatui]-based live dashboard consuming `MetricsSnapshot` via channel. Archetype table, entity churn sparklines, WAL pressure bar. Stretch goal building on the `minkowski-observe` crate |
+Design decisions are documented as ADRs in [`docs/adr/`](docs/adr/). Each records what was decided, what alternatives were considered, and what trade-offs were accepted.
 
 ## Glossary
 
@@ -315,5 +285,4 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [soa]: https://en.wikipedia.org/wiki/AoS_and_SoA#Structure_of_arrays
 [tree-borrows]: https://perso.crans.org/vanille/treebor/
 [uniform-grid]: https://en.wikipedia.org/wiki/Grid_(spatial_index)
-[ratatui]: https://github.com/ratatui/ratatui
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging

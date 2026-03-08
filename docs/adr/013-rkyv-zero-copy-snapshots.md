@@ -9,7 +9,7 @@ Snapshot load deserializes every component value through bincode — allocating 
 
 ## Decision
 
-Replace serde/bincode entirely with rkyv as the sole serialization backend in `minkowski-persist`. Remove the `WireFormat` trait and the `<W>` type parameter from `Wal`, `Snapshot`, and `Durable`. Add `Snapshot::load_zero_copy` for mmap-based snapshot loading that accesses archived data directly.
+Replace serde/bincode entirely with rkyv as the sole serialization backend in `minkowski-persist`. Remove the `WireFormat` trait and the `<W>` type parameter from `Wal`, `Snapshot`, and `Durable`. Add `Snapshot::load` for mmap-based snapshot loading that accesses archived data directly.
 
 **Key insight: the persist crate is pre-1.0 with no external consumers — this is the time to make a clean switch rather than maintaining dual-format complexity.**
 
@@ -25,7 +25,7 @@ Component types registered with `CodecRegistry` must derive `rkyv::{Archive, Ser
 
 - Persistent components derive `rkyv::{Archive, Serialize, Deserialize}` instead of `serde::{Serialize, Deserialize}` — same effort, different syntax
 - `Wal`, `Snapshot`, `Durable` are no longer generic over a wire format — simpler types, simpler construction
-- `Snapshot::load_zero_copy` enables mmap-based snapshot loading — archived component bytes are copied directly into BlobVec columns without per-value typed deserialization
+- `Snapshot::load` enables mmap-based snapshot loading — archived component bytes are copied directly into BlobVec columns without per-value typed deserialization
 - `serde` and `bincode` dependencies removed from the persist crate; `rkyv` and `memmap2` added
 - Existing snapshot files are not forward-compatible — a one-time migration (re-save with the new format)
 - `#[repr(C)]` on components is recommended but not required — rkyv works without it, just without byte-for-byte zero-copy for those types

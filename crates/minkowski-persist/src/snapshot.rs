@@ -30,6 +30,10 @@ impl Snapshot {
     }
 
     /// Save a full world snapshot to disk.
+    ///
+    /// Writes the rkyv payload directly to the file without copying it into
+    /// a second framed buffer. Use `save_to_bytes` when you need the framed
+    /// bytes as a `Vec<u8>` (e.g. for network transfer).
     pub fn save(
         &self,
         path: &Path,
@@ -44,17 +48,46 @@ impl Snapshot {
             entity_count: data.archetypes.iter().map(|a| a.entities.len()).sum(),
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
 
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        let len = bytes.len() as u64;
+        let len = payload.len() as u64;
         writer.write_all(&len.to_le_bytes())?;
-        writer.write_all(&bytes)?;
+        writer.write_all(&payload)?;
         writer.flush()?;
 
         Ok(header)
+    }
+
+    /// Serialize a full world snapshot to bytes.
+    ///
+    /// Returns `(header, wire_bytes)`. The wire format is
+    /// `[len: u64 LE][rkyv payload: len bytes]` — identical to the on-disk
+    /// format. Pass the bytes to `load_from_bytes` on the receiving side.
+    pub fn save_to_bytes(
+        &self,
+        world: &World,
+        codecs: &CodecRegistry,
+        wal_seq: u64,
+    ) -> Result<(SnapshotHeader, Vec<u8>), SnapshotError> {
+        let data = self.build_snapshot_data(world, codecs, wal_seq)?;
+        let header = SnapshotHeader {
+            wal_seq,
+            archetype_count: data.archetypes.len(),
+            entity_count: data.archetypes.iter().map(|a| a.entities.len()).sum(),
+        };
+
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+            .map_err(|e| SnapshotError::Format(e.to_string()))?;
+
+        let len = payload.len() as u64;
+        let mut bytes = Vec::with_capacity(8 + payload.len());
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        Ok((header, bytes))
     }
 
     /// Load a world from a snapshot file.
@@ -74,25 +107,34 @@ impl Snapshot {
     pub fn load(&self, path: &Path, codecs: &CodecRegistry) -> Result<(World, u64), SnapshotError> {
         let file = File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        self.load_from_bytes(&mmap, codecs)
+    }
 
-        if mmap.len() < 8 {
-            return Err(SnapshotError::Format("file too small".to_string()));
+    /// Reconstruct a world from snapshot bytes received over the wire.
+    ///
+    /// Accepts the same `[len: u64 LE][rkyv payload]` format produced by
+    /// `save_to_bytes`. Returns `(world, wal_seq)`.
+    pub fn load_from_bytes(
+        &self,
+        bytes: &[u8],
+        codecs: &CodecRegistry,
+    ) -> Result<(World, u64), SnapshotError> {
+        if bytes.len() < 8 {
+            return Err(SnapshotError::Format("snapshot too small".to_string()));
         }
 
-        // Validate length prefix against actual file size.
-        // Use checked arithmetic to prevent overflow on crafted length prefixes.
-        let len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let end = 8usize
             .checked_add(len)
             .ok_or_else(|| SnapshotError::Format(format!("invalid payload length: {len}")))?;
-        if mmap.len() < end {
+        if bytes.len() < end {
             return Err(SnapshotError::Format(format!(
-                "file truncated: expected {} payload bytes, got {}",
+                "snapshot truncated: expected {} payload bytes, got {}",
                 len,
-                mmap.len() - 8
+                bytes.len() - 8
             )));
         }
-        let payload = &mmap[8..end];
+        let payload = &bytes[8..end];
 
         let archived = rkyv::access::<ArchivedSnapshotData, rkyv::rancor::Error>(payload)
             .map_err(|e| SnapshotError::Format(e.to_string()))?;
@@ -391,6 +433,27 @@ mod tests {
             .collect();
         velocities.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert_eq!(velocities, vec![(3.0, 4.0), (7.0, 8.0)]);
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Vel>(&mut world);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+        world.spawn((Pos { x: 5.0, y: 6.0 },));
+
+        let snap = Snapshot::new();
+        let (header, bytes) = snap.save_to_bytes(&world, &codecs, 99).unwrap();
+        assert_eq!(header.entity_count, 2);
+        assert_eq!(header.wal_seq, 99);
+
+        let (mut world2, wal_seq) = snap.load_from_bytes(&bytes, &codecs).unwrap();
+        assert_eq!(wal_seq, 99);
+        assert_eq!(world2.query::<(&Pos,)>().count(), 2);
+        assert_eq!(world2.query::<(&Vel,)>().count(), 1);
     }
 
     #[test]
