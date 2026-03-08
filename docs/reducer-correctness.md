@@ -27,9 +27,9 @@ A deterministic reducer's output is a pure function of its handle state and args
 
 Query iteration currently visits archetypes in creation order and rows within each archetype in insertion order. This is deterministic given identical world state. However, this is **not a stability guarantee** — do not rely on specific ordering across engine versions.
 
-### Replication implication
+### Replication note
 
-Non-deterministic reducers break WAL replay on replicas. If using `Durable<S>`, the WAL records the changeset produced by each reducer invocation. A replica replaying the WAL gets the same mutations regardless of reducer determinism. But if a reducer is used on both the source and replica (e.g., for validation or live queries), non-determinism causes divergence. Keep reducers deterministic if your architecture involves replicated execution.
+WAL-based replication replays serialized mutation records (`apply_batch`), not reducer code. A replica consuming WAL records gets identical state regardless of reducer determinism — the changeset is the source of truth. Determinism matters only if your architecture re-executes reducers on replicas (e.g., for validation or speculative execution). Pure WAL replay is determinism-agnostic.
 
 ## No Unwinding
 
