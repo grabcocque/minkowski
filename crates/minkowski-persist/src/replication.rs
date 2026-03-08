@@ -15,7 +15,7 @@ use minkowski::{ComponentId, World};
 
 use crate::codec::{CodecError, CodecRegistry};
 use crate::record::ReplicationBatch;
-use crate::wal::apply_record;
+use crate::wal::{apply_record, WalError};
 
 /// Errors from transport-agnostic replication operations.
 ///
@@ -28,6 +28,15 @@ pub enum ReplicationError {
     Format(String),
     #[error("replication codec error: {0}")]
     Codec(#[from] CodecError),
+}
+
+impl From<WalError> for ReplicationError {
+    fn from(e: WalError) -> Self {
+        match e {
+            WalError::Codec(c) => ReplicationError::Codec(c),
+            other => ReplicationError::Format(other.to_string()),
+        }
+    }
 }
 
 impl ReplicationBatch {
@@ -67,8 +76,7 @@ pub fn apply_batch(
 
     let mut last_seq = None;
     for record in &batch.records {
-        apply_record(record, world, codecs, remap.as_ref())
-            .map_err(|e| ReplicationError::Format(e.to_string()))?;
+        apply_record(record, world, codecs, remap.as_ref())?;
         last_seq = Some(record.seq);
     }
 
