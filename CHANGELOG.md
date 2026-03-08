@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.1
+
+### Sparse Data Durability (`minkowski` + `minkowski-persist`)
+
+- **Sparse component mutations now survive WAL crash recovery.** `SparseInsert` and `SparseRemove` variants added to `Mutation`/`MutationRef` enums in `EnumChangeSet`, with full reverse changeset support for undo/redo.
+- New typed helpers on `EnumChangeSet`: `insert_sparse<T>()`, `remove_sparse<T>()`, plus raw pre-resolved variants `insert_sparse_raw()`, `remove_sparse_raw()`.
+- New transaction methods on `Tx`: `write_sparse<T>()`, `remove_sparse<T>()`, and pre-resolved variants.
+- Raw type-erased methods on `SparseStorage`: `insert_raw()`, `get_raw()`, `remove_raw()` for changeset apply and WAL replay.
+- `ComponentRegistry::mark_sparse()` ensures sparse routing flag is set after WAL replay.
+- WAL `SerializedMutation` extended with `SparseInsert`/`SparseRemove` variants for rkyv serialization and cross-process replay.
+- Entity liveness assertions on `SparseInsert`/`SparseRemove` apply paths, matching the existing dense insert safety checks.
+
+### Bug Fixes
+
+- Fixed `World::insert_sparse` calling `register()` instead of `register_sparse()`, which prevented `world.get()` from routing to sparse storage for components inserted via that path.
+
 ## 1.0.0
 
 Initial stable release of the Minkowski column-oriented ECS storage engine.
