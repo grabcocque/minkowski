@@ -49,6 +49,15 @@ pub enum ReducerError {
     },
     /// Transaction conflict (wraps [`Conflict`]).
     TransactionConflict(Conflict),
+    /// The reducer ID does not refer to a valid entry in this registry.
+    /// Caused by using an ID from a different registry or after the
+    /// registry has been rebuilt.
+    InvalidId {
+        /// `"reducer"` or `"dynamic"`.
+        kind: &'static str,
+        index: usize,
+        max: usize,
+    },
 }
 
 impl fmt::Display for ReducerError {
@@ -76,6 +85,12 @@ impl fmt::Display for ReducerError {
             }
             ReducerError::TransactionConflict(c) => {
                 write!(f, "transaction conflict: {c}")
+            }
+            ReducerError::InvalidId { kind, index, max } => {
+                write!(
+                    f,
+                    "invalid {kind} reducer ID (index {index}, registry has {max})"
+                )
             }
         }
     }
@@ -1657,9 +1672,10 @@ impl ReducerRegistry {
 
     /// Call a transactional reducer (entity, spawner, or query writer).
     ///
-    /// Returns `Err(ReducerError::WrongKind)` if the ID points to a
-    /// scheduled reducer, or `Err(ReducerError::TransactionConflict)` if
-    /// the transaction strategy detects a conflict.
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds,
+    /// `Err(ReducerError::WrongKind)` if the ID points to a scheduled
+    /// reducer, or `Err(ReducerError::TransactionConflict)` if the
+    /// transaction strategy detects a conflict.
     pub fn call<S: Transact, Args: Clone + 'static>(
         &self,
         strategy: &S,
@@ -1667,7 +1683,7 @@ impl ReducerRegistry {
         id: ReducerId,
         args: Args,
     ) -> Result<(), ReducerError> {
-        let entry = &self.reducers[id.0];
+        let entry = self.get_entry(id.0)?;
         let adapter = match &entry.kind {
             ReducerKind::Transactional(f) => f,
             ReducerKind::Scheduled(_) => {
@@ -1710,7 +1726,8 @@ impl ReducerRegistry {
 
     /// Run a scheduled query reducer directly. Caller guarantees exclusivity.
     ///
-    /// Returns `Err(ReducerError::WrongKind)` if the ID points to a
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds,
+    /// or `Err(ReducerError::WrongKind)` if the ID points to a
     /// transactional reducer.
     pub fn run<Args: Clone + 'static>(
         &self,
@@ -1718,7 +1735,7 @@ impl ReducerRegistry {
         id: QueryReducerId,
         args: Args,
     ) -> Result<(), ReducerError> {
-        let entry = &self.reducers[id.0];
+        let entry = self.get_entry(id.0)?;
         match &entry.kind {
             ReducerKind::Scheduled(f) => {
                 f(world, &args);
@@ -1758,16 +1775,26 @@ impl ReducerRegistry {
     }
 
     /// Access metadata for a transactional reducer.
+    ///
+    /// # Panics
+    /// Panics if the ID is out of bounds. Use [`reducer_info`](Self::reducer_info)
+    /// for a fallible alternative.
     pub fn reducer_access(&self, id: ReducerId) -> &Access {
         &self.reducers[id.0].access
     }
 
     /// Access metadata for a scheduled query reducer.
+    ///
+    /// # Panics
+    /// Panics if the ID is out of bounds.
     pub fn query_reducer_access(&self, id: QueryReducerId) -> &Access {
         &self.reducers[id.0].access
     }
 
     /// Access metadata by raw index.
+    ///
+    /// # Panics
+    /// Panics if the index is out of bounds.
     pub fn access(&self, idx: usize) -> &Access {
         &self.reducers[idx].access
     }
@@ -1776,7 +1803,8 @@ impl ReducerRegistry {
 
     /// Call a dynamic reducer with a chosen transaction strategy.
     ///
-    /// Returns `Err(ReducerError::TransactionConflict)` if the transaction
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds,
+    /// or `Err(ReducerError::TransactionConflict)` if the transaction
     /// strategy detects a conflict.
     pub fn dynamic_call<S: Transact, Args: 'static>(
         &self,
@@ -1785,7 +1813,7 @@ impl ReducerRegistry {
         id: DynamicReducerId,
         args: &Args,
     ) -> Result<(), ReducerError> {
-        let entry = &self.dynamic_reducers[id.0];
+        let entry = self.get_dynamic_entry(id.0)?;
         let closure = &entry.closure;
         let resolved = &entry.resolved;
         let access = resolved.access();
@@ -1821,6 +1849,9 @@ impl ReducerRegistry {
     }
 
     /// Access metadata for a dynamic reducer.
+    ///
+    /// # Panics
+    /// Panics if the ID is out of bounds.
     pub fn dynamic_access(&self, id: DynamicReducerId) -> &Access {
         self.dynamic_reducers[id.0].resolved.access()
     }
@@ -1828,37 +1859,43 @@ impl ReducerRegistry {
     // ── Introspection ─────────────────────────────────────────────
 
     /// Introspection for a transactional reducer.
-    pub fn reducer_info(&self, id: ReducerId) -> ReducerInfo {
-        let entry = &self.reducers[id.0];
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds.
+    pub fn reducer_info(&self, id: ReducerId) -> Result<ReducerInfo, ReducerError> {
+        let entry = self.get_entry(id.0)?;
         let kind = match &entry.kind {
             ReducerKind::Transactional(_) => "transactional",
             ReducerKind::Scheduled(_) => "scheduled",
         };
-        ReducerInfo {
+        Ok(ReducerInfo {
             name: entry.name,
             kind,
             access: entry.access.clone(),
             has_change_tracking: entry.last_read_tick.is_some(),
             can_despawn: entry.access.despawns(),
-        }
+        })
     }
 
     /// Introspection for a scheduled query reducer.
-    pub fn query_reducer_info(&self, id: QueryReducerId) -> ReducerInfo {
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds.
+    pub fn query_reducer_info(&self, id: QueryReducerId) -> Result<ReducerInfo, ReducerError> {
         self.reducer_info(ReducerId(id.0))
     }
 
     /// Introspection for a dynamic reducer.
-    pub fn dynamic_reducer_info(&self, id: DynamicReducerId) -> ReducerInfo {
-        let entry = &self.dynamic_reducers[id.0];
+    ///
+    /// Returns `Err(ReducerError::InvalidId)` if the ID is out of bounds.
+    pub fn dynamic_reducer_info(&self, id: DynamicReducerId) -> Result<ReducerInfo, ReducerError> {
+        let entry = self.get_dynamic_entry(id.0)?;
         let access = entry.resolved.access().clone();
-        ReducerInfo {
+        Ok(ReducerInfo {
             name: entry.name,
             kind: "dynamic",
             access: access.clone(),
             has_change_tracking: true, // dynamic reducers always have tick tracking
             can_despawn: access.despawns(),
-        }
+        })
     }
 
     /// Number of registered unified reducers (transactional + scheduled).
@@ -1877,6 +1914,24 @@ impl ReducerRegistry {
     }
 
     // ── Internal ─────────────────────────────────────────────────
+
+    fn get_entry(&self, index: usize) -> Result<&ReducerEntry, ReducerError> {
+        self.reducers.get(index).ok_or(ReducerError::InvalidId {
+            kind: "reducer",
+            index,
+            max: self.reducers.len(),
+        })
+    }
+
+    fn get_dynamic_entry(&self, index: usize) -> Result<&DynamicReducerEntry, ReducerError> {
+        self.dynamic_reducers
+            .get(index)
+            .ok_or(ReducerError::InvalidId {
+                kind: "dynamic",
+                index,
+                max: self.dynamic_reducers.len(),
+            })
+    }
 
     fn push_entry(
         &mut self,
@@ -3974,7 +4029,7 @@ mod tests {
         let id = registry
             .register_entity::<(Health,), (), _>(&mut world, "heal", |_e, ()| {})
             .unwrap();
-        let info = registry.reducer_info(id);
+        let info = registry.reducer_info(id).unwrap();
         assert_eq!(info.name, "heal");
         assert_eq!(info.kind, "transactional");
         assert!(!info.can_despawn);
@@ -3988,7 +4043,7 @@ mod tests {
         let id = registry
             .register_entity_despawn::<(Health,), (), _>(&mut world, "kill", |_e, ()| {})
             .unwrap();
-        let info = registry.reducer_info(id);
+        let info = registry.reducer_info(id).unwrap();
         assert_eq!(info.name, "kill");
         assert!(info.can_despawn);
     }
@@ -4000,7 +4055,7 @@ mod tests {
         let id = registry
             .register_query_writer::<(&mut Pos,), (), _>(&mut world, "move", |_qw, ()| {})
             .unwrap();
-        let info = registry.reducer_info(id);
+        let info = registry.reducer_info(id).unwrap();
         assert_eq!(info.name, "move");
         assert!(info.has_change_tracking);
     }
@@ -4012,7 +4067,7 @@ mod tests {
         let id = registry
             .register_query::<(&mut Pos,), (), _>(&mut world, "move", |_q, ()| {})
             .unwrap();
-        let info = registry.query_reducer_info(id);
+        let info = registry.query_reducer_info(id).unwrap();
         assert_eq!(info.name, "move");
         assert_eq!(info.kind, "scheduled");
     }
@@ -4028,7 +4083,7 @@ mod tests {
             .can_despawn()
             .build(|_ctx: &mut DynamicCtx, _args: &()| {})
             .unwrap();
-        let info = registry.dynamic_reducer_info(id);
+        let info = registry.dynamic_reducer_info(id).unwrap();
         assert_eq!(info.name, "dyn_test");
         assert_eq!(info.kind, "dynamic");
         assert!(info.can_despawn);
@@ -4127,5 +4182,81 @@ mod tests {
         );
 
         assert!(ctx.can_despawn());
+    }
+
+    // ── InvalidId bounds-check tests ─────────────────────────────────
+
+    #[test]
+    fn call_with_invalid_reducer_id() {
+        let mut world = World::new();
+        let strategy = crate::Optimistic::new(&world);
+        let registry = ReducerRegistry::new();
+        let bogus = ReducerId(999);
+        let result = registry.call(&strategy, &mut world, bogus, ());
+        assert!(matches!(
+            result,
+            Err(ReducerError::InvalidId {
+                kind: "reducer",
+                index: 999,
+                max: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn run_with_invalid_query_reducer_id() {
+        let mut world = World::new();
+        let registry = ReducerRegistry::new();
+        let bogus = QueryReducerId(42);
+        let result = registry.run(&mut world, bogus, ());
+        assert!(matches!(
+            result,
+            Err(ReducerError::InvalidId {
+                kind: "reducer",
+                index: 42,
+                max: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn dynamic_call_with_invalid_id() {
+        let mut world = World::new();
+        let strategy = crate::Optimistic::new(&world);
+        let registry = ReducerRegistry::new();
+        let bogus = DynamicReducerId(7);
+        let result = registry.dynamic_call(&strategy, &mut world, bogus, &());
+        assert!(matches!(
+            result,
+            Err(ReducerError::InvalidId {
+                kind: "dynamic",
+                index: 7,
+                max: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn reducer_info_with_invalid_id() {
+        let registry = ReducerRegistry::new();
+        let bogus = ReducerId(0);
+        let result = registry.reducer_info(bogus);
+        assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
+    }
+
+    #[test]
+    fn query_reducer_info_with_invalid_id() {
+        let registry = ReducerRegistry::new();
+        let bogus = QueryReducerId(0);
+        let result = registry.query_reducer_info(bogus);
+        assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
+    }
+
+    #[test]
+    fn dynamic_reducer_info_with_invalid_id() {
+        let registry = ReducerRegistry::new();
+        let bogus = DynamicReducerId(0);
+        let result = registry.dynamic_reducer_info(bogus);
+        assert!(matches!(result, Err(ReducerError::InvalidId { .. })));
     }
 }
