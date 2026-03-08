@@ -39,7 +39,7 @@ Determine which files to analyze:
 
 **Persistence (I/O hot paths)** — `crates/minkowski-persist/src/`
 - `wal.rs` — `append`, `replay_from`, `scan_last_seq`
-- `snapshot.rs` — `save`, `load`, `load_zero_copy`
+- `snapshot.rs` — `save`, `save_to_bytes`, `load`, `load_from_bytes`
 - `codec.rs` — `serialize`, `deserialize`, `raw_copy_size` usage
 - `format.rs` — `serialize_record`, `deserialize_record`
 
@@ -100,7 +100,7 @@ Use the Agent tool with this prompt:
 > Check:
 > 1. **`raw_copy_size` coverage**: For each component type registered with `CodecRegistry`, determine if `raw_copy_size` would return `Some` (i.e., `size_of::<T>() == size_of::<T::Archived>()`). If not, explain why — missing `#[repr(C)]`, non-trivial archived layout (e.g., `String`, `Vec`), or platform-dependent sizes.
 > 2. **WAL append/replay**: In `wal.rs` `append` and `replay_from`, look for unnecessary heap allocations, redundant copies, or intermediate `Vec<u8>` buffers that could be eliminated.
-> 3. **Snapshot zero-copy path**: In `snapshot.rs` `load_zero_copy`, verify that components with `raw_copy_size == Some` actually take the direct-copy path and don't fall through to `codecs.deserialize()`. Check `save` for avoidable allocations.
+> 3. **Snapshot zero-copy path**: In `snapshot.rs` `load` / `load_from_bytes`, verify that components with `raw_copy_size == Some` actually take the direct-copy path and don't fall through to `codecs.deserialize()`. Check `save` for avoidable allocations.
 > 4. **Codec closures**: In `codec.rs`, examine the `serialize_fn` and `deserialize_fn` closures for avoidable work — unnecessary clones, redundant validation, allocations that could be reused.
 > 5. **Format layer**: In `format.rs`, check `serialize_record`/`deserialize_record` for intermediate buffers or copies between rkyv and the wire format.
 >
