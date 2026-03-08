@@ -2328,4 +2328,148 @@ mod tests {
         let _: Vec<_> = world.query::<(&Pos,)>().collect();
         assert_eq!(world.stats().query_cache_len, 1);
     }
+
+    // ── remove: empty-archetype path ─────────────────────────────
+
+    #[test]
+    fn remove_last_component_moves_to_empty_archetype() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let removed = world.remove::<Pos>(e);
+        assert_eq!(removed, Some(Pos { x: 1.0, y: 2.0 }));
+        assert!(world.is_alive(e));
+        assert!(world.is_placed(e));
+        // Entity is alive with no components
+        assert_eq!(world.get::<Pos>(e), None);
+        assert_eq!(world.query::<(&Pos,)>().count(), 0);
+    }
+
+    #[test]
+    fn remove_last_component_swap_fixup() {
+        // Removing a non-last row in a single-component archetype triggers
+        // swap-remove; verify the swapped entity's location is updated.
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        let e3 = world.spawn((Pos { x: 3.0, y: 0.0 },));
+        // e1 is row 0, e2 is row 1, e3 is row 2
+        // Removing the only component from e1 swap-removes row 0, e3 fills gap
+        world.remove::<Pos>(e1);
+        assert!(world.is_alive(e1));
+        assert_eq!(world.get::<Pos>(e1), None);
+        assert_eq!(world.get::<Pos>(e2), Some(&Pos { x: 2.0, y: 0.0 }));
+        assert_eq!(world.get::<Pos>(e3), Some(&Pos { x: 3.0, y: 0.0 }));
+    }
+
+    #[test]
+    fn remove_last_component_with_multiple_columns() {
+        // Entity has (Pos, Vel); remove Pos, then remove Vel.
+        // Second remove hits the empty-archetype path with remaining columns
+        // that need drop via swap_remove.
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 3.0, dy: 4.0 }));
+        let _pos = world.remove::<Pos>(e);
+        // Now entity has only Vel
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 3.0, dy: 4.0 }));
+        // Remove last component
+        let vel = world.remove::<Vel>(e);
+        assert_eq!(vel, Some(Vel { dx: 3.0, dy: 4.0 }));
+        assert!(world.is_alive(e));
+        assert_eq!(world.get::<Vel>(e), None);
+    }
+
+    // ── remove: dead entity and missing component paths ──────────
+
+    #[test]
+    fn remove_dead_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.despawn(e);
+        assert_eq!(world.remove::<Pos>(e), None);
+    }
+
+    #[test]
+    fn remove_component_entity_doesnt_have() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        assert_eq!(world.remove::<Vel>(e), None);
+    }
+
+    // ── get: sparse component path ───────────────────────────────
+
+    #[test]
+    fn get_sparse_component() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert_sparse(e, Health(42));
+        assert_eq!(world.get::<Health>(e), Some(&Health(42)));
+    }
+
+    #[test]
+    fn get_mut_sparse_component() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        world.insert_sparse(e, Health(42));
+        *world.get_mut::<Health>(e).unwrap() = Health(99);
+        assert_eq!(world.get::<Health>(e), Some(&Health(99)));
+    }
+
+    // ── has: sparse component path ───────────────────────────────
+
+    #[test]
+    fn has_sparse_component() {
+        let mut world = World::new();
+        world.components.register_sparse::<Health>();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+        assert!(!world.has::<Health>(e));
+        world.insert_sparse(e, Health(42));
+        assert!(world.has::<Health>(e));
+    }
+
+    // ── query: cache invalidation on new component registration ──
+
+    #[test]
+    fn query_cache_invalidated_on_new_component_registration() {
+        // If a component is registered after the query cache entry is created,
+        // the required bitset changes and the cache must rescan from scratch.
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        // First query: Vel not yet registered, bitset uses whatever IDs exist
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 0);
+        // Register Vel explicitly and add an entity that matches
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { dx: 1.0, dy: 0.0 }));
+        // The required bitset for (&Pos, &Vel) may have changed if Vel was
+        // registered between the first and second query call.
+        assert_eq!(world.query::<(&Pos, &Vel)>().count(), 1);
+    }
+
+    // ── despawn_batch: unplaced entity ───────────────────────────
+
+    #[test]
+    fn despawn_batch_skips_unplaced() {
+        let mut world = World::new();
+        let placed = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let unplaced = world.alloc_entity();
+        assert!(!world.is_placed(unplaced));
+        let count = world.despawn_batch(&[placed, unplaced]);
+        // Only the placed entity counts
+        assert_eq!(count, 1);
+        assert!(!world.is_alive(placed));
+    }
+
+    // ── despawn_batch: last-row removal (no swap needed) ─────────
+
+    #[test]
+    fn despawn_batch_last_row_no_swap() {
+        let mut world = World::new();
+        let _a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        // b is the last row — swap_remove just truncates, no copy needed
+        let count = world.despawn_batch(&[b]);
+        assert_eq!(count, 1);
+        assert!(!world.is_alive(b));
+        assert_eq!(world.get::<Pos>(_a).unwrap().x, 1.0);
+    }
 }
