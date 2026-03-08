@@ -1,1 +1,151 @@
 //! Rate computation from consecutive snapshots.
+
+use std::time::Duration;
+
+use crate::snapshot::MetricsSnapshot;
+
+/// Rates computed from two consecutive snapshots.
+#[derive(Clone, Debug)]
+pub struct MetricsDiff {
+    pub elapsed: Duration,
+    pub entity_delta: i64,
+    pub entity_churn: u64,
+    pub tick_delta: u64,
+    pub wal_seq_delta: u64,
+    pub archetype_delta: i64,
+    pub largest_archetypes: Vec<(usize, usize)>,
+}
+
+impl MetricsDiff {
+    /// Compute rates and deltas from two consecutive snapshots.
+    pub fn compute(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Self {
+        let elapsed = after.timestamp.duration_since(before.timestamp);
+
+        let entity_delta = after.world.entity_count as i64 - before.world.entity_count as i64;
+
+        // Churn estimation:
+        // free_list_growth ≈ despawns (each despawn pushes to free list)
+        // spawns ≈ entity_delta + despawns
+        let free_list_growth = after
+            .world
+            .free_list_len
+            .saturating_sub(before.world.free_list_len);
+        let despawns = free_list_growth as u64;
+        let spawns = (entity_delta + despawns as i64).max(0) as u64;
+        let entity_churn = spawns + despawns;
+
+        let tick_delta = after
+            .world
+            .current_tick
+            .saturating_sub(before.world.current_tick);
+
+        let wal_seq_delta = match (before.wal, after.wal) {
+            (Some(b), Some(a)) => a.next_seq.saturating_sub(b.next_seq),
+            _ => 0,
+        };
+
+        let archetype_delta =
+            after.world.archetype_count as i64 - before.world.archetype_count as i64;
+
+        // Top 5 archetypes by entity count (from the `after` snapshot)
+        let mut sorted: Vec<(usize, usize)> = after
+            .archetypes
+            .iter()
+            .filter(|a| a.entity_count > 0)
+            .map(|a| (a.id, a.entity_count))
+            .collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.truncate(5);
+
+        Self {
+            elapsed,
+            entity_delta,
+            entity_churn,
+            tick_delta,
+            wal_seq_delta,
+            archetype_delta,
+            largest_archetypes: sorted,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minkowski::World;
+
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
+
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    struct Vel {
+        dx: f32,
+        dy: f32,
+    }
+
+    #[test]
+    fn diff_entity_delta() {
+        let mut world = World::new();
+        let before = MetricsSnapshot::capture(&world, None);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.spawn((Pos { x: 3.0, y: 4.0 },));
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        assert_eq!(diff.entity_delta, 2);
+        assert!(diff.tick_delta > 0);
+        assert_eq!(diff.wal_seq_delta, 0);
+    }
+
+    #[test]
+    fn diff_churn_estimation() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        let before = MetricsSnapshot::capture(&world, None);
+
+        world.despawn(e1);
+        world.despawn(e2);
+        world.spawn((Pos { x: 5.0, y: 6.0 },));
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        assert_eq!(diff.entity_delta, -1);
+        // Churn estimation undercounts when free list recycling happens
+        // in the same interval: 2 despawns + 1 spawn, but spawn recycles
+        // from the free list so free_list_growth is only 1.
+        assert!(diff.entity_churn >= 1);
+    }
+
+    #[test]
+    fn diff_largest_archetypes() {
+        let mut world = World::new();
+        for _ in 0..10 {
+            world.spawn((Pos { x: 1.0, y: 2.0 },));
+        }
+        let before = MetricsSnapshot::capture(&world, None);
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        assert!(!diff.largest_archetypes.is_empty());
+        assert_eq!(diff.largest_archetypes[0].1, 10);
+    }
+
+    #[test]
+    fn diff_archetype_delta() {
+        let mut world = World::new();
+        let before = MetricsSnapshot::capture(&world, None);
+
+        world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.1, dy: 0.2 }));
+        let after = MetricsSnapshot::capture(&world, None);
+
+        let diff = MetricsDiff::compute(&before, &after);
+        assert!(diff.archetype_delta >= 1);
+    }
+}
