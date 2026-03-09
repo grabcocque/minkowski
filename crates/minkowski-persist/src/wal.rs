@@ -8,13 +8,29 @@ use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 use crate::codec::{CodecError, CodecRegistry};
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 
-// WAL frame format: `[len: u32 LE][crc32: u32 LE][payload: len bytes]` repeated.
+// WAL segment format (v2):
+//   [segment_magic: 4 bytes "MKW2"]
+//   [frame0: len+crc+payload]          — schema preamble
+//   [frame1: len+crc+payload]          — data / checkpoint
+//   ...
+//
+// Frame format: `[len: u32 LE][crc32: u32 LE][payload: len bytes]`.
 // Each payload is a `WalEntry` (Schema | Mutations | Checkpoint) serialized
 // through rkyv. The CRC32 (Castagnoli via crc32fast) covers the payload bytes
 // and catches silent data corruption that rkyv validation alone might miss.
+//
+// Legacy v1 segments (no magic header, no CRC32) are detected at open time
+// and produce a hard `WalError::Format` error — they are never silently
+// truncated or reinterpreted.
 
 /// Frame header size: 4 bytes length + 4 bytes CRC32.
 const FRAME_HEADER_SIZE: u64 = 8;
+
+/// Segment file magic identifying v2 format with CRC32 checksums.
+const SEGMENT_MAGIC: [u8; 4] = *b"MKW2";
+
+/// Size of the segment magic header in bytes.
+const SEGMENT_MAGIC_SIZE: u64 = 4;
 
 /// Read exactly `buf.len()` bytes from `file` starting at byte offset `pos`.
 fn read_exact_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -91,6 +107,35 @@ pub(crate) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError>
     }
     segments.sort_by_key(|(seq, _)| *seq);
     Ok(segments)
+}
+
+/// Validate the segment magic at the start of a file. Returns `Ok(())` if
+/// the magic matches v2 format. Returns `Err(WalError::Format)` with a
+/// descriptive message if the file uses a legacy v1 format (no magic header).
+/// Returns `Ok(())` on UnexpectedEof (empty/torn file — caller handles recovery).
+fn validate_segment_magic(file: &File, path: &Path) -> Result<(), WalError> {
+    let mut buf = [0u8; SEGMENT_MAGIC_SIZE as usize];
+    match read_exact_at(file, 0, &mut buf) {
+        Ok(()) => {}
+        // Empty or torn file — not a legacy format issue, just incomplete.
+        // Caller handles this via truncation / rewrite.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    if buf != SEGMENT_MAGIC {
+        return Err(WalError::Format(format!(
+            "segment {} uses legacy v1 format (no CRC32 checksums); \
+             migrate by replaying into a new WAL or rebuild from snapshot",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Write the segment magic header. Returns bytes written (always SEGMENT_MAGIC_SIZE).
+fn write_segment_magic(writer: &mut BufWriter<&File>) -> Result<u64, WalError> {
+    writer.write_all(&SEGMENT_MAGIC)?;
+    Ok(SEGMENT_MAGIC_SIZE)
 }
 
 /// Try to read the next WAL entry at byte offset `pos`.
@@ -300,7 +345,7 @@ impl Wal {
             last_checkpoint_seq: None,
             bytes_since_checkpoint: 0,
         };
-        wal.active_bytes = wal.write_schema_preamble()?;
+        wal.active_bytes = wal.write_segment_header()?;
         Ok(wal)
     }
 
@@ -317,10 +362,21 @@ impl Wal {
 
         let (last_start_seq, last_path) = segments.last().unwrap().clone();
 
+        // Validate magic on all sealed segments before touching the active one.
+        // A legacy v1 segment must produce a hard error, not silent truncation.
+        for (_, seg_path) in segments.iter().rev().skip(1) {
+            let seg_file = File::open(seg_path)?;
+            validate_segment_magic(&seg_file, seg_path)?;
+        }
+
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(&last_path)?;
+
+        // Validate magic on the active segment. Empty/torn files pass through
+        // (validate_segment_magic returns Ok on UnexpectedEof).
+        validate_segment_magic(&file, &last_path)?;
 
         let schema = Self::build_schema(codecs);
 
@@ -336,16 +392,16 @@ impl Wal {
             bytes_since_checkpoint: 0,
         };
 
-        // Crash recovery: scan the active segment, truncating torn/corrupt tail
+        // Crash recovery: scan the active segment, truncating torn/corrupt tail.
+        // Frame scanning starts after the segment magic header.
         let (active_last_seq, active_has) = wal.scan_active_segment()?;
         wal.active_bytes = wal.active_file.metadata()?.len();
 
-        // If crash recovery truncated the schema preamble itself (e.g. a
-        // crash during roll_segment tore the very first frame), the segment
-        // is empty and no longer self-describing. Rewrite the preamble so
-        // subsequent appends produce a valid, cross-process-replayable segment.
-        if wal.active_bytes == 0 {
-            wal.active_bytes = wal.write_schema_preamble()?;
+        // If crash recovery truncated the segment to empty (or below magic
+        // size), rewrite the full segment header (magic + schema preamble).
+        if wal.active_bytes <= SEGMENT_MAGIC_SIZE {
+            wal.active_file.set_len(0)?;
+            wal.active_bytes = wal.write_segment_header()?;
         }
 
         if active_has {
@@ -354,7 +410,7 @@ impl Wal {
             // Active segment has no mutations — check earlier segments
             for (_, seg_path) in segments.iter().rev().skip(1) {
                 let seg_file = File::open(seg_path)?;
-                let mut pos: u64 = 0;
+                let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_last = 0u64;
                 let mut seg_has = false;
                 while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
@@ -389,7 +445,7 @@ impl Wal {
         if wal.last_checkpoint_seq.is_none() {
             for (_, seg_path) in segments.iter().rev().skip(1) {
                 let seg_file = File::open(seg_path)?;
-                let mut pos: u64 = 0;
+                let mut pos: u64 = SEGMENT_MAGIC_SIZE;
                 let mut seg_mutation_bytes: u64 = 0;
                 let mut found = false;
                 while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
@@ -531,7 +587,8 @@ impl Wal {
 
         for (_, seg_path) in &segments {
             let seg_file = File::open(seg_path)?;
-            let mut pos: u64 = 0;
+            validate_segment_magic(&seg_file, seg_path)?;
+            let mut pos: u64 = SEGMENT_MAGIC_SIZE;
             let mut remap: Option<HashMap<ComponentId, ComponentId>> = None;
 
             while let Some((entry, next_pos)) = read_next_frame(&seg_file, pos)? {
@@ -607,13 +664,16 @@ impl Wal {
         WalSchema { components }
     }
 
-    /// Write a schema preamble to the active segment. Returns bytes written.
-    fn write_schema_preamble(&mut self) -> Result<u64, WalError> {
+    /// Write the segment header (magic + schema preamble) to the active
+    /// segment. Returns total bytes written (magic + frame).
+    fn write_segment_header(&mut self) -> Result<u64, WalError> {
         let entry = WalEntry::Schema(self.schema.clone());
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
             .map_err(|e| WalError::Format(e.to_string()))?;
         let mut writer = BufWriter::new(&self.active_file);
-        write_frame(&mut writer, &payload)
+        let magic_bytes = write_segment_magic(&mut writer)?;
+        let frame_bytes = write_frame(&mut writer, &payload)?;
+        Ok(magic_bytes + frame_bytes)
     }
 
     /// Roll to a new segment file. All I/O completes before internal state
@@ -626,13 +686,16 @@ impl Wal {
             .read(true)
             .open(&seg_path)?;
 
-        // Write schema preamble to the NEW file before touching self.
+        // Write segment header (magic + schema preamble) to the NEW file
+        // before touching self.
         let entry = WalEntry::Schema(self.schema.clone());
         let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
             .map_err(|e| WalError::Format(e.to_string()))?;
         let preamble_bytes = {
             let mut writer = BufWriter::new(&file);
-            write_frame(&mut writer, &payload)?
+            let magic_bytes = write_segment_magic(&mut writer)?;
+            let frame_bytes = write_frame(&mut writer, &payload)?;
+            magic_bytes + frame_bytes
         };
 
         // All I/O succeeded — atomically update state.
@@ -664,7 +727,7 @@ impl Wal {
     fn scan_active_segment(&mut self) -> Result<(u64, bool), WalError> {
         let mut last_seq = 0u64;
         let mut has_mutations = false;
-        let mut pos: u64 = 0;
+        let mut pos: u64 = SEGMENT_MAGIC_SIZE;
         let mut bytes_after_checkpoint: u64 = 0;
 
         while let Some((entry, next_pos)) = self.read_next_entry(pos)? {
@@ -817,7 +880,8 @@ impl WalCursor {
 
         let (start_seq, seg_path) = &segments[seg_idx];
         let file = File::open(seg_path)?;
-        let mut pos: u64 = 0;
+        validate_segment_magic(&file, seg_path)?;
+        let mut pos: u64 = SEGMENT_MAGIC_SIZE;
         let mut schema = None;
 
         // Scan forward to from_seq
@@ -897,10 +961,13 @@ impl WalCursor {
         match next {
             Some((start_seq, path)) => {
                 self.file = File::open(path)?;
-                self.pos = 0;
+                validate_segment_magic(&self.file, path)?;
+                self.pos = SEGMENT_MAGIC_SIZE;
                 self.current_segment_start_seq = *start_seq;
                 // Parse schema preamble of new segment
-                if let Some((WalEntry::Schema(s), next_pos)) = read_next_frame(&self.file, 0)? {
+                if let Some((WalEntry::Schema(s), next_pos)) =
+                    read_next_frame(&self.file, SEGMENT_MAGIC_SIZE)?
+                {
                     self.schema = Some(s);
                     self.pos = next_pos;
                 }
@@ -1355,11 +1422,12 @@ mod tests {
             "should have rolled to multiple segments"
         );
 
-        // Every segment should start with a schema preamble
+        // Every segment should start with magic + schema preamble
         let segments = list_segments(&wal_dir).unwrap();
         for (_, seg_path) in &segments {
             let file = File::open(seg_path).unwrap();
-            let (entry, _) = read_next_frame(&file, 0).unwrap().unwrap();
+            // First frame starts after the 4-byte segment magic.
+            let (entry, _) = read_next_frame(&file, SEGMENT_MAGIC_SIZE).unwrap().unwrap();
             assert!(matches!(entry, WalEntry::Schema(_)));
         }
     }
@@ -2182,5 +2250,131 @@ mod tests {
     #[test]
     fn frame_header_size_is_eight() {
         assert_eq!(FRAME_HEADER_SIZE, 8);
+    }
+
+    // ── Legacy v1 format detection tests ─────────────────────────────
+
+    #[test]
+    fn legacy_v1_segment_detected_on_open() {
+        // Simulate a legacy v1 segment: [len: u32 LE][payload] with no magic.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("legacy.wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Write a fake v1 segment: starts with a u32 length (no "MKW2" magic).
+        let seg_path = wal_dir.join(segment_filename(0));
+        {
+            use std::io::Write;
+            let mut f = File::create(&seg_path).unwrap();
+            // Write a plausible v1 frame: [len=100][100 bytes of data]
+            f.write_all(&100u32.to_le_bytes()).unwrap();
+            f.write_all(&[0u8; 100]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let codecs = CodecRegistry::new();
+        let result = Wal::open(&wal_dir, &codecs, default_config());
+        let msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("legacy segment should produce an error"),
+        };
+        assert!(
+            msg.contains("legacy v1 format"),
+            "error should mention legacy format: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_segment_detected_on_replay() {
+        // Create a valid v2 WAL, then corrupt one sealed segment to look like v1.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("legacy_replay.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register_as::<Pos>("pos", &mut world);
+
+        let mut wal = Wal::create(&wal_dir, &codecs, small_config()).unwrap();
+
+        // Write enough to create multiple segments.
+        for i in 0..20 {
+            let e = world.alloc_entity();
+            let mut cs = EnumChangeSet::new();
+            cs.spawn_bundle(
+                &mut world,
+                e,
+                (Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },),
+            );
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+        }
+        assert!(wal.segment_count() > 1);
+
+        // Overwrite the first segment's magic with garbage to simulate v1.
+        let segments = list_segments(&wal_dir).unwrap();
+        let (_, first_seg_path) = &segments[0];
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().write(true).open(first_seg_path).unwrap();
+            // Overwrite the 4-byte magic with a v1-style length prefix.
+            f.write_all(&50u32.to_le_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        // Replay should detect the corrupted segment magic and error.
+        let mut world2 = World::new();
+        codecs.register_one(world.component_id::<Pos>().unwrap(), &mut world2);
+        let result = wal.replay(&mut world2, &codecs);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("legacy v1 format"),
+            "replay should detect legacy format: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_segment_detected_on_cursor_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("legacy_cursor.wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Write a fake v1 segment.
+        let seg_path = wal_dir.join(segment_filename(0));
+        {
+            use std::io::Write;
+            let mut f = File::create(&seg_path).unwrap();
+            f.write_all(&100u32.to_le_bytes()).unwrap();
+            f.write_all(&[0u8; 100]).unwrap();
+            f.flush().unwrap();
+        }
+
+        let result = WalCursor::open(&wal_dir, 0);
+        let msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("cursor should produce an error for legacy segment"),
+        };
+        assert!(
+            msg.contains("legacy v1 format"),
+            "cursor should detect legacy format: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_segment_magic_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("v2_magic.wal");
+
+        let codecs = CodecRegistry::new();
+
+        let _wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+
+        let seg_path = wal_dir.join(segment_filename(0));
+        let data = std::fs::read(&seg_path).unwrap();
+        assert!(data.len() >= 4);
+        assert_eq!(&data[0..4], b"MKW2", "segment must start with v2 magic");
     }
 }
