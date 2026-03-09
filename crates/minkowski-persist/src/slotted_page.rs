@@ -287,15 +287,15 @@ impl SlottedPage {
     /// or crafted data). Individual slot entries are validated lazily
     /// by `get()` — this method only checks structural invariants.
     pub fn read_from<R: Read>(reader: &mut R, page_size: usize) -> io::Result<Self> {
-        let mut data = vec![0u8; page_size];
-        reader.read_exact(&mut data)?;
-
         if page_size < PAGE_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("page too small ({page_size}) to contain header"),
             ));
         }
+
+        let mut data = vec![0u8; page_size];
+        reader.read_exact(&mut data)?;
 
         let mut header_buf = [0u8; PAGE_HEADER_SIZE];
         header_buf.copy_from_slice(&data[0..PAGE_HEADER_SIZE]);
@@ -877,5 +877,15 @@ mod tests {
         assert!(result.is_err());
         let msg = result.err().expect("should be Err").to_string();
         assert!(msg.contains("data_offset"), "{msg}");
+    }
+
+    #[test]
+    fn read_from_undersized_page_returns_error() {
+        // page_size < PAGE_HEADER_SIZE must return an error, not panic.
+        let tiny = vec![0u8; 4];
+        let result = SlottedPage::read_from(&mut tiny.as_slice(), 4);
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("too small"), "{msg}");
     }
 }
