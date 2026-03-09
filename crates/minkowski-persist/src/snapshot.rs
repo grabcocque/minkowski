@@ -137,8 +137,7 @@ impl Snapshot {
 
         // Detect format: v2 starts with SNAPSHOT_MAGIC, v1 starts with a u64 length.
         let (payload_offset, stored_crc) = if bytes[..4] == SNAPSHOT_MAGIC {
-            let stored_crc =
-                u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            let stored_crc = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             (SNAPSHOT_HEADER_SIZE, Some(stored_crc))
         } else {
             // Legacy v1 format (length-only, no magic/CRC). Accept for
@@ -914,7 +913,10 @@ mod tests {
         let result = snap.load(&snap_path, &codecs);
         let err = result.err().expect("should fail with CRC mismatch");
         let msg = format!("{err}");
-        assert!(msg.contains("checksum mismatch"), "error should mention checksum: {msg}");
+        assert!(
+            msg.contains("checksum mismatch"),
+            "error should mention checksum: {msg}"
+        );
     }
 
     #[test]
@@ -933,7 +935,10 @@ mod tests {
         let result = snap.load_from_bytes(&bytes, &codecs);
         let err = result.err().expect("should fail with CRC mismatch");
         let msg = format!("{err}");
-        assert!(msg.contains("checksum mismatch"), "error should mention checksum: {msg}");
+        assert!(
+            msg.contains("checksum mismatch"),
+            "error should mention checksum: {msg}"
+        );
     }
 
     #[test]

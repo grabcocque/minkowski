@@ -73,8 +73,7 @@ impl Arena {
         if self.capacity > 0 {
             unsafe {
                 std::ptr::copy_nonoverlapping(self.data.as_ptr(), new_data.as_ptr(), self.len);
-                let old_layout =
-                    Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
+                let old_layout = Layout::from_size_align(self.capacity, ARENA_ALIGN).unwrap();
                 alloc::dealloc(self.data.as_ptr(), old_layout);
             }
         }
