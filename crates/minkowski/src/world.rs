@@ -1251,7 +1251,17 @@ impl World {
     pub fn has_changed<Q: WorldQuery + 'static>(&self) -> bool {
         let type_id = TypeId::of::<Q>();
         let last_read_tick = match self.query_cache.get(&type_id) {
-            Some(entry) => entry.last_read_tick,
+            Some(entry) => {
+                // If the previous iterator was iterated, the pending tick
+                // represents the most recent baseline (not yet committed to
+                // last_read_tick — that happens on the next query() call).
+                // Use it so has_changed doesn't report stale true results.
+                if entry.iterated.load(std::sync::atomic::Ordering::Relaxed) {
+                    entry.pending_read_tick.unwrap_or(entry.last_read_tick)
+                } else {
+                    entry.last_read_tick
+                }
+            }
             // No cache entry means never queried — first query will see everything.
             None => return false,
         };
@@ -2810,6 +2820,31 @@ mod tests {
         // After iteration, no more changes.
         let count = world.query::<(Changed<Pos>,)>().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn has_changed_uses_pending_tick_after_iteration() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Baseline.
+        let _ = world.query::<(Changed<Pos>,)>().count();
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Iterate to consume the change.
+        let count = world.query::<(Changed<Pos>,)>().count();
+        assert_eq!(count, 1);
+
+        // has_changed BEFORE the next query() call — the pending tick
+        // hasn't been committed yet, but has_changed should use it
+        // so it doesn't report stale true.
+        assert!(
+            !world.has_changed::<(Changed<Pos>,)>(),
+            "has_changed should use pending tick after iteration"
+        );
     }
 
     #[test]
