@@ -106,6 +106,46 @@ impl PagedSparseSet {
         }
     }
 
+    /// Inserts a value, overwriting any existing value WITHOUT dropping the old
+    /// one. Returns `true` if an overwrite occurred (caller owns the old bytes).
+    ///
+    /// # Safety
+    /// Same as [`insert`]. If this returns `true`, the caller is responsible for
+    /// ensuring the old value's destructor runs (e.g., via a `DropEntry` in the
+    /// reverse changeset).
+    pub unsafe fn insert_no_drop(&mut self, entity: Entity, ptr: *const u8) -> bool {
+        if let Some(dense) = self.dense_index(entity) {
+            // Overwrite: copy new bytes WITHOUT dropping old.
+            let dst = self.dense_values.get_ptr(dense);
+            let size = self.dense_values.item_layout.size();
+            if size > 0 {
+                std::ptr::copy_nonoverlapping(ptr, dst, size);
+            }
+            true
+        } else {
+            // New entry — same as insert.
+            debug_assert!(
+                self.dense_entities.len() < EMPTY as usize,
+                "PagedSparseSet overflow: {} entries exceeds u32 index space",
+                self.dense_entities.len()
+            );
+            let dense = self.dense_entities.len() as u32;
+            let idx = entity.index() as usize;
+            let page_idx = idx / PAGE_SIZE;
+            let slot = idx % PAGE_SIZE;
+
+            if page_idx >= self.pages.len() {
+                self.pages.resize_with(page_idx + 1, || None);
+            }
+            let page = self.pages[page_idx].get_or_insert_with(|| Box::new([EMPTY; PAGE_SIZE]));
+            page[slot] = dense;
+
+            self.dense_entities.push(entity);
+            self.dense_values.push(ptr as *mut u8);
+            false
+        }
+    }
+
     /// Removes the entity's value, dropping it. Returns `true` if the entity
     /// was present.
     pub fn remove(&mut self, entity: Entity) -> bool {
@@ -312,7 +352,36 @@ impl SparseStorage {
             .storages
             .entry(comp_id)
             .or_insert_with(|| PagedSparseSet::new(layout, drop_fn));
+        debug_assert_eq!(
+            set.dense_values.item_layout, layout,
+            "insert_raw layout mismatch for ComponentId {comp_id}"
+        );
         set.insert(entity, ptr);
+    }
+
+    /// Like [`insert_raw`](Self::insert_raw), but does NOT drop the old value
+    /// on overwrite. Returns `true` if an overwrite occurred. The caller is
+    /// responsible for the old value's destructor (e.g., via a `DropEntry`).
+    ///
+    /// # Safety
+    /// Same as `insert_raw`.
+    pub unsafe fn insert_raw_no_drop(
+        &mut self,
+        comp_id: ComponentId,
+        entity: Entity,
+        ptr: *const u8,
+        layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+    ) -> bool {
+        let set = self
+            .storages
+            .entry(comp_id)
+            .or_insert_with(|| PagedSparseSet::new(layout, drop_fn));
+        debug_assert_eq!(
+            set.dense_values.item_layout, layout,
+            "insert_raw_no_drop layout mismatch for ComponentId {comp_id}"
+        );
+        set.insert_no_drop(entity, ptr)
     }
 
     /// Raw read: returns a pointer to the sparse component data, or `None`.
@@ -326,6 +395,16 @@ impl SparseStorage {
     pub fn remove_raw(&mut self, comp_id: ComponentId, entity: Entity) -> bool {
         match self.storages.get_mut(&comp_id) {
             Some(set) => set.remove(entity),
+            None => false,
+        }
+    }
+
+    /// Like [`remove_raw`](Self::remove_raw), but does NOT drop the old value.
+    /// Returns `true` if the entity had the component. The caller is
+    /// responsible for the old value's destructor (e.g., via a `DropEntry`).
+    pub fn remove_raw_no_drop(&mut self, comp_id: ComponentId, entity: Entity) -> bool {
+        match self.storages.get_mut(&comp_id) {
+            Some(set) => set.remove_no_drop(entity),
             None => false,
         }
     }

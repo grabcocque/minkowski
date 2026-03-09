@@ -236,7 +236,9 @@ fn changeset_to_events(changeset: &EnumChangeSet, world: &World) -> Vec<Replicat
             MutationRef::Remove { entity, .. } => {
                 let _ = entity;
             }
-            MutationRef::SparseInsert { .. } | MutationRef::SparseRemove { .. } => {}
+            MutationRef::SparseInsert { .. } | MutationRef::SparseRemove { .. } => {
+                // Sparse components not used in this example — skip replication.
+            }
         }
     }
     events

@@ -2001,4 +2001,52 @@ mod tests {
             "sparse overwrite should survive WAL replay"
         );
     }
+
+    #[test]
+    fn sparse_wal_replay_sets_sparse_routing_flag() {
+        // Verifies that mark_sparse is called during WAL replay so that
+        // world.has() and world.get() route to sparse storage correctly,
+        // even when the replay world never called insert_sparse directly.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("sparse_routing.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        codecs.register::<Health>(&mut world);
+
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },));
+        cs.insert_sparse::<Health>(&mut world, e, Health(42));
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world);
+
+        // Replay into fresh world — Health registered via codecs.register
+        // (not register_sparse), so sparse flag only comes from mark_sparse
+        // inside changeset apply.
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2);
+        codecs2.register::<Health>(&mut world2);
+
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        let e2 = Entity::from_bits(e.to_bits());
+        assert!(
+            world2.has::<Health>(e2),
+            "has() must route to sparse storage after WAL replay"
+        );
+        assert_eq!(world2.get::<Health>(e2), Some(&Health(42)));
+
+        // Also verify dense component survived.
+        assert_eq!(
+            world2.get::<Pos>(e2),
+            Some(&Pos { x: 1.0, y: 2.0 }),
+            "dense component from same changeset should also survive"
+        );
+    }
 }

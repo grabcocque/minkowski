@@ -104,7 +104,14 @@ impl ComponentRegistry {
     }
 
     /// Mark an already-registered component as sparse.
+    ///
+    /// # Panics
+    /// Panics if `id` is not a registered component.
     pub(crate) fn mark_sparse(&mut self, id: ComponentId) {
+        assert!(
+            id < self.infos.len(),
+            "mark_sparse called with unregistered ComponentId {id}"
+        );
         self.sparse_set.grow(id + 1);
         self.sparse_set.insert(id);
     }
