@@ -30,14 +30,13 @@ Every WAL error path is evaluated against "is the mutation durable?" If yes, the
 
 ### Integrity checking
 
-WAL frames use CRC32 checksums (Castagnoli via `crc32fast`, hardware-accelerated on SSE 4.2 / AArch64). Frame format: `[len: u32 LE][crc32: u32 LE][payload: len bytes]`. The CRC covers the rkyv payload and catches silent data corruption that rkyv validation alone might miss. On read, checksum mismatches are treated identically to torn writes — the corrupt frame and everything after it is truncated during crash recovery.
+WAL frames use CRC32 checksums (IEEE via `crc32fast`, hardware-accelerated on SSE 4.2 / AArch64). Frame format: `[len: u32 LE][crc32: u32 LE][payload: len bytes]`. The CRC covers the rkyv payload and catches silent data corruption that rkyv validation alone might miss. On read, checksum mismatches are treated identically to torn writes — the corrupt frame and everything after it is truncated during crash recovery.
 
 Snapshot files use the same CRC32 over the rkyv payload, stored in the v2 envelope header: `[magic: 8B "MK2SNAPK"][crc32: 4B LE][reserved: 4B][len: u64 LE][payload]`. Checksum mismatches return `SnapshotError::Format` — no silent data loss. Legacy v1 snapshots (no magic, no CRC) are accepted for backward compatibility but skip verification.
 
 Segment files use a 4-byte magic (`"MKW2"`) to distinguish v2 format from legacy v1 (no checksums). Legacy segments produce a hard error with a migration message — they are never silently reinterpreted.
 
-After snapshot restore, an entity generation high-water-mark check validates that every entity in every archetype has a generation matching the restored allocator state. A corrupt snapshot where allocator generations diverge from archetype data would silently poison `is_alive()` — this assert catches it at load time.
-
+After snapshot restore, an entity generation consistency check validates that every entity in every archetype has a generation matching the restored allocator state. A corrupt snapshot where allocator generations diverge from archetype data would silently poison `is_alive()` — this assert catches it at load time.
 ## Alternatives Considered
 
 - Full-world serialization per write — O(n) cost per mutation, unacceptable for large worlds

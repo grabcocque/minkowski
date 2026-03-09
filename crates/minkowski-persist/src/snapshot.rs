@@ -34,8 +34,8 @@ pub enum SnapshotError {
 
 /// Full-world snapshot: serialize all archetype data to disk and reconstruct on load.
 ///
-/// File format: `[len: u64 LE][payload: len bytes]` — one snapshot per file.
-/// Uses rkyv for serialization.
+/// V2 file format: `[magic: 8B "MK2SNAPK"][crc32: 4B LE][reserved: 4B][len: u64 LE][rkyv payload]`.
+/// Legacy v1 (`[len: u64 LE][payload]`) is accepted on load but no longer written.
 pub struct Snapshot;
 
 impl Snapshot {
@@ -45,9 +45,9 @@ impl Snapshot {
 
     /// Save a full world snapshot to disk.
     ///
-    /// Writes the rkyv payload directly to the file without copying it into
-    /// a second framed buffer. Use `save_to_bytes` when you need the framed
-    /// bytes as a `Vec<u8>` (e.g. for network transfer).
+    /// Writes the v2 envelope (magic, CRC32, length) and rkyv payload directly
+    /// to disk without allocating an intermediate `Vec<u8>`. Use `save_to_bytes`
+    /// when you need the framed bytes in memory (e.g. for network transfer).
     pub fn save(
         &self,
         path: &Path,
