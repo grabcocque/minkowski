@@ -22,13 +22,24 @@ pub(crate) struct Tick(u64);
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ChangeTick(pub(crate) Tick);
 
+impl ChangeTick {
+    /// Convert to raw u64 for serialization.
+    pub fn to_raw(self) -> u64 {
+        self.0.raw()
+    }
+
+    /// Reconstruct from raw u64. The caller must ensure the value
+    /// represents a valid tick from the same world.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(Tick::new(raw))
+    }
+}
+
 impl Tick {
-    #[allow(dead_code)]
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn raw(self) -> u64 {
         self.0
     }
@@ -84,5 +95,19 @@ mod tests {
         assert!(a < b);
         assert_eq!(b, c);
         assert!(b > a);
+    }
+
+    #[test]
+    fn change_tick_round_trip_via_u64() {
+        let tick = ChangeTick(Tick::new(42));
+        let raw = tick.to_raw();
+        let restored = ChangeTick::from_raw(raw);
+        assert_eq!(tick, restored);
+    }
+
+    #[test]
+    fn change_tick_default_round_trips() {
+        let tick = ChangeTick::default();
+        assert_eq!(ChangeTick::from_raw(tick.to_raw()), tick);
     }
 }
