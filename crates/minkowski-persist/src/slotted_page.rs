@@ -212,14 +212,18 @@ impl SlottedPage {
         Some(slot_idx)
     }
 
-    /// Read a record by slot index.
+    /// Read a record by slot index. Returns `None` if the index is out of
+    /// range or the slot entry references data outside the page (corruption).
     pub fn get(&self, slot_index: u16) -> Option<&[u8]> {
         if slot_index >= self.header.slot_count {
             return None;
         }
-        let entry = self.slot_entry(slot_index);
+        let entry = self.slot_entry(slot_index)?;
         let start = entry.offset as usize;
         let end = start + entry.length as usize;
+        if end > self.page_size {
+            return None;
+        }
         Some(&self.data[start..end])
     }
 
@@ -278,14 +282,65 @@ impl SlottedPage {
         writer.write_all(&self.data)
     }
 
-    /// Read a page from a reader.
+    /// Read a page from a reader. Returns an error if the page header
+    /// contains values that are inconsistent with `page_size` (corrupt
+    /// or crafted data). Individual slot entries are validated lazily
+    /// by `get()` — this method only checks structural invariants.
     pub fn read_from<R: Read>(reader: &mut R, page_size: usize) -> io::Result<Self> {
         let mut data = vec![0u8; page_size];
         reader.read_exact(&mut data)?;
 
+        if page_size < PAGE_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("page too small ({page_size}) to contain header"),
+            ));
+        }
+
         let mut header_buf = [0u8; PAGE_HEADER_SIZE];
         header_buf.copy_from_slice(&data[0..PAGE_HEADER_SIZE]);
         let header = PageHeader::from_bytes(&header_buf);
+
+        // Validate structural invariants against page_size.
+        let slot_dir_end = PAGE_HEADER_SIZE + (header.slot_count as usize) * SLOT_ENTRY_SIZE;
+        if slot_dir_end > page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt page header: slot directory end ({slot_dir_end}) \
+                     exceeds page size ({page_size})"
+                ),
+            ));
+        }
+        if (header.free_offset as usize) < PAGE_HEADER_SIZE
+            || (header.free_offset as usize) > page_size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt page header: free_offset ({}) out of range",
+                    header.free_offset
+                ),
+            ));
+        }
+        if (header.data_offset as usize) > page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt page header: data_offset ({}) exceeds page size ({page_size})",
+                    header.data_offset
+                ),
+            ));
+        }
+        if header.free_offset > header.data_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt page header: free_offset ({}) > data_offset ({})",
+                    header.free_offset, header.data_offset
+                ),
+            ));
+        }
 
         Ok(Self {
             data,
@@ -307,12 +362,17 @@ impl SlottedPage {
         &self.header
     }
 
-    /// Read a slot entry at the given index.
-    fn slot_entry(&self, index: u16) -> SlotEntry {
+    /// Read a slot entry at the given index. Returns `None` if the slot
+    /// directory entry falls outside the page buffer (corrupt header).
+    fn slot_entry(&self, index: u16) -> Option<SlotEntry> {
         let pos = PAGE_HEADER_SIZE + (index as usize) * SLOT_ENTRY_SIZE;
+        let end = pos + SLOT_ENTRY_SIZE;
+        if end > self.page_size {
+            return None;
+        }
         let mut buf = [0u8; SLOT_ENTRY_SIZE];
-        buf.copy_from_slice(&self.data[pos..pos + SLOT_ENTRY_SIZE]);
-        SlotEntry::from_bytes(&buf)
+        buf.copy_from_slice(&self.data[pos..end]);
+        Some(SlotEntry::from_bytes(&buf))
     }
 
     /// Flush the cached header back into the data buffer.
@@ -350,12 +410,11 @@ impl<'a> Iterator for SlotIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.page.header.slot_count - self.index) as usize;
-        (remaining, Some(remaining))
+        let remaining = self.page.header.slot_count.saturating_sub(self.index) as usize;
+        // Lower bound is 0 because corrupt slots may terminate iteration early.
+        (0, Some(remaining))
     }
 }
-
-impl ExactSizeIterator for SlotIter<'_> {}
 
 /// Availability list tracking pages with free space.
 ///
@@ -556,7 +615,7 @@ mod tests {
 
         let records: Vec<&[u8]> = page.iter_slots().collect();
         assert_eq!(records, vec![b"aaa".as_slice(), b"bbb", b"ccc"]);
-        assert_eq!(page.iter_slots().len(), 3);
+        assert_eq!(page.iter_slots().count(), 3);
     }
 
     #[test]
@@ -670,5 +729,153 @@ mod tests {
         let slot = page.try_insert(&[]).unwrap();
         assert_eq!(slot, 0);
         assert_eq!(page.get(0), Some([].as_slice()));
+    }
+
+    // ── Corruption resilience tests ─────────────────────────────────
+
+    #[test]
+    fn corrupt_slot_offset_beyond_page_returns_none() {
+        let mut page = SlottedPage::new(0, 64);
+        page.try_insert(b"hello").unwrap();
+
+        // Corrupt the slot entry: set offset to beyond page_size.
+        let slot_pos = PAGE_HEADER_SIZE;
+        page.data[slot_pos] = 0xFF;
+        page.data[slot_pos + 1] = 0xFF; // offset = 65535, way beyond 64
+
+        assert_eq!(page.get(0), None, "corrupt offset must not panic");
+    }
+
+    #[test]
+    fn corrupt_slot_length_beyond_page_returns_none() {
+        let mut page = SlottedPage::new(0, 64);
+        page.try_insert(b"hello").unwrap();
+
+        // Corrupt the slot entry: set length to a huge value.
+        let slot_pos = PAGE_HEADER_SIZE;
+        page.data[slot_pos + 2] = 0xFF;
+        page.data[slot_pos + 3] = 0xFF; // length = 65535
+
+        assert_eq!(page.get(0), None, "corrupt length must not panic");
+    }
+
+    #[test]
+    fn corrupt_slot_count_beyond_page_returns_none_on_get() {
+        let mut page = SlottedPage::new(0, 64);
+        page.try_insert(b"hi").unwrap();
+
+        // Corrupt slot_count to a huge value — slot_entry will try to
+        // read directory entries beyond the page buffer.
+        page.header.slot_count = 10000;
+        page.flush_header();
+
+        // Slots 0 might still be in bounds, but slot 9999 definitely isn't.
+        // get must return None, not panic.
+        assert_eq!(page.get(9999), None);
+    }
+
+    #[test]
+    fn corrupt_iter_stops_on_bad_slot() {
+        let mut page = SlottedPage::new(0, 64);
+        page.try_insert(b"aaa").unwrap();
+        page.try_insert(b"bbb").unwrap();
+
+        // Corrupt second slot's offset to go out of bounds.
+        let slot1_pos = PAGE_HEADER_SIZE + SLOT_ENTRY_SIZE;
+        page.data[slot1_pos] = 0xFF;
+        page.data[slot1_pos + 1] = 0xFF;
+
+        let records: Vec<&[u8]> = page.iter_slots().collect();
+        // First slot is valid, second is corrupt — iterator yields 1 then stops.
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0], b"aaa");
+    }
+
+    #[test]
+    fn read_from_corrupt_slot_count_errors() {
+        // Create a page buffer with slot_count that overflows the page.
+        let page_size = 64;
+        let mut data = vec![0u8; page_size];
+        let header = PageHeader {
+            magic: PAGE_MAGIC,
+            page_seq: 0,
+            slot_count: 1000, // would need 4000+ bytes for slot directory
+            free_offset: PAGE_HEADER_SIZE as u16,
+            data_offset: page_size as u16,
+            _padding: 0,
+            checksum: 0,
+        };
+        data[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+        let result = SlottedPage::read_from(&mut data.as_slice(), page_size);
+        assert!(
+            result.is_err(),
+            "corrupt slot_count should produce an error"
+        );
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("slot directory end"), "{msg}");
+    }
+
+    #[test]
+    fn read_from_corrupt_free_offset_errors() {
+        let page_size = 64;
+        let mut data = vec![0u8; page_size];
+        let header = PageHeader {
+            magic: PAGE_MAGIC,
+            page_seq: 0,
+            slot_count: 0,
+            free_offset: 5, // below PAGE_HEADER_SIZE
+            data_offset: page_size as u16,
+            _padding: 0,
+            checksum: 0,
+        };
+        data[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+        let result = SlottedPage::read_from(&mut data.as_slice(), page_size);
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("free_offset"), "{msg}");
+    }
+
+    #[test]
+    fn read_from_free_offset_exceeds_data_offset_errors() {
+        let page_size = 64;
+        let mut data = vec![0u8; page_size];
+        let header = PageHeader {
+            magic: PAGE_MAGIC,
+            page_seq: 0,
+            slot_count: 0,
+            free_offset: 50,
+            data_offset: 40, // free > data = overlapping
+            _padding: 0,
+            checksum: 0,
+        };
+        data[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+        let result = SlottedPage::read_from(&mut data.as_slice(), page_size);
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("free_offset"), "{msg}");
+    }
+
+    #[test]
+    fn read_from_data_offset_exceeds_page_size_errors() {
+        let page_size = 64;
+        let mut data = vec![0u8; page_size];
+        let header = PageHeader {
+            magic: PAGE_MAGIC,
+            page_seq: 0,
+            slot_count: 0,
+            free_offset: PAGE_HEADER_SIZE as u16,
+            data_offset: 100, // beyond 64-byte page
+            _padding: 0,
+            checksum: 0,
+        };
+        data[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+        let result = SlottedPage::read_from(&mut data.as_slice(), page_size);
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("data_offset"), "{msg}");
     }
 }
