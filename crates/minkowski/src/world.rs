@@ -5,7 +5,7 @@ use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
 use crate::storage::sparse::SparseStorage;
-use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
+use crate::sync::{Arc, AtomicBool, AtomicU64, Mutex, Ordering};
 use crate::table::TableCache;
 use crate::tick::Tick;
 use fixedbitset::FixedBitSet;
@@ -69,7 +69,7 @@ pub(crate) struct QueryCacheEntry {
     /// Shared flag set by `QueryIter` when iteration actually occurs.
     /// Checked on the next `query()` call to decide whether to commit
     /// `pending_read_tick`.
-    iterated: Arc<std::sync::atomic::AtomicBool>,
+    iterated: Arc<AtomicBool>,
 }
 
 /// Shared queue for entity IDs orphaned by aborted transactions.
@@ -734,17 +734,15 @@ impl World {
                 last_archetype_count: 0,
                 last_read_tick: Tick::default(),
                 pending_read_tick: None,
-                iterated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                iterated: Arc::new(AtomicBool::new(false)),
             });
 
         // Commit deferred tick from previous iterator, if it was iterated.
-        if entry.iterated.load(std::sync::atomic::Ordering::Relaxed) {
+        if entry.iterated.load(Ordering::Relaxed) {
             if let Some(pending) = entry.pending_read_tick.take() {
                 entry.last_read_tick = pending;
             }
-            entry
-                .iterated
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            entry.iterated.store(false, Ordering::Relaxed);
         } else {
             // Previous iterator was not iterated — discard pending tick,
             // preserving the change window.
@@ -1256,7 +1254,7 @@ impl World {
                 // represents the most recent baseline (not yet committed to
                 // last_read_tick — that happens on the next query() call).
                 // Use it so has_changed doesn't report stale true results.
-                if entry.iterated.load(std::sync::atomic::Ordering::Relaxed) {
+                if entry.iterated.load(Ordering::Relaxed) {
                     entry.pending_read_tick.unwrap_or(entry.last_read_tick)
                 } else {
                     entry.last_read_tick
@@ -1300,7 +1298,7 @@ impl World {
                     last_archetype_count: 0,
                     last_read_tick: Tick::default(),
                     pending_read_tick: None,
-                    iterated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    iterated: Arc::new(AtomicBool::new(false)),
                 });
 
             let fresh_required = Q::required_ids(&self.components);
@@ -1326,9 +1324,7 @@ impl World {
         if let Some(entry) = self.query_cache.get_mut(&type_id) {
             entry.last_read_tick = read_tick;
             entry.pending_read_tick = None;
-            entry
-                .iterated
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            entry.iterated.store(false, Ordering::Relaxed);
         }
     }
 

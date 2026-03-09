@@ -3,10 +3,9 @@
 //! ([`for_each_chunk`](QueryIter::for_each_chunk)) iteration over matched archetypes.
 
 use super::fetch::WorldQuery;
+use crate::sync::{Arc, AtomicBool, Ordering};
 use rayon::prelude::*;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 /// Iterator over entities matching a query.
 ///
