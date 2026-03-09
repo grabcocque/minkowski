@@ -88,11 +88,16 @@ impl EntityAllocator {
     /// before using `alloc()` or `is_alive()` on reserved indices.
     #[allow(dead_code)]
     pub fn reserve(&self) -> Entity {
-        let index = self.next_reserved.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            index < u32::MAX,
-            "entity index space exhausted: reserve() wrapped past u32::MAX"
-        );
+        let index = self
+            .next_reserved
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current < u32::MAX {
+                    Some(current + 1)
+                } else {
+                    None
+                }
+            })
+            .expect("entity index space exhausted: reserve() cannot allocate past u32::MAX");
         Entity::new(index, 0)
     }
 
