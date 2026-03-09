@@ -800,6 +800,9 @@ mod tests {
     #[derive(Clone, Copy)]
     #[allow(dead_code)]
     struct Vel(f32);
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    #[allow(dead_code)]
+    struct Health(u32);
 
     // ── Sequential tests ────────────────────────────────────────────
 
@@ -1350,5 +1353,34 @@ mod tests {
         let result = strategy.transact(&mut world, &access, |_tx, _world| {});
         assert!(result.is_err(), "should fail with locks held");
         drop(tx);
+    }
+
+    #[test]
+    fn optimistic_sparse_write_commits() {
+        let mut world = World::new();
+        let strategy = Optimistic::new(&world);
+        let e = world.spawn((Vel(1.0),));
+        let access = Access::empty();
+
+        let result = strategy.transact(&mut world, &access, |tx, world| {
+            tx.write_sparse::<Health>(world, e, Health(99));
+        });
+        assert!(result.is_ok());
+        assert_eq!(world.get::<Health>(e), Some(&Health(99)));
+    }
+
+    #[test]
+    fn pessimistic_sparse_remove_commits() {
+        let mut world = World::new();
+        let strategy = Pessimistic::new(&world);
+        let e = world.spawn((Vel(1.0),));
+        world.insert_sparse(e, Health(50));
+        let access = Access::empty();
+
+        let result = strategy.transact(&mut world, &access, |tx, world| {
+            tx.remove_sparse::<Health>(world, e);
+        });
+        assert!(result.is_ok());
+        assert_eq!(world.get::<Health>(e), None);
     }
 }

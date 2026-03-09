@@ -650,9 +650,13 @@ impl EnumChangeSet {
                     // (needed for world.get/has routing after WAL replay).
                     world.components.mark_sparse(*component_id);
 
-                    // Capture old value for reverse (if entity already has this sparse component).
-                    if let Some(old_ptr) = world.sparse.get_raw(*component_id, *entity) {
-                        // Old value exists — reverse is SparseInsert with old data.
+                    // Apply: insert into sparse storage WITHOUT dropping old value.
+                    // If an overwrite occurred, the old bytes are still live in the
+                    // dense array slot (now overwritten) — we captured them first.
+                    let had_old = if let Some(old_ptr) =
+                        world.sparse.get_raw(*component_id, *entity)
+                    {
+                        // Old value exists — capture bytes for reverse before overwrite.
                         let rev_offset =
                             reverse.record_sparse_insert(*entity, *component_id, old_ptr, *layout);
                         if let Some(drop_fn) = drop_fn {
@@ -661,16 +665,33 @@ impl EnumChangeSet {
                                 drop_fn,
                             });
                         }
+                        true
                     } else {
                         // No old value — reverse is SparseRemove.
                         reverse.record_sparse_remove(*entity, *component_id);
-                    }
+                        false
+                    };
 
-                    // Apply: insert raw bytes into sparse storage.
                     unsafe {
-                        world
-                            .sparse
-                            .insert_raw(*component_id, *entity, data_ptr, *layout, drop_fn);
+                        if had_old {
+                            // Overwrite without drop — reverse changeset owns the old bytes.
+                            world.sparse.insert_raw_no_drop(
+                                *component_id,
+                                *entity,
+                                data_ptr,
+                                *layout,
+                                drop_fn,
+                            );
+                        } else {
+                            // First insert — no old value to worry about.
+                            world.sparse.insert_raw(
+                                *component_id,
+                                *entity,
+                                data_ptr,
+                                *layout,
+                                drop_fn,
+                            );
+                        }
                     }
                 }
 
@@ -693,10 +714,12 @@ impl EnumChangeSet {
                                 drop_fn,
                             });
                         }
+                        // Remove WITHOUT drop — reverse changeset owns the old bytes.
+                        world.sparse.remove_raw_no_drop(*component_id, *entity);
+                    } else {
+                        // Nothing to remove — no-op.
+                        world.sparse.remove_raw(*component_id, *entity);
                     }
-
-                    // Apply: remove from sparse storage (drops the value).
-                    world.sparse.remove_raw(*component_id, *entity);
                 }
             }
         }
@@ -1559,6 +1582,109 @@ mod tests {
 
         world.despawn(e);
         assert_eq!(drops.load(Ordering::SeqCst), 1, "one drop from despawn");
+    }
+
+    #[test]
+    fn sparse_overwrite_tracked_no_double_drop() {
+        // Verifies that overwriting a sparse component with a non-trivial
+        // destructor does not double-free. The old value's destructor must
+        // run exactly once: when the reverse changeset is dropped (not
+        // during the overwrite itself).
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        // Insert initial Tracked into sparse storage.
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(1, &drops));
+            let _reverse = cs.apply(&mut world);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "no drops yet");
+
+        // Overwrite with a new Tracked.
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(2, &drops));
+            let reverse = cs.apply(&mut world);
+            // Reverse holds old value (Tracked(1)). Not dropped yet.
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "reverse holds old value");
+            drop(reverse);
+            // Dropping reverse runs old value's destructor exactly once.
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "old value dropped by reverse"
+            );
+        }
+
+        // New value still alive in world.
+        world.despawn(e);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "new value dropped by despawn"
+        );
+    }
+
+    #[test]
+    fn sparse_remove_tracked_no_double_drop() {
+        // Verifies that removing a sparse component with a non-trivial
+        // destructor via changeset doesn't double-free. The old value's
+        // destructor runs when the reverse changeset is dropped.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+
+        // Insert Tracked into sparse storage.
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.insert_sparse::<Tracked>(&mut world, e, Tracked::new(1, &drops));
+            let _reverse = cs.apply(&mut world);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        // Remove via changeset.
+        {
+            let mut cs = EnumChangeSet::new();
+            cs.remove_sparse::<Tracked>(&mut world, e);
+            let reverse = cs.apply(&mut world);
+            // Reverse holds old value.
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "reverse holds old value");
+            drop(reverse);
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "old value dropped by reverse"
+            );
+        }
+
+        // Entity still alive but no sparse component — despawn should not drop again.
+        world.despawn(e);
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "no extra drops");
+    }
+
+    #[test]
+    fn mixed_sparse_and_dense_changeset() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 0.0, y: 0.0 },));
+
+        let mut cs = EnumChangeSet::new();
+        // Dense insert (archetype migration)
+        cs.insert::<Vel>(&mut world, e, Vel { dx: 1.0, dy: 2.0 });
+        // Sparse insert
+        cs.insert_sparse::<f32>(&mut world, e, 42.0f32);
+
+        let reverse = cs.apply(&mut world);
+
+        // Both present
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 1.0, dy: 2.0 }));
+        assert_eq!(world.get::<f32>(e), Some(&42.0f32));
+
+        // Reverse undoes both
+        let _forward = reverse.apply(&mut world);
+        assert_eq!(world.get::<Vel>(e), None);
+        assert_eq!(world.get::<f32>(e), None);
     }
 
     #[test]
