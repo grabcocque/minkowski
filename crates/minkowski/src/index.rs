@@ -153,6 +153,29 @@ impl<T: Component + Ord + Clone> BTreeIndex<T> {
         })
     }
 
+    /// Borrow the internal state for serialization.
+    pub fn as_raw_parts(&self) -> (&BTreeMap<T, Vec<Entity>>, &HashMap<Entity, T>, ChangeTick) {
+        (&self.tree, &self.reverse, self.last_sync)
+    }
+
+    /// Reconstruct from deserialized parts.
+    pub fn from_raw_parts(
+        tree: BTreeMap<T, Vec<Entity>>,
+        reverse: HashMap<Entity, T>,
+        last_sync: ChangeTick,
+    ) -> Self {
+        debug_assert_eq!(
+            tree.values().map(|v| v.len()).sum::<usize>(),
+            reverse.len(),
+            "BTreeIndex::from_raw_parts: forward/reverse map size mismatch"
+        );
+        Self {
+            tree,
+            reverse,
+            last_sync,
+        }
+    }
+
     fn remove_entity(&mut self, entity: Entity) {
         if let Some(old_value) = self.reverse.remove(&entity) {
             if let Some(bucket) = self.tree.get_mut(&old_value) {
@@ -268,6 +291,29 @@ impl<T: Component + Hash + Eq + Clone> HashIndex<T> {
             .iter()
             .copied()
             .filter(|&entity| world.has::<T>(entity))
+    }
+
+    /// Borrow the internal state for serialization.
+    pub fn as_raw_parts(&self) -> (&HashMap<T, Vec<Entity>>, &HashMap<Entity, T>, ChangeTick) {
+        (&self.map, &self.reverse, self.last_sync)
+    }
+
+    /// Reconstruct from deserialized parts.
+    pub fn from_raw_parts(
+        map: HashMap<T, Vec<Entity>>,
+        reverse: HashMap<Entity, T>,
+        last_sync: ChangeTick,
+    ) -> Self {
+        debug_assert_eq!(
+            map.values().map(|v| v.len()).sum::<usize>(),
+            reverse.len(),
+            "HashIndex::from_raw_parts: forward/reverse map size mismatch"
+        );
+        Self {
+            map,
+            reverse,
+            last_sync,
+        }
     }
 
     fn remove_entity(&mut self, entity: Entity) {
@@ -731,5 +777,42 @@ mod tests {
         assert_eq!(idx.len(), 1);
         assert!(idx.contains(e1));
         assert!(!idx.contains(Entity::DANGLING));
+    }
+
+    #[test]
+    fn btree_raw_parts_round_trip() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let (tree, reverse, last_sync) = idx.as_raw_parts();
+        let restored =
+            BTreeIndex::<Score>::from_raw_parts(tree.clone(), reverse.clone(), last_sync);
+
+        assert_eq!(restored.get(&Score(10)).len(), 1);
+        assert!(restored.get(&Score(10)).contains(&e1));
+        assert_eq!(restored.get(&Score(20)).len(), 1);
+        assert!(restored.get(&Score(20)).contains(&e2));
+    }
+
+    #[test]
+    fn hash_raw_parts_round_trip() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+
+        let mut idx = HashIndex::<Score>::new();
+        idx.rebuild(&mut world);
+
+        let (map, reverse, last_sync) = idx.as_raw_parts();
+        let restored = HashIndex::<Score>::from_raw_parts(map.clone(), reverse.clone(), last_sync);
+
+        assert_eq!(restored.get(&Score(10)).len(), 1);
+        assert!(restored.get(&Score(10)).contains(&e1));
+        assert_eq!(restored.get(&Score(20)).len(), 1);
+        assert!(restored.get(&Score(20)).contains(&e2));
     }
 }

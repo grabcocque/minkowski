@@ -126,7 +126,7 @@ Reducers are closures registered with the `ReducerRegistry`. The type signature 
 | `QueryMut<Q>` | Iterate and mutate many entities directly | Scheduled |
 | `DynamicCtx` | Decide which components to access at runtime | Dynamic |
 
-Scheduled reducers (`QueryRef`, `QueryMut`) can run in parallel when their access patterns don't overlap — the registry can prove this at registration time. Transactional reducers (`EntityMut`, `Spawner`, `QueryWriter`) buffer writes and commit atomically through a [transaction strategy](#transactions). Dynamic reducers (`DynamicCtx`) let you choose which components to access at runtime when the set isn't known at compile time.
+Scheduled reducers (`QueryRef`, `QueryMut`) can run in parallel when their access patterns don't overlap — the registry can prove this at registration time. Transactional reducers (`EntityMut`, `Spawner`, `QueryWriter`) buffer writes and commit atomically through a [transaction strategy](#transactions). Dynamic reducers (`DynamicCtx`) let you choose which components to access at runtime when the set isn't known at compile time. See [`docs/reducer-correctness.md`](docs/reducer-correctness.md) for behavioral requirements (determinism, termination, no unwinding).
 
 ## Transactions
 
