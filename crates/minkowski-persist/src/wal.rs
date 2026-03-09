@@ -16,7 +16,7 @@ use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
 //
 // Frame format: `[len: u32 LE][crc32: u32 LE][payload: len bytes]`.
 // Each payload is a `WalEntry` (Schema | Mutations | Checkpoint) serialized
-// through rkyv. The CRC32 (Castagnoli via crc32fast) covers the payload bytes
+// through rkyv. The CRC32 (IEEE via crc32fast) covers the payload bytes
 // and catches silent data corruption that rkyv validation alone might miss.
 //
 // Legacy v1 segments (no magic header, no CRC32) are detected at open time

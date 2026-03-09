@@ -34,8 +34,8 @@ pub enum SnapshotError {
 
 /// Full-world snapshot: serialize all archetype data to disk and reconstruct on load.
 ///
-/// File format: `[len: u64 LE][payload: len bytes]` — one snapshot per file.
-/// Uses rkyv for serialization.
+/// V2 file format: `[magic: 8B "MK2SNAPK"][crc32: 4B LE][reserved: 4B][len: u64 LE][rkyv payload]`.
+/// Legacy v1 (`[len: u64 LE][payload]`) is accepted on load but no longer written.
 pub struct Snapshot;
 
 impl Snapshot {
@@ -45,9 +45,9 @@ impl Snapshot {
 
     /// Save a full world snapshot to disk.
     ///
-    /// Writes the rkyv payload directly to the file without copying it into
-    /// a second framed buffer. Use `save_to_bytes` when you need the framed
-    /// bytes as a `Vec<u8>` (e.g. for network transfer).
+    /// Writes the v2 envelope (magic, CRC32, length) and rkyv payload directly
+    /// to disk without allocating an intermediate `Vec<u8>`. Use `save_to_bytes`
+    /// when you need the framed bytes in memory (e.g. for network transfer).
     pub fn save(
         &self,
         path: &Path,
@@ -82,8 +82,9 @@ impl Snapshot {
     /// Serialize a full world snapshot to bytes.
     ///
     /// Returns `(header, wire_bytes)`. The wire format is
-    /// `[len: u64 LE][rkyv payload: len bytes]` — identical to the on-disk
-    /// format. Pass the bytes to `load_from_bytes` on the receiving side.
+    /// `[magic: 8B][crc32: 4B LE][reserved: 4B][len: u64 LE][rkyv payload: len bytes]`
+    /// — identical to the on-disk v2 format. Pass the bytes to
+    /// `load_from_bytes` on the receiving side.
     pub fn save_to_bytes(
         &self,
         world: &World,
@@ -134,8 +135,9 @@ impl Snapshot {
 
     /// Reconstruct a world from snapshot bytes received over the wire.
     ///
-    /// Accepts the same `[len: u64 LE][rkyv payload]` format produced by
-    /// `save_to_bytes`. Returns `(world, wal_seq)`.
+    /// Accepts both the v2 format (`[magic][crc32][reserved][len][payload]`)
+    /// produced by `save_to_bytes` and the legacy v1 format (`[len: u64 LE][payload]`).
+    /// Returns `(world, wal_seq)`.
     pub fn load_from_bytes(
         &self,
         bytes: &[u8],
@@ -434,6 +436,24 @@ impl Snapshot {
             .map(|v| u32::from(*v))
             .collect();
         world.restore_allocator_state(generations, free_list);
+
+        // Validate that every entity in every archetype has a generation that
+        // matches the restored allocator. A corrupt snapshot could contain
+        // entities whose generation diverges from the allocator state — this
+        // would make is_alive() return false for live entities, silently
+        // poisoning the entity lifecycle.
+        for arch_idx in 0..world.archetype_count() {
+            for &entity in world.archetype_entities(arch_idx) {
+                if !world.is_alive(entity) {
+                    return Err(SnapshotError::Format(format!(
+                        "snapshot corruption: entity (index={}, gen={}) is in an archetype \
+                         but the allocator has a different generation",
+                        entity.index(),
+                        entity.generation(),
+                    )));
+                }
+            }
+        }
 
         Ok(world)
     }
@@ -1013,6 +1033,86 @@ mod tests {
         assert!(
             !msg.contains("checksum mismatch"),
             "v1 snapshot with MKS1 length prefix was misclassified as v2: {msg}"
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_passes_generation_validation() {
+        // End-to-end: save and reload — the generation high-water-mark
+        // assert should pass for a well-formed snapshot.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        // Spawn, despawn, respawn to create non-trivial generations.
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let _e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        world.despawn(e1);
+        let _e3 = world.spawn((Pos { x: 5.0, y: 6.0 },)); // reuses index 0, gen 1
+
+        let snap = Snapshot::new();
+        let (_, bytes) = snap.save_to_bytes(&world, &codecs, 0).unwrap();
+
+        // Should not panic — allocator generations match archetype entities.
+        let (mut world2, _) = snap.load_from_bytes(&bytes, &codecs).unwrap();
+
+        let positions: Vec<(f32, f32)> =
+            world2.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_generation_mismatch_returns_error() {
+        // Construct a snapshot where the allocator generation for entity 0 is
+        // 99, but the archetype data contains entity(0, gen=0). This simulates
+        // a corrupt or bit-rotted snapshot file. load_from_bytes must return
+        // Err(SnapshotError::Format), not panic.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+        world.spawn((Pos { x: 1.0, y: 2.0 },)); // entity(index=0, gen=0)
+
+        let snap = Snapshot::new();
+        let (_, bytes) = snap.save_to_bytes(&world, &codecs, 0).unwrap();
+
+        // The rkyv payload contains the allocator's generations vec. The
+        // generation for index 0 is 0u32 LE = [0x00, 0x00, 0x00, 0x00].
+        // Corrupt it by flipping generation bytes in the payload, then
+        // recompute the CRC so the checksum passes.
+        // Find the generation value (0u32) in the allocator section.
+        // The allocator data is near the end of the payload. Search backwards
+        // for a 4-byte zero run that, when changed, causes a generation mismatch.
+        let mut tampered = bytes.clone();
+        let payload_start = SNAPSHOT_HEADER_SIZE;
+        let payload_len = tampered.len() - payload_start;
+
+        // Try corrupting 4-byte aligned positions from the end of the payload.
+        // One of them will be the allocator's generation for index 0.
+        let mut found_corruption = false;
+        for offset in (0..payload_len.saturating_sub(3)).rev() {
+            let abs = payload_start + offset;
+            if tampered[abs..abs + 4] == [0, 0, 0, 0] {
+                // Flip to gen=99 and recompute CRC.
+                tampered[abs] = 99;
+                let new_crc = crc32fast::hash(&tampered[payload_start..]);
+                tampered[8..12].copy_from_slice(&new_crc.to_le_bytes());
+
+                let result = snap.load_from_bytes(&tampered, &codecs);
+                if let Err(e) = result {
+                    let msg = format!("{e}");
+                    if msg.contains("snapshot corruption") {
+                        found_corruption = true;
+                        break;
+                    }
+                }
+                // Restore and try next position.
+                tampered[abs] = 0;
+            }
+        }
+
+        assert!(
+            found_corruption,
+            "failed to trigger generation mismatch by corrupting payload bytes"
         );
     }
 }

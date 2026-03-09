@@ -603,6 +603,7 @@ impl EnumChangeSet {
                     }
                     let row = archetype.entities.len();
                     archetype.entities.push(*entity);
+                    archetype.debug_assert_consistent();
 
                     world.entity_locations[index] = Some(EntityLocation {
                         archetype_id: arch_id,
@@ -832,6 +833,10 @@ fn changeset_insert_raw(
             });
         }
 
+        // Verify column/entity invariant after migration.
+        src_arch.debug_assert_consistent();
+        target_arch.debug_assert_consistent();
+
         world.entity_locations[index] = Some(EntityLocation {
             archetype_id: target_arch_id,
             row: target_row,
@@ -903,6 +908,7 @@ fn changeset_remove_raw(
                 row: src_row,
             });
         }
+        arch.debug_assert_consistent();
         let empty_arch_id = world.archetypes.get_or_create(&[], &world.components);
         let empty_arch = &mut world.archetypes.archetypes[empty_arch_id.0];
         empty_arch.entities.push(entity);
@@ -950,6 +956,10 @@ fn changeset_remove_raw(
             row: src_row,
         });
     }
+
+    // Verify column/entity invariant after migration.
+    src_arch.debug_assert_consistent();
+    target_arch.debug_assert_consistent();
 
     world.entity_locations[index] = Some(EntityLocation {
         archetype_id: target_arch_id,

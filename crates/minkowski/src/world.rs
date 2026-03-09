@@ -379,6 +379,8 @@ impl World {
             });
         }
 
+        archetype.debug_assert_consistent();
+
         // Clean sparse storage before dealloc bumps the generation
         self.sparse.remove_all(entity);
 
@@ -463,6 +465,7 @@ impl World {
                     }
                 }
             }
+            archetype.debug_assert_consistent();
         }
 
         // Phase 4: Dealloc entities and clear locations
