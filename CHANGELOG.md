@@ -4,7 +4,7 @@
 
 ### Reducer Error Handling
 
-- **`ReducerError` enum** replaces panics for API misuse in `ReducerRegistry`. Variants: `WrongKind`, `ArgsMismatch`, `DuplicateName`, `TransactionConflict`, `InvalidId`.
+- **`ReducerError` enum** replaces panics for API misuse in `ReducerRegistry`. Variants: `WrongKind`, `DuplicateName`, `TransactionConflict`, `InvalidId`. Args type mismatches remain panics (static programming errors, consistent with the assert boundary rule).
 - All registration methods (`register_entity`, `register_spawner`, `register_query`, `register_query_writer`, `DynamicReducerBuilder::build`, etc.) now return `Result<_, ReducerError>`.
 - Dispatch methods (`call`, `run`, `dynamic_call`) return `Result<(), ReducerError>` with bounds checking on reducer IDs.
 - **`ReducerInfo`** struct for runtime introspection: `reducer_info()`, `query_reducer_info()`, `dynamic_reducer_info()` return name, kind, access pattern, change tracking, and despawn capability.

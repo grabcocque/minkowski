@@ -1230,14 +1230,20 @@ impl World {
     /// the same result until a mutation actually occurs. Use this to decide
     /// whether to run an expensive query without losing the change window.
     ///
-    /// Returns `false` if `Q` has never been queried (no cache entry exists),
-    /// since the first real query will see all data as "changed."
+    /// Returns `false` if `Q` has never been queried (no cache entry exists).
+    /// This means `has_changed` is not suitable as a guard before the *first*
+    /// query — use `query().count() > 0` instead if you need to detect
+    /// initial data. After the first `query::<Q>()` call establishes a
+    /// baseline tick, `has_changed` accurately reports subsequent mutations.
     ///
     /// # Example
     ///
     /// ```ignore
+    /// // Establish baseline with first query.
+    /// world.query::<(Changed<Pos>, &Pos)>().for_each(|_| {});
+    ///
+    /// // Now has_changed accurately reports mutations since the baseline.
     /// if world.has_changed::<(Changed<Pos>, &Pos)>() {
-    ///     // Only iterate when there are actual changes
     ///     for pos in world.query::<(Changed<Pos>, &Pos)>() { /* ... */ }
     /// }
     /// ```
@@ -2824,6 +2830,54 @@ mod tests {
         // Change window should be consumed.
         let count = world.query::<(Changed<Pos>,)>().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn for_each_chunk_consumes_change_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Baseline — establish cache entry for this query type.
+        world.query::<(Changed<Pos>, &Pos)>().for_each_chunk(|_| {});
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Consume via for_each_chunk.
+        world.query::<(Changed<Pos>, &Pos)>().for_each_chunk(|_| {});
+
+        // Window should be consumed — same query type sees no changes.
+        let count = world.query::<(Changed<Pos>, &Pos)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn par_for_each_consumes_change_window() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+
+        // Baseline — establish cache entry.
+        world.query::<(Changed<Pos>, &Pos)>().par_for_each(|_| {});
+
+        // Mutate.
+        let e = world.query::<(Entity,)>().map(|(e,)| e).next().unwrap();
+        let _ = world.get_mut::<Pos>(e);
+
+        // Consume via par_for_each.
+        world.query::<(Changed<Pos>, &Pos)>().par_for_each(|_| {});
+
+        // Window should be consumed — same query type sees no changes.
+        let count = world.query::<(Changed<Pos>, &Pos)>().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn has_changed_returns_false_for_uncached_query() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        // Never queried — has_changed returns false even though data exists.
+        assert!(!world.has_changed::<(Changed<Pos>,)>());
     }
 
     #[test]

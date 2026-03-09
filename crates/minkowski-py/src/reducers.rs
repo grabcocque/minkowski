@@ -519,7 +519,9 @@ pub fn dispatch(
             validate_positive("ali_r", params.ali_r)?;
             validate_positive("coh_r", params.coh_r)?;
             validate_positive("max_force", params.max_force)?;
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "boids_integrate" => {
             let params = BoidsIntegrateParams {
@@ -529,7 +531,9 @@ pub fn dispatch(
             };
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "gravity" => {
             let params = GravityParams {
@@ -541,14 +545,18 @@ pub fn dispatch(
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
             validate_positive("softening", params.softening)?;
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "life_step" => {
             let params = LifeStepParams {
                 width: kwarg_usize(kwargs, "width")?,
                 height: kwarg_usize(kwargs, "height")?,
             };
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "movement" => {
             let params = MovementParams {
@@ -557,7 +565,9 @@ pub fn dispatch(
             };
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "worm_move" => {
             let params = WormMoveParams {
@@ -568,7 +578,9 @@ pub fn dispatch(
             validate_positive("world_size", params.world_size)?;
             validate_positive("dt", params.dt)?;
             validate_positive("speed", params.speed)?;
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         "worm_metabolism" => {
             let params = WormMetabolismParams {
@@ -577,7 +589,9 @@ pub fn dispatch(
             };
             validate_positive("dt", params.dt)?;
             validate_positive("drain_rate", params.drain_rate)?;
-            registry.run(world, id, params).unwrap();
+            registry
+                .run(world, id, params)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
         }
         _ => {
             return Err(PyValueError::new_err(format!("unknown reducer: {name}")));

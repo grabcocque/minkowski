@@ -35,12 +35,6 @@ pub enum ReducerError {
         /// `"transactional"` or `"scheduled"`.
         actual: &'static str,
     },
-    /// Args downcast failed — the caller passed a different type than
-    /// the reducer was registered with.
-    ArgsMismatch {
-        /// Type name the reducer expected.
-        expected: &'static str,
-    },
     /// A reducer with this name was already registered.
     DuplicateName {
         name: &'static str,
@@ -68,9 +62,6 @@ impl fmt::Display for ReducerError {
                     f,
                     "reducer kind mismatch: expected {expected}, got {actual}"
                 )
-            }
-            ReducerError::ArgsMismatch { expected } => {
-                write!(f, "reducer args type mismatch: expected {expected}")
             }
             ReducerError::DuplicateName {
                 name,
@@ -1889,12 +1880,13 @@ impl ReducerRegistry {
     pub fn dynamic_reducer_info(&self, id: DynamicReducerId) -> Result<ReducerInfo, ReducerError> {
         let entry = self.get_dynamic_entry(id.0)?;
         let access = entry.resolved.access().clone();
+        let can_despawn = access.despawns();
         Ok(ReducerInfo {
             name: entry.name,
             kind: "dynamic",
-            access: access.clone(),
+            access,
             has_change_tracking: true, // dynamic reducers always have tick tracking
-            can_despawn: access.despawns(),
+            can_despawn,
         })
     }
 
@@ -3996,10 +3988,6 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("transactional"));
         assert!(msg.contains("scheduled"));
-
-        let err = ReducerError::ArgsMismatch { expected: "u32" };
-        let msg = format!("{err}");
-        assert!(msg.contains("u32"));
 
         let err = ReducerError::DuplicateName {
             name: "foo",
