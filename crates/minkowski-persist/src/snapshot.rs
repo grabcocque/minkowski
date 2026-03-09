@@ -82,8 +82,9 @@ impl Snapshot {
     /// Serialize a full world snapshot to bytes.
     ///
     /// Returns `(header, wire_bytes)`. The wire format is
-    /// `[len: u64 LE][rkyv payload: len bytes]` — identical to the on-disk
-    /// format. Pass the bytes to `load_from_bytes` on the receiving side.
+    /// `[magic: 8B][crc32: 4B LE][reserved: 4B][len: u64 LE][rkyv payload: len bytes]`
+    /// — identical to the on-disk v2 format. Pass the bytes to
+    /// `load_from_bytes` on the receiving side.
     pub fn save_to_bytes(
         &self,
         world: &World,
@@ -134,8 +135,9 @@ impl Snapshot {
 
     /// Reconstruct a world from snapshot bytes received over the wire.
     ///
-    /// Accepts the same `[len: u64 LE][rkyv payload]` format produced by
-    /// `save_to_bytes`. Returns `(world, wal_seq)`.
+    /// Accepts both the v2 format (`[magic][crc32][reserved][len][payload]`)
+    /// produced by `save_to_bytes` and the legacy v1 format (`[len: u64 LE][payload]`).
+    /// Returns `(world, wal_seq)`.
     pub fn load_from_bytes(
         &self,
         bytes: &[u8],
@@ -434,6 +436,25 @@ impl Snapshot {
             .map(|v| u32::from(*v))
             .collect();
         world.restore_allocator_state(generations, free_list);
+
+        // Validate that every entity in every archetype has a generation that
+        // matches the restored allocator. A corrupt snapshot could contain
+        // entities whose generation diverges from the allocator state — this
+        // would make is_alive() return false for live entities, silently
+        // poisoning the entity lifecycle.
+        for arch_idx in 0..world.archetype_count() {
+            for &entity in world.archetype_entities(arch_idx) {
+                assert!(
+                    world.is_alive(entity),
+                    "snapshot corruption: entity {:?} (index={}, gen={}) is in an archetype \
+                     but the allocator has a different generation — the snapshot's allocator \
+                     state is inconsistent with its archetype data",
+                    entity,
+                    entity.index(),
+                    entity.generation(),
+                );
+            }
+        }
 
         Ok(world)
     }
@@ -1014,5 +1035,59 @@ mod tests {
             !msg.contains("checksum mismatch"),
             "v1 snapshot with MKS1 length prefix was misclassified as v2: {msg}"
         );
+    }
+
+    #[test]
+    fn snapshot_round_trip_passes_generation_validation() {
+        // End-to-end: save and reload — the generation high-water-mark
+        // assert should pass for a well-formed snapshot.
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world);
+
+        // Spawn, despawn, respawn to create non-trivial generations.
+        let e1 = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let _e2 = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        world.despawn(e1);
+        let _e3 = world.spawn((Pos { x: 5.0, y: 6.0 },)); // reuses index 0, gen 1
+
+        let snap = Snapshot::new();
+        let (_, bytes) = snap.save_to_bytes(&world, &codecs, 0).unwrap();
+
+        // Should not panic — allocator generations match archetype entities.
+        let (mut world2, _) = snap.load_from_bytes(&bytes, &codecs).unwrap();
+
+        let positions: Vec<(f32, f32)> =
+            world2.query::<(&Pos,)>().map(|p| (p.0.x, p.0.y)).collect();
+        assert_eq!(positions.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot corruption")]
+    fn snapshot_generation_mismatch_panics() {
+        // Simulate a corrupt snapshot: allocator generations disagree with
+        // archetype entity data. This exercises the same validation that
+        // restore_world performs after restore_allocator_state.
+        let mut w = World::new();
+        w.register_component::<Pos>();
+        w.spawn((Pos { x: 1.0, y: 2.0 },)); // entity(index=0, gen=0)
+
+        // Overwrite allocator: gen[0] = 99, but archetype still has entity(0, gen=0).
+        w.restore_allocator_state(vec![99], vec![]);
+
+        // Walk archetypes and assert is_alive — mirrors restore_world's check.
+        for arch_idx in 0..w.archetype_count() {
+            for &entity in w.archetype_entities(arch_idx) {
+                assert!(
+                    w.is_alive(entity),
+                    "snapshot corruption: entity {:?} (index={}, gen={}) is in an archetype \
+                     but the allocator has a different generation — the snapshot's allocator \
+                     state is inconsistent with its archetype data",
+                    entity,
+                    entity.index(),
+                    entity.generation(),
+                );
+            }
+        }
     }
 }
