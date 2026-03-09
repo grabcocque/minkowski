@@ -39,7 +39,7 @@ pub enum IndexPersistError {
 ///
 /// After loading, call [`SpatialIndex::update`] to catch up with
 /// mutations that occurred after the index was last saved.
-pub trait PersistentIndex: SpatialIndex {
+pub trait PersistentIndex: SpatialIndex + Send {
     /// Serialize the index state to a file.
     fn save(&self, path: &Path) -> Result<(), IndexPersistError>;
 }
@@ -431,6 +431,116 @@ mod tests {
         assert_eq!(loaded.get(&Score(30)).len(), 1);
         assert_eq!(loaded.get(&Score(40)).len(), 1);
         assert_eq!(loaded.get(&Score(10)).len(), 1);
+    }
+
+    #[test]
+    fn full_recovery_with_persistent_index() {
+        use crate::codec::CodecRegistry;
+        use crate::snapshot::Snapshot;
+        use crate::wal::{Wal, WalConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("recovery.wal");
+        let snap_path = dir.path().join("checkpoint.snap");
+        let idx_path = dir.path().join("score.idx");
+
+        let config = WalConfig {
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_bytes_between_checkpoints: None,
+        };
+
+        // Phase 1: create world, spawn entities via WAL, build & save index
+        let checkpoint_seq;
+        {
+            let mut world = World::new();
+            let mut codecs = CodecRegistry::new();
+            codecs.register_as::<Score>("score", &mut world);
+
+            let mut wal = Wal::create(&wal_dir, &codecs, config.clone()).unwrap();
+
+            // Spawn 10 entities with Score components via WAL
+            for i in 0..10 {
+                let e = world.alloc_entity();
+                let mut cs = minkowski::EnumChangeSet::new();
+                cs.spawn_bundle(&mut world, e, (Score(i),));
+                wal.append(&cs, &codecs).unwrap();
+                cs.apply(&mut world);
+            }
+
+            // Build and save index
+            let mut idx = BTreeIndex::<Score>::new();
+            idx.rebuild(&mut world);
+            idx.save(&idx_path).unwrap();
+
+            // Save snapshot
+            checkpoint_seq = wal.next_seq();
+            let snap = Snapshot::new();
+            snap.save(&snap_path, &world, &codecs, checkpoint_seq)
+                .unwrap();
+            wal.acknowledge_snapshot(checkpoint_seq).unwrap();
+
+            // Phase 2: more WAL mutations AFTER checkpoint+index save
+            let e = world.alloc_entity();
+            let mut cs = minkowski::EnumChangeSet::new();
+            cs.spawn_bundle(&mut world, e, (Score(99),));
+            wal.append(&cs, &codecs).unwrap();
+            cs.apply(&mut world);
+
+            // Spawn another post-checkpoint entity
+            let e2 = world.alloc_entity();
+            let mut cs2 = minkowski::EnumChangeSet::new();
+            cs2.spawn_bundle(&mut world, e2, (Score(88),));
+            wal.append(&cs2, &codecs).unwrap();
+            cs2.apply(&mut world);
+
+            // "Crash" — drop everything
+        }
+
+        // Phase 3: recover
+        {
+            let mut codecs = CodecRegistry::new();
+            // Must re-register codecs before loading
+            let mut tmp_world = World::new();
+            codecs.register_as::<Score>("score", &mut tmp_world);
+            drop(tmp_world);
+
+            // Load snapshot
+            let snap = Snapshot::new();
+            let (mut world, _snap_seq) = snap.load(&snap_path, &codecs).unwrap();
+
+            // Replay WAL from checkpoint onwards
+            let mut wal = Wal::open(&wal_dir, &codecs, config.clone()).unwrap();
+            wal.replay_from(checkpoint_seq, &mut world, &codecs)
+                .unwrap();
+
+            // Load persistent index and catch up
+            let mut idx = load_btree_index::<Score>(&idx_path).unwrap();
+            idx.update(&mut world);
+
+            // Verify: all 12 entities present (10 original + Score(99) + Score(88))
+            let mut total = 0;
+            for i in 0..100 {
+                total += idx.get(&Score(i)).len();
+            }
+            assert_eq!(total, 12, "expected 12 entities in index after recovery");
+
+            // Specifically check the post-checkpoint entities
+            assert_eq!(
+                idx.get(&Score(99)).len(),
+                1,
+                "post-checkpoint Score(99) missing"
+            );
+            assert_eq!(
+                idx.get(&Score(88)).len(),
+                1,
+                "post-checkpoint Score(88) missing"
+            );
+
+            // Check original entities survived
+            for i in 0..10 {
+                assert_eq!(idx.get(&Score(i)).len(), 1, "original Score({i}) missing");
+            }
+        }
     }
 
     #[test]
