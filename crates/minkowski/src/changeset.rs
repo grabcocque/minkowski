@@ -129,6 +129,10 @@ struct DropEntry {
     offset: usize,
     /// Type-erased destructor (`drop_in_place::<T>`).
     drop_fn: unsafe fn(*mut u8),
+    /// Index of the mutation that owns this value. Used to partition
+    /// drop entries between processed (ownership transferred to World)
+    /// and unprocessed (must be dropped on error) during `apply()`.
+    mutation_idx: usize,
 }
 
 /// A single structural mutation recorded in a ChangeSet.
@@ -312,7 +316,12 @@ impl EnumChangeSet {
         let value = std::mem::ManuallyDrop::new(value);
         let offset = self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if let Some(drop_fn) = drop_fn {
-            self.drop_entries.push(DropEntry { offset, drop_fn });
+            let mutation_idx = self.mutations.len() - 1;
+            self.drop_entries.push(DropEntry {
+                offset,
+                drop_fn,
+                mutation_idx,
+            });
         }
     }
 
@@ -337,7 +346,12 @@ impl EnumChangeSet {
         let offset =
             self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if let Some(drop_fn) = drop_fn {
-            self.drop_entries.push(DropEntry { offset, drop_fn });
+            let mutation_idx = self.mutations.len() - 1;
+            self.drop_entries.push(DropEntry {
+                offset,
+                drop_fn,
+                mutation_idx,
+            });
         }
     }
 
@@ -370,9 +384,14 @@ impl EnumChangeSet {
             });
         }
         // Register drop entries for components that need cleanup.
+        let mutation_idx = self.mutations.len(); // index of the Spawn we're about to push
         for &(comp_id, offset, _) in &components {
             if let Some(drop_fn) = world.components.info(comp_id).drop_fn {
-                self.drop_entries.push(DropEntry { offset, drop_fn });
+                self.drop_entries.push(DropEntry {
+                    offset,
+                    drop_fn,
+                    mutation_idx,
+                });
             }
         }
         self.mutations.push(Mutation::Spawn { entity, components });
@@ -395,9 +414,11 @@ impl EnumChangeSet {
         let value = std::mem::ManuallyDrop::new(value);
         let offset = self.record_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if std::mem::needs_drop::<T>() {
+            let mutation_idx = self.mutations.len() - 1;
             self.drop_entries.push(DropEntry {
                 offset,
                 drop_fn: crate::component::drop_ptr::<T>,
+                mutation_idx,
             });
         }
     }
@@ -416,9 +437,11 @@ impl EnumChangeSet {
         let offset =
             self.record_sparse_insert(entity, comp_id, &*value as *const T as *const u8, layout);
         if std::mem::needs_drop::<T>() {
+            let mutation_idx = self.mutations.len() - 1;
             self.drop_entries.push(DropEntry {
                 offset,
                 drop_fn: crate::component::drop_ptr::<T>,
+                mutation_idx,
             });
         }
     }
@@ -447,9 +470,14 @@ impl EnumChangeSet {
                 components.push((comp_id, offset, layout));
             });
         }
+        let mutation_idx = self.mutations.len();
         for &(comp_id, offset, _) in &components {
             if let Some(drop_fn) = registry.info(comp_id).drop_fn {
-                self.drop_entries.push(DropEntry { offset, drop_fn });
+                self.drop_entries.push(DropEntry {
+                    offset,
+                    drop_fn,
+                    mutation_idx,
+                });
             }
         }
         self.mutations.push(Mutation::Spawn { entity, components });
@@ -577,14 +605,38 @@ impl EnumChangeSet {
     /// Returns `Ok(())` on success or `Err(ApplyError)` if a mutation targets
     /// an invalid entity. A single tick is allocated for the entire batch.
     pub fn apply(mut self, world: &mut World) -> Result<(), ApplyError> {
-        // Disarm drop entries — ownership transfers to the world during apply.
-        // If apply panics (programming error), arena values may leak rather
-        // than double-drop, which is the safer failure mode.
-        self.drop_entries.clear();
-
         let tick = world.next_tick();
 
-        for mutation in &self.mutations {
+        let result = self.apply_mutations(world, tick);
+
+        match result {
+            Ok(()) => {
+                // All mutations succeeded — disarm all drop entries.
+                // Ownership of arena-backed values has transferred to World.
+                self.drop_entries.clear();
+                Ok(())
+            }
+            Err((failed_idx, err)) => {
+                // Mutations 0..failed_idx succeeded (ownership transferred to World).
+                // Mutations failed_idx.. were not processed — their arena values
+                // must be dropped. Retain only drop entries for unprocessed mutations
+                // so the Drop impl cleans them up.
+                self.drop_entries
+                    .retain(|entry| entry.mutation_idx >= failed_idx);
+                Err(err)
+            }
+        }
+    }
+
+    /// Process all mutations. Returns `Err((mutation_index, error))` on failure,
+    /// where `mutation_index` is the index of the mutation that failed.
+    fn apply_mutations(
+        &self,
+        world: &mut World,
+        tick: crate::tick::Tick,
+    ) -> Result<(), (usize, ApplyError)> {
+        for (mutation_idx, mutation) in self.mutations.iter().enumerate() {
+            let map_err = |e| (mutation_idx, e);
             match mutation {
                 Mutation::Spawn { entity, components } => {
                     // Ensure the entity allocator's generations vec covers
@@ -593,7 +645,7 @@ impl EnumChangeSet {
                     // false for reserved-then-spawned entities.
                     world.entities.materialize_reserved();
                     if world.is_placed(*entity) {
-                        return Err(ApplyError::AlreadyPlaced(*entity));
+                        return Err(map_err(ApplyError::AlreadyPlaced(*entity)));
                     }
                     // --- Apply: push raw component data into the right archetype ---
                     let sorted_ids: Vec<ComponentId> = {
@@ -642,14 +694,15 @@ impl EnumChangeSet {
                     layout,
                 } => {
                     let data_ptr = self.arena.get(*offset);
-                    changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)?;
+                    changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)
+                        .map_err(map_err)?;
                 }
 
                 Mutation::Remove {
                     entity,
                     component_id,
                 } => {
-                    changeset_remove_raw(world, *entity, *component_id, tick)?;
+                    changeset_remove_raw(world, *entity, *component_id, tick).map_err(map_err)?;
                 }
 
                 Mutation::SparseInsert {
@@ -659,7 +712,7 @@ impl EnumChangeSet {
                     layout,
                 } => {
                     if !world.is_alive(*entity) {
-                        return Err(ApplyError::DeadEntity(*entity));
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
                     }
                     let data_ptr = self.arena.get(*offset);
                     let info = world.components.info(*component_id);
@@ -683,7 +736,7 @@ impl EnumChangeSet {
                     component_id,
                 } => {
                     if !world.is_alive(*entity) {
-                        return Err(ApplyError::DeadEntity(*entity));
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
                     }
                     // Remove with drop — no reverse to own the old bytes.
                     world.sparse.remove_raw(*component_id, *entity);
@@ -1591,5 +1644,74 @@ mod tests {
 
         cs.apply(&mut world).unwrap();
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 10.0, dy: 20.0 }));
+    }
+
+    /// Component with a drop counter — verifies no leaks on partial apply.
+    struct DropCounted {
+        _value: u32,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for DropCounted {
+        fn drop(&mut self) {
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn partial_apply_drops_unapplied_values() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut world = World::new();
+        let live = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let dead = world.spawn((Pos { x: 3.0, y: 4.0 },));
+        world.despawn(dead); // dead entity
+
+        // Register the droppable component type.
+        let dc_id = world.register_component::<DropCounted>();
+
+        let mut cs = EnumChangeSet::new();
+        // Mutation 0: insert on live entity — will succeed
+        cs.insert_raw::<DropCounted>(
+            live,
+            dc_id,
+            DropCounted {
+                _value: 1,
+                counter: drops.clone(),
+            },
+        );
+        // Mutation 1: insert on dead entity — will fail
+        cs.insert_raw::<DropCounted>(
+            dead,
+            dc_id,
+            DropCounted {
+                _value: 2,
+                counter: drops.clone(),
+            },
+        );
+
+        // Apply should fail on mutation 1.
+        let result = cs.apply(&mut world);
+        assert!(result.is_err());
+
+        // Mutation 0's value transferred to World (not dropped by changeset).
+        // Mutation 1's value should have been dropped by the changeset cleanup.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "unapplied value must be dropped"
+        );
+
+        // Despawn the live entity to drop mutation 0's value from World.
+        world.despawn(live);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "both values must be dropped total"
+        );
     }
 }
