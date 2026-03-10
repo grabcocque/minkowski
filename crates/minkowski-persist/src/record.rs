@@ -121,11 +121,54 @@ pub struct ReplicationBatch {
     pub records: Vec<WalRecord>,
 }
 
+/// Reference to an unchanged archetype in an incremental snapshot.
+/// On load, the archetype data is carried forward from the base world.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct CleanArchetypeRef {
+    /// Component IDs defining this archetype's schema.
+    pub component_ids: Vec<ComponentId>,
+    /// Number of entities — for validation against the base world.
+    pub entity_count: u32,
+}
+
+/// Incremental snapshot payload — captures only archetypes that changed
+/// since a base (full) snapshot. Clean archetypes are referenced by their
+/// component ID set and carried forward from the base world on load.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct IncrementalSnapshotData {
+    /// WAL seq of the base (full) snapshot this delta applies on top of.
+    pub base_wal_seq: u64,
+    /// WAL seq at the time this incremental snapshot was taken.
+    pub wal_seq: u64,
+    /// Full component schema (same format as full snapshot).
+    pub schema: Vec<ComponentSchema>,
+    /// Full allocator state at the time of this snapshot.
+    pub allocator: AllocatorState,
+    /// Archetypes that changed since the base snapshot. Full data included.
+    pub dirty_archetypes: Vec<ArchetypeData>,
+    /// Unchanged archetypes — only metadata, no entity/column data.
+    pub clean_archetypes: Vec<CleanArchetypeRef>,
+    /// Sparse components that changed since base.
+    pub dirty_sparse: Vec<SparseComponentData>,
+    /// Component IDs of sparse components unchanged since base.
+    pub clean_sparse_ids: Vec<ComponentId>,
+}
+
 /// Returned after a successful snapshot save.
 #[derive(Debug, Clone)]
 pub struct SnapshotHeader {
     pub wal_seq: u64,
     pub archetype_count: usize,
+    pub entity_count: usize,
+}
+
+/// Returned after a successful incremental snapshot save.
+#[derive(Debug, Clone)]
+pub struct IncrementalSnapshotHeader {
+    pub base_wal_seq: u64,
+    pub wal_seq: u64,
+    pub dirty_archetype_count: usize,
+    pub clean_archetype_count: usize,
     pub entity_count: usize,
 }
 

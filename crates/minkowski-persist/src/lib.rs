@@ -14,4 +14,6 @@ pub use index::{load_btree_index, load_hash_index, IndexPersistError, Persistent
 pub use record::*;
 pub use replication::{apply_batch, ReplicationError};
 pub use snapshot::{Snapshot, SnapshotError};
+// record.rs re-exports include IncrementalSnapshotData, IncrementalSnapshotHeader,
+// CleanArchetypeRef via the existing `pub use record::*`.
 pub use wal::{Wal, WalConfig, WalCursor, WalError, WalStats};

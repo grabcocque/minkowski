@@ -1448,6 +1448,21 @@ impl World {
         self.archetypes.archetypes[arch_idx].len()
     }
 
+    /// Change tick of a specific column in an archetype.
+    ///
+    /// Returns the tick at which the column was last mutably accessed.
+    /// Used by incremental snapshots to determine which archetypes
+    /// have changed since a previous snapshot.
+    pub fn archetype_column_changed_tick(
+        &self,
+        arch_idx: usize,
+        comp_id: ComponentId,
+    ) -> crate::tick::ChangeTick {
+        let arch = &self.archetypes.archetypes[arch_idx];
+        let col_idx = arch.column_index(comp_id).unwrap();
+        crate::tick::ChangeTick::from_raw(arch.columns[col_idx].changed_tick.raw())
+    }
+
     /// Raw pointer to a component value at a specific row in an archetype column.
     ///
     /// # Safety
@@ -2234,6 +2249,35 @@ mod tests {
         struct Unknown;
         let changed = world.query_changed_since::<Unknown>(crate::tick::ChangeTick::default());
         assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn archetype_column_changed_tick_basic() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
+
+        let pos_id = world.component_id::<Pos>().unwrap();
+        // Find the archetype containing Pos+Vel
+        let arch_idx = (0..world.archetype_count())
+            .find(|&i| {
+                let ids = world.archetype_component_ids(i);
+                ids.contains(&pos_id)
+            })
+            .unwrap();
+
+        let tick1 = world.archetype_column_changed_tick(arch_idx, pos_id);
+
+        // Mutate via query to bump the tick
+        for (pos,) in world.query::<(&mut Pos,)>() {
+            let pos = pos as *const Pos as *mut Pos;
+            unsafe { (*pos).x = 99.0 };
+        }
+
+        let tick2 = world.archetype_column_changed_tick(arch_idx, pos_id);
+        assert!(
+            tick2.to_raw() > tick1.to_raw(),
+            "column tick should advance after mutable query"
+        );
     }
 
     // ── World::get_batch tests ────────────────────────────────────
