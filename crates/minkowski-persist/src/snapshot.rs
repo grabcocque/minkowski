@@ -880,14 +880,17 @@ impl Snapshot {
                 let mut raw_components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)> =
                     Vec::new();
                 for &comp_id in &ref_comp_ids {
-                    let layout = codecs
-                        .layout(comp_id)
-                        .or_else(|| world.component_layout(comp_id))
-                        .ok_or_else(|| {
-                            SnapshotError::Format(format!(
-                                "no layout for component {comp_id} in clean archetype"
-                            ))
-                        })?;
+                    // Use the restored world's layout (sender-side IDs, set up
+                    // during schema registration above). Do NOT use codecs.layout()
+                    // here — comp_id is a sender-side ID but the codec registry is
+                    // keyed by receiver-side IDs. When registration order differs,
+                    // codecs.layout(sender_id) would resolve the wrong component's
+                    // layout, causing incorrect byte counts in copy_nonoverlapping.
+                    let layout = world.component_layout(comp_id).ok_or_else(|| {
+                        SnapshotError::Format(format!(
+                            "no layout for component {comp_id} in clean archetype"
+                        ))
+                    })?;
 
                     // Copy raw bytes from base world's column
                     let ptr =
@@ -2019,5 +2022,73 @@ mod tests {
             inc_bytes.len(),
             full_bytes.len(),
         );
+    }
+
+    #[test]
+    fn incremental_cross_process_different_registration_order() {
+        // Regression: when sender and receiver register components in different
+        // order, the clean-archetype restore path used codecs.layout(sender_id)
+        // which resolved the wrong component in the receiver's registry. This
+        // caused incorrect byte counts in copy_nonoverlapping.
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.snap");
+
+        // "Process A" (sender): Pos first, then Vel
+        let mut world_a = World::new();
+        let mut codecs_a = CodecRegistry::new();
+        codecs_a.register_as::<Pos>("pos", &mut world_a);
+        codecs_a.register_as::<Vel>("vel", &mut world_a);
+
+        // Archetype 1: (Pos, Vel) — will be dirty
+        world_a.spawn((
+            Pos { x: 1.0, y: 2.0 },
+            Vel { dx: 3.0, dy: 4.0 },
+        ));
+        // Archetype 2: (Pos) only — will be clean
+        world_a.spawn((Pos { x: 5.0, y: 6.0 },));
+
+        let snap = Snapshot::new();
+        snap.save(&base_path, &world_a, &codecs_a, 0).unwrap();
+
+        let since_tick = world_a.change_tick();
+
+        // Mutate only (Pos, Vel) archetype
+        for (pos, _vel) in world_a.query::<(&mut Pos, &Vel)>() {
+            let pos = pos as *const Pos as *mut Pos;
+            unsafe { (*pos).x = 100.0 };
+        }
+
+        let (_, inc_bytes) = snap
+            .save_incremental_to_bytes(&world_a, &codecs_a, 0, 1, since_tick)
+            .unwrap();
+
+        // "Process B" (receiver): OPPOSITE registration order
+        let mut world_b_tmp = World::new();
+        let mut codecs_b = CodecRegistry::new();
+        codecs_b.register_as::<Vel>("vel", &mut world_b_tmp);
+        codecs_b.register_as::<Pos>("pos", &mut world_b_tmp);
+
+        // Load base snapshot with receiver codecs
+        let (base_world_b, _) = snap.load(&base_path, &codecs_b).unwrap();
+
+        // Load incremental on top of base — this is the path that was buggy
+        let (mut restored, _) = snap
+            .load_incremental_from_bytes(&inc_bytes, &base_world_b, &codecs_b)
+            .unwrap();
+
+        // Verify clean archetype (Pos-only) data survived correctly
+        let mut positions: Vec<(f32, f32)> = restored
+            .query::<(&Pos,)>()
+            .map(|p| (p.0.x, p.0.y))
+            .collect();
+        positions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(positions, vec![(5.0, 6.0), (100.0, 2.0)]);
+
+        // Verify dirty archetype (Pos, Vel) data
+        let velocities: Vec<(f32, f32)> = restored
+            .query::<(&Vel,)>()
+            .map(|v| (v.0.dx, v.0.dy))
+            .collect();
+        assert_eq!(velocities, vec![(3.0, 4.0)]);
     }
 }
