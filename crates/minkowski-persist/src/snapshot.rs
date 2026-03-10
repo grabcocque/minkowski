@@ -423,7 +423,9 @@ impl Snapshot {
                 changeset.record_spawn(entity, &ptrs);
             }
 
-            changeset.apply(&mut world);
+            changeset
+                .apply(&mut world)
+                .expect("snapshot restore changeset apply");
         }
 
         // Restore sparse components: sender IDs for insertion, codec IDs for deserialization.
@@ -698,7 +700,7 @@ mod tests {
             (Pos { x: 5.0, y: 6.0 }, Vel { dx: 0.5, dy: 0.6 }),
         );
         wal.append(&cs, &codecs).unwrap();
-        let _reverse = cs.apply(&mut world);
+        cs.apply(&mut world).unwrap();
 
         let entities: Vec<_> = world
             .query::<(minkowski::Entity, &Pos)>()
