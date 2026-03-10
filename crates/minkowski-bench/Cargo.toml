@@ -32,3 +32,15 @@ harness = false
 [[bench]]
 name = "add_remove"
 harness = false
+
+[[bench]]
+name = "schedule"
+harness = false
+
+[[bench]]
+name = "serialize"
+harness = false
+
+[[bench]]
+name = "reducer"
+harness = false
