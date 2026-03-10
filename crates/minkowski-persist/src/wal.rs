@@ -55,6 +55,8 @@ pub enum WalError {
     },
     #[error("cursor behind: requested seq {requested} but oldest available is {oldest}")]
     CursorBehind { requested: u64, oldest: u64 },
+    #[error("WAL apply error: {0}")]
+    Apply(#[from] minkowski::ApplyError),
 }
 
 /// Maximum WAL frame size (256 MB). Rejects corrupt length prefixes
@@ -292,12 +294,7 @@ pub(crate) fn apply_record(
             }
         }
     }
-    changeset.apply(world).map_err(|e| {
-        WalError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            e.to_string(),
-        ))
-    })?;
+    changeset.apply(world).map_err(WalError::Apply)?;
     Ok(())
 }
 

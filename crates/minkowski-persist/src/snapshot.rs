@@ -425,7 +425,7 @@ impl Snapshot {
 
             changeset
                 .apply(&mut world)
-                .expect("snapshot restore changeset apply");
+                .expect("snapshot restore: changeset apply failed — snapshot may be corrupt");
         }
 
         // Restore sparse components: sender IDs for insertion, codec IDs for deserialization.
@@ -719,7 +719,7 @@ mod tests {
             cs2.insert::<Pos>(&mut world, *e, *new_pos);
         }
         wal.append(&cs2, &codecs).unwrap();
-        let _reverse2 = cs2.apply(&mut world);
+        cs2.apply(&mut world).unwrap();
 
         // Recover from snapshot + WAL
         let mut load_codecs = CodecRegistry::new();

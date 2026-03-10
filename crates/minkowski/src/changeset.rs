@@ -9,7 +9,8 @@ use crate::world::{get_pair_mut, EntityLocation, World};
 
 /// Error returned by [`EnumChangeSet::apply`] when a mutation targets
 /// an invalid entity.
-#[derive(Debug)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ApplyError {
     /// Mutation targeted an entity that is no longer alive.
     DeadEntity(Entity),
@@ -174,8 +175,8 @@ pub(crate) enum Mutation {
 /// with component bytes stored in a contiguous arena.
 ///
 /// [`apply()`](EnumChangeSet::apply) executes all buffered mutations against a
-/// [`World`] and returns a **reverse** `EnumChangeSet` — applying the reverse
-/// undoes the original changes, enabling rollback and undo/redo.
+/// [`World`], returning `Ok(())` on success or `Err(ApplyError)` if a
+/// mutation targets a dead or already-placed entity.
 ///
 /// Typed helpers — [`insert`](EnumChangeSet::insert), [`remove`](EnumChangeSet::remove),
 /// [`spawn_bundle`](EnumChangeSet::spawn_bundle) — auto-register component types and
@@ -664,14 +665,13 @@ impl EnumChangeSet {
                     }
 
                     let archetype = &mut world.archetypes.archetypes[arch_id.0];
-                    for &(comp_id, offset, layout) in components {
+                    for &(comp_id, offset, _) in components {
                         let src = self.arena.get(offset);
                         let col = archetype.column_index(comp_id).unwrap();
                         unsafe {
                             archetype.columns[col].push(src as *mut u8);
                         }
                         archetype.columns[col].mark_changed(tick);
-                        let _ = layout;
                     }
                     let row = archetype.entities.len();
                     archetype.entities.push(*entity);
@@ -684,7 +684,9 @@ impl EnumChangeSet {
                 }
 
                 Mutation::Despawn { entity } => {
-                    world.despawn(*entity);
+                    if !world.despawn(*entity) {
+                        return Err(map_err(ApplyError::DeadEntity(*entity)));
+                    }
                 }
 
                 Mutation::Insert {
