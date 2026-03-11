@@ -1,7 +1,7 @@
 use crate::bundle::Bundle;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::{Entity, EntityAllocator};
-use crate::pool::{PoolExhausted, SharedPool, default_pool};
+use crate::pool::{PoolExhausted, SharedPool, SlabPool, default_pool};
 use crate::query::fetch::WorldQuery;
 use crate::query::iter::QueryIter;
 use crate::storage::archetype::{Archetype, ArchetypeId, Archetypes};
@@ -1549,17 +1549,8 @@ impl Default for World {
 
 // ── WorldBuilder ─────────────────────────────────────────────────────
 
-/// Hugepage configuration for the memory pool.
-#[derive(Clone, Copy, Debug, Default)]
-pub enum HugePages {
-    /// Attempt 2 MiB hugepages, fall back to 4 KiB pages silently.
-    #[default]
-    Try,
-    /// Require hugepages — fail if unavailable.
-    Require,
-    /// Use regular 4 KiB pages only.
-    Off,
-}
+// HugePages is defined in pool.rs and re-exported via lib.rs.
+use crate::pool::HugePages;
 
 /// Builder for configuring [`World`] memory and allocation strategy.
 ///
@@ -1586,17 +1577,13 @@ impl WorldBuilder {
     }
 
     /// Set a fixed memory budget in bytes. When set, the World will
-    /// allocate from a bounded slab pool instead of the system allocator.
-    ///
-    /// Not yet functional — `SlabPool` is implemented in a later task (C5).
-    /// Currently falls through to the default system allocator.
+    /// allocate from a bounded [`SlabPool`] instead of the system allocator.
     pub fn memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget = Some(bytes);
         self
     }
 
     /// Configure hugepage usage for the memory pool.
-    #[allow(dead_code)]
     pub fn hugepages(mut self, hp: HugePages) -> Self {
         self.hugepages = hp;
         self
@@ -1606,11 +1593,7 @@ impl WorldBuilder {
     /// allocated (only possible with a bounded `memory_budget`).
     pub fn build(self) -> Result<World, PoolExhausted> {
         let pool: SharedPool = match self.memory_budget {
-            Some(_bytes) => {
-                // TODO(C5): SlabPool::new(bytes, self.hugepages) — replace
-                // with mmap-backed slab pool when implemented.
-                default_pool()
-            }
+            Some(bytes) => Arc::new(SlabPool::new(bytes, self.hugepages)?),
             None => default_pool(),
         };
         Ok(World::new_with_pool(pool))
@@ -3118,16 +3101,15 @@ mod tests {
     }
 
     #[test]
-    fn world_builder_with_memory_budget_still_defaults() {
-        // SlabPool not yet implemented — budget is accepted but falls through
-        // to the system allocator.
+    fn world_builder_with_memory_budget_uses_slab_pool() {
         let world = WorldBuilder::new()
             .memory_budget(64 * 1024 * 1024)
+            .hugepages(HugePages::Off)
             .build()
             .unwrap();
         let stats = world.stats();
-        // TODO(C5): once SlabPool exists, pool_capacity should be Some(64 MiB).
-        assert!(stats.pool_capacity.is_none());
+        assert_eq!(stats.pool_capacity, Some(64 * 1024 * 1024));
+        assert_eq!(stats.pool_used, Some(0));
     }
 
     #[test]
@@ -3145,6 +3127,24 @@ mod tests {
         let builder = WorldBuilder::default();
         let world = builder.build().unwrap();
         assert_eq!(world.entity_count(), 0);
+    }
+
+    #[test]
+    fn world_builder_with_slab_pool() {
+        let mut world = World::builder()
+            .memory_budget(8 * 1024 * 1024)
+            .hugepages(HugePages::Off)
+            .build()
+            .unwrap();
+
+        for i in 0..100 {
+            world.spawn((i as u32, i as f64));
+        }
+
+        let stats = world.stats();
+        assert_eq!(stats.entity_count, 100);
+        assert!(stats.pool_capacity.is_some());
+        assert!(stats.pool_used.unwrap() > 0);
     }
 }
 

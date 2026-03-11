@@ -96,7 +96,7 @@ pub use component::ComponentId;
 pub use entity::Entity;
 pub use index::{BTreeIndex, HashIndex, SpatialIndex};
 pub use minkowski_derive::Table;
-pub use pool::PoolExhausted;
+pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
     ComponentSet, Contains, DynamicCtx, DynamicReducerBuilder, DynamicReducerId, EntityMut,
@@ -106,4 +106,4 @@ pub use reducer::{
 pub use retention::Expiry;
 pub use tick::ChangeTick;
 pub use transaction::{Conflict, Optimistic, Pessimistic, Sequential, SequentialTx, Transact, Tx};
-pub use world::{HugePages, QueryTickInfo, World, WorldBuilder, WorldStats};
+pub use world::{QueryTickInfo, World, WorldBuilder, WorldStats};
