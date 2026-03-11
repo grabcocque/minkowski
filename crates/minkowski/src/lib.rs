@@ -71,6 +71,7 @@
 extern crate self as minkowski;
 
 pub mod access;
+pub mod blob;
 pub mod bundle;
 pub mod changeset;
 pub mod command;
@@ -88,6 +89,7 @@ pub mod transaction;
 pub mod world;
 
 pub use access::Access;
+pub use blob::{BlobRef, BlobStore};
 pub use changeset::{ApplyError, EnumChangeSet, MutationRef};
 pub use command::CommandBuffer;
 pub use component::ComponentId;
