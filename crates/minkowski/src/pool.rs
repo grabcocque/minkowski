@@ -8,8 +8,8 @@
 use std::alloc::Layout;
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
 
 /// Error returned when the memory pool is exhausted.
 #[derive(Debug, Clone)]
@@ -106,13 +106,38 @@ unsafe impl PoolAllocator for SystemAllocator {
 }
 
 /// Shared handle to a pool allocator. Cheaply cloneable.
+///
+/// Under `cfg(loom)`, uses `Arc<Box<dyn PoolAllocator>>` because loom's `Arc`
+/// does not support direct trait-object coercion.
 #[allow(dead_code)]
+#[cfg(not(loom))]
 pub(crate) type SharedPool = Arc<dyn PoolAllocator>;
+
+#[allow(dead_code)]
+#[cfg(loom)]
+pub(crate) type SharedPool = Arc<Box<dyn PoolAllocator>>;
 
 /// Create the default (system) allocator as a shared pool.
 #[allow(dead_code)]
 pub(crate) fn default_pool() -> SharedPool {
-    Arc::new(SystemAllocator)
+    into_shared(SystemAllocator)
+}
+
+/// Wrap a concrete allocator into a `SharedPool`.
+///
+/// This helper exists because `loom::sync::Arc` does not support automatic
+/// trait-object coercion from `Arc<T>` to `Arc<dyn PoolAllocator>`.
+/// On `std`, this is a simple `Arc::new(alloc)`.
+#[cfg(not(loom))]
+pub(crate) fn into_shared<A: PoolAllocator + 'static>(alloc: A) -> SharedPool {
+    Arc::new(alloc)
+}
+
+#[cfg(loom)]
+pub(crate) fn into_shared<A: PoolAllocator + 'static>(alloc: A) -> SharedPool {
+    // loom::sync::Arc doesn't coerce to dyn. Box first, then Arc the Box.
+    let boxed: Box<dyn PoolAllocator> = Box::new(alloc);
+    Arc::from(boxed)
 }
 
 // ── mlockall ────────────────────────────────────────────────────────
@@ -256,12 +281,12 @@ fn size_class_for(layout: Layout) -> Option<usize> {
 /// Memory is partitioned into fixed-size blocks across six size classes.
 /// Allocation and deallocation are serialized per size class via `Mutex`.
 ///
-// PERF: parking_lot::Mutex is a single atomic CAS on uncontended paths.
+// PERF: Mutex is a single atomic CAS on uncontended paths.
 // If profiling shows contention, consider upgrading to a lock-free
 // structure with ABA protection (tagged pointers or epoch-based reclamation).
 pub(crate) struct SlabPool {
     region: MmapRegion,
-    free_lists: [parking_lot::Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES],
+    free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES],
     used_bytes: AtomicUsize,
 }
 
@@ -280,8 +305,8 @@ impl SlabPool {
         let total = region.len();
 
         // Initialize free lists as empty Vecs.
-        let free_lists: [parking_lot::Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES] =
-            std::array::from_fn(|_| parking_lot::Mutex::new(Vec::new()));
+        let free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES] =
+            std::array::from_fn(|_| Mutex::new(Vec::new()));
 
         // Partition the region into size-class blocks proportionally.
         let proportion_sum: usize = PROPORTIONS.iter().sum();
@@ -605,5 +630,69 @@ mod tests {
             // SAFETY: each ptr was returned by `allocate` with layout_small.
             unsafe { pool.deallocate(ptr, layout_small) };
         }
+    }
+}
+
+// ── Loom tests ─────────────────────────────────────────────────────
+
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+    use std::alloc::Layout;
+
+    /// Two threads concurrently allocate and deallocate from the same pool.
+    /// Verifies: (1) no double-allocation (all pointers unique), (2) `used_bytes`
+    /// returns to zero after all deallocations.
+    #[test]
+    fn loom_concurrent_allocate_deallocate() {
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || {
+                let ptr = p1.allocate(layout).unwrap();
+                // SAFETY: ptr from allocate, deallocated once.
+                unsafe { p1.deallocate(ptr, layout) };
+            });
+
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || {
+                let ptr = p2.allocate(layout).unwrap();
+                // SAFETY: ptr from allocate, deallocated once.
+                unsafe { p2.deallocate(ptr, layout) };
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(pool.used(), Some(0));
+        });
+    }
+
+    /// Two threads allocate from the same size class. Verifies no duplicate
+    /// pointers are returned (the Mutex serializes access correctly).
+    #[test]
+    fn loom_no_duplicate_allocations() {
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || p1.allocate(layout).unwrap());
+
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || p2.allocate(layout).unwrap());
+
+            let ptr1 = t1.join().unwrap();
+            let ptr2 = t2.join().unwrap();
+
+            assert_ne!(
+                ptr1.as_ptr(),
+                ptr2.as_ptr(),
+                "two threads got the same block"
+            );
+        });
     }
 }

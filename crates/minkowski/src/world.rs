@@ -1831,7 +1831,10 @@ impl WorldBuilder {
             let _ = crate::pool::try_mlockall();
         }
         let pool: SharedPool = match self.memory_budget {
-            Some(bytes) => Arc::new(SlabPool::new(bytes, self.hugepages)?),
+            Some(bytes) => {
+                let slab = SlabPool::new(bytes, self.hugepages)?;
+                crate::pool::into_shared(slab)
+            }
             None => default_pool(),
         };
         Ok(World::new_with_pool(pool))
