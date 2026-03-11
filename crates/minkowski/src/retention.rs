@@ -119,6 +119,31 @@ mod tests {
     }
 
     #[test]
+    fn retention_despawns_at_boundary_tick() {
+        // Regression: the retention adapter must compare deadlines against
+        // the post-query tick, not a pre-query snapshot. world.query()
+        // advances the tick, so a pre-query snapshot lets entities at
+        // deadline == tick+1 survive one extra dispatch.
+        let mut world = World::new();
+        let mut registry = crate::ReducerRegistry::new();
+        let retention_id = registry.retention(&mut world);
+
+        // Set deadline to exactly the tick the query will advance to.
+        // The entity should be despawned on this run, not the next.
+        let pre_tick = world.change_tick().to_raw();
+        // world.query() inside retention will advance tick by at least 1,
+        // so deadline = pre_tick + 1 should be caught.
+        let deadline = ChangeTick::from_raw(pre_tick + 1);
+        let e = world.spawn((Expiry::at_tick(deadline),));
+
+        registry.run(&mut world, retention_id, ()).unwrap();
+        assert!(
+            !world.is_alive(e),
+            "entity at deadline tick+1 should be despawned by the run that crosses its deadline"
+        );
+    }
+
+    #[test]
     fn retention_access_declares_despawns() {
         let mut world = World::new();
         let mut registry = crate::ReducerRegistry::new();

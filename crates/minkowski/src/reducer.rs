@@ -1671,15 +1671,24 @@ impl ReducerRegistry {
         let resolved = ResolvedComponents(Vec::new());
 
         let adapter: ScheduledAdapter = Box::new(|world, _args_any| {
-            let current_tick = world.change_tick().to_raw();
-            let mut expired = Vec::new();
+            // Collect (entity, deadline) pairs during the scan. We must NOT
+            // snapshot change_tick() before the query because world.query()
+            // advances the tick — a pre-query snapshot would let entities at
+            // deadline == tick+1 survive even though the query itself pushed
+            // the world past their deadline.
+            let mut candidates: Vec<(Entity, u64)> = Vec::new();
             world
                 .query::<(Entity, &crate::retention::Expiry)>()
                 .for_each(|(entity, expiry)| {
-                    if expiry.deadline().to_raw() <= current_tick {
-                        expired.push(entity);
-                    }
+                    candidates.push((entity, expiry.deadline().to_raw()));
                 });
+            // Capture tick AFTER the query so the comparison reflects the
+            // true current state of the world.
+            let current_tick = world.change_tick().to_raw();
+            let expired: Vec<Entity> = candidates
+                .into_iter()
+                .filter_map(|(e, deadline)| (deadline <= current_tick).then_some(e))
+                .collect();
             if !expired.is_empty() {
                 world.despawn_batch(&expired);
             }
