@@ -2,15 +2,21 @@
 //!
 //! `BlobRef` holds a key/URL to data in an external object store (S3, MinIO,
 //! local filesystem). The ECS stores only the reference — blob bytes never
-//! enter the World. Same external composition pattern as [`SpatialIndex`].
+//! enter the World. Same external composition pattern as
+//! [`SpatialIndex`](minkowski::SpatialIndex).
+//!
+//! `BlobRef` derives rkyv `Archive`/`Serialize`/`Deserialize` and can be
+//! registered with [`CodecRegistry`](crate::CodecRegistry) like any other
+//! persistable component.
 
 /// Reference to an externally-stored blob.
 ///
 /// The ECS stores only this key string — the actual blob bytes live in an
 /// external object store. Persistence serializes the key, not the remote blob.
 /// On snapshot restore, keys are restored but remote blobs must still exist.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BlobRef(pub String);
+#[derive(Clone, Debug, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub struct BlobRef(String);
 
 impl BlobRef {
     /// Create a new blob reference from a key string.
@@ -28,7 +34,13 @@ impl BlobRef {
 ///
 /// The engine does **not** call these methods automatically. Users wire them
 /// into cleanup reducers or framework-level hooks. Same responsibility model
-/// as [`SpatialIndex::rebuild`](crate::SpatialIndex::rebuild).
+/// as [`SpatialIndex::rebuild`](minkowski::SpatialIndex::rebuild).
+///
+/// # Shared-key safety
+///
+/// If multiple entities share the same blob key, the caller must verify no
+/// remaining entity holds the key before including it in the orphaned set.
+/// Passing refs that are still attached to live entities will cause data loss.
 ///
 /// # Example
 ///
@@ -52,7 +64,7 @@ pub trait BlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::World;
+    use minkowski::World;
 
     #[test]
     fn blob_ref_is_a_component() {
@@ -105,5 +117,15 @@ mod tests {
         });
         keys.sort();
         assert_eq!(keys, vec!["s3://1", "s3://2"]);
+    }
+
+    #[test]
+    fn blob_ref_codec_registration() {
+        let mut world = World::new();
+        let mut codecs = crate::CodecRegistry::new();
+        codecs.register::<BlobRef>(&mut world);
+
+        let id = world.component_id::<BlobRef>().unwrap();
+        assert!(codecs.stable_name(id).is_some());
     }
 }

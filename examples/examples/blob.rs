@@ -8,7 +8,8 @@
 //!
 //! Run: cargo run -p minkowski-examples --example blob --release
 
-use minkowski::{BlobRef, BlobStore, Entity, World};
+use minkowski::{Entity, World};
+use minkowski_persist::{BlobRef, BlobStore};
 use std::collections::HashMap;
 
 /// Simulated object store (in-memory HashMap standing in for S3/MinIO).
