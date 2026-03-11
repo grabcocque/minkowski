@@ -115,6 +115,27 @@ pub(crate) fn default_pool() -> SharedPool {
     Arc::new(SystemAllocator)
 }
 
+// ── mlockall ────────────────────────────────────────────────────────
+
+/// Call `mlockall(MCL_CURRENT | MCL_FUTURE)` to lock all current and future
+/// memory mappings into physical RAM. This is a process-global operation.
+///
+/// Best-effort: silently ignored on platforms without `mlockall` or if the
+/// call fails (insufficient privileges).
+#[cfg(unix)]
+pub(crate) fn mlockall_best_effort() {
+    // SAFETY: mlockall is a process-global operation with no memory
+    // unsafety. It may fail due to insufficient RLIMIT_MEMLOCK.
+    unsafe {
+        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mlockall_best_effort() {
+    // No-op on non-Unix platforms.
+}
+
 // ── MmapRegion ──────────────────────────────────────────────────────
 
 /// Memory region backed by an anonymous mmap with optional hugepage support.

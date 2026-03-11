@@ -1774,6 +1774,7 @@ use crate::pool::HugePages;
 pub struct WorldBuilder {
     memory_budget: Option<usize>,
     hugepages: HugePages,
+    lock_all_memory: bool,
 }
 
 impl WorldBuilder {
@@ -1781,6 +1782,7 @@ impl WorldBuilder {
         Self {
             memory_budget: None,
             hugepages: HugePages::default(),
+            lock_all_memory: false,
         }
     }
 
@@ -1797,9 +1799,26 @@ impl WorldBuilder {
         self
     }
 
+    /// Lock all current and future memory mappings into physical RAM.
+    ///
+    /// Calls `mlockall(MCL_CURRENT | MCL_FUTURE)` before pool creation.
+    /// This is a **process-global** operation — it affects all memory in
+    /// the process, not just the pool. Use only in dedicated database
+    /// processes, not in libraries embedded in larger applications.
+    ///
+    /// Requires `CAP_IPC_LOCK` or sufficient `RLIMIT_MEMLOCK` on Linux.
+    /// On unsupported platforms this is a no-op.
+    pub fn lock_all_memory(mut self, lock: bool) -> Self {
+        self.lock_all_memory = lock;
+        self
+    }
+
     /// Build the [`World`]. Returns `Err` if the memory pool cannot be
     /// allocated (only possible with a bounded `memory_budget`).
     pub fn build(self) -> Result<World, PoolExhausted> {
+        if self.lock_all_memory {
+            crate::pool::mlockall_best_effort();
+        }
         let pool: SharedPool = match self.memory_budget {
             Some(bytes) => Arc::new(SlabPool::new(bytes, self.hugepages)?),
             None => default_pool(),
