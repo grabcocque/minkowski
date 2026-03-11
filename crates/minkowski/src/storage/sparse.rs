@@ -13,6 +13,24 @@ const EMPTY: u32 = u32::MAX;
 /// The sparse array is indexed by `entity.index()`, split into pages of
 /// [`PAGE_SIZE`]. Each page entry stores a dense index (`u32`) or [`EMPTY`].
 /// Generation is validated against `dense_entities` to reject stale handles.
+///
+/// # Pool threading status
+///
+/// The dense `BlobVec` uses the shared pool (threaded via `new()`).
+/// The remaining heap allocations are **deferred to v2**:
+///
+/// - `pages: Vec<Option<Box<[u32; PAGE_SIZE]>>>` — each page is 16 KiB
+///   (`Box::new([EMPTY; PAGE_SIZE])`). Pages are allocated lazily and
+///   infrequently (one per 4096 unique entity indices). They are cold-path
+///   metadata, not hot-path component data.
+/// - `dense_entities: Vec<Entity>` — one `Entity` (8 bytes) per stored value.
+///   Grows with the dense array but is small relative to `BlobVec` columns.
+///
+/// These account for <5% of total memory in typical workloads. The `BlobVec`
+/// columns (hot-path component data) account for >95% and already use the
+/// pool. Converting pages to pool allocation is straightforward (16 KiB fits
+/// in size class 4 = 64 KiB) but the complexity isn't justified until strict
+/// zero-system-malloc is required.
 pub(crate) struct PagedSparseSet {
     // PERF: Two pointer chases per lookup (Vec data → Box page → array slot).
     // Inherent to paged design — flat array would be 16 GiB for u32 index space.
