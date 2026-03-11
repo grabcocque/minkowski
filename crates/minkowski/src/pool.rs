@@ -136,6 +136,7 @@ impl MmapRegion {
         if matches!(hugepages, HugePages::Try | HugePages::Require) {
             let result = MmapOptions::new()
                 .len(size)
+                .populate() // MAP_POPULATE — pre-fault with hugepages
                 .huge(Some(21)) // 2 MiB hugepages (2^21)
                 .map_anon();
 
@@ -148,13 +149,52 @@ impl MmapRegion {
             }
         }
 
-        // Regular pages.
-        let mmap = MmapOptions::new()
+        // Regular pages — pre-fault via fallback chain.
+        // Pre-faulting is NOT optional: we must know at startup whether
+        // the system can back the mapping with physical RAM. Three paths,
+        // tried in order of preference:
+        //
+        // 1. MAP_POPULATE — kernel pre-faults pages at mmap time.
+        //    Fastest on native Linux, but can hang/fail on WSL2 or
+        //    older kernels.
+        //
+        // 2. mlock — forces pages into physical RAM after mmap.
+        //    Works on most systems but requires sufficient RLIMIT_MEMLOCK.
+        //
+        // 3. Manual touch sweep — write one byte per page (4 KB stride).
+        //    Always works, no privilege requirements. Slowest but guaranteed.
+        let mut mmap = MmapOptions::new()
             .len(size)
+            .populate() // Attempt 1: MAP_POPULATE
             .map_anon()
+            .or_else(|_| {
+                // populate() failed — try without it, then mlock/touch.
+                MmapOptions::new().len(size).map_anon()
+            })
             .map_err(|_| PoolExhausted { requested: layout })?;
 
+        // If MAP_POPULATE succeeded, pages are already faulted. If it
+        // didn't (we fell through to the plain mmap), we need to force
+        // pages into RAM via mlock or manual touch.
+        if mmap.lock().is_err() {
+            // mlock failed (insufficient RLIMIT_MEMLOCK or platform
+            // doesn't support it) — manual touch sweep as final fallback.
+            Self::prefault_manual(&mut mmap);
+        }
+
         Ok(Self { mmap, huge: false })
+    }
+
+    /// Write one byte per page to force the kernel to back the mapping
+    /// with physical memory. This is the last-resort pre-fault path.
+    fn prefault_manual(mmap: &mut memmap2::MmapMut) {
+        const PAGE_SIZE: usize = 4096;
+        let ptr = mmap.as_mut_ptr();
+        let len = mmap.len();
+        for offset in (0..len).step_by(PAGE_SIZE) {
+            // Safety: offset < len, and len == mmap size.
+            unsafe { ptr.add(offset).write_volatile(0) };
+        }
     }
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
