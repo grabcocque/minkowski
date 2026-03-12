@@ -35,6 +35,7 @@ cargo run -p minkowski-examples --example blob --release   # Blob offloading: Bl
 cargo run -p minkowski-examples --example retention --release   # Retention: Expiry countdown + RetentionReducer, dispatch-count TTL, progressive despawn (5 entities, 8 frames)
 cargo run -p minkowski-examples --example pool --release   # Memory pool: TigerBeetle-style WorldBuilder with 16 MB budget, try_spawn until exhaustion, pool stats (131K entities)
 cargo run -p minkowski-examples --example profile_changeset --release   # Profiling harness: QueryWriter vs QueryMut flamegraph capture (10K entities, 1K iterations)
+cargo run -p minkowski-examples --example planner --release   # Volcano query planner: cost-based plans, index selection, joins, execute/for_each/for_each_raw (1K entities, 2 archetypes)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib -- --skip par_for_each  # UB check (strict)
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo +nightly miri test -p minkowski --lib par_for_each  # rayon tests
@@ -169,7 +170,7 @@ A field can carry both `#[index(btree)]` and `#[index(hash)]` simultaneously. Fi
 
 **Cost model** (`Cost`): `rows` (estimated output cardinality) and `cpu` (dimensionless relative units). Vectorized nodes apply multipliers (0.3–0.95×) reflecting cache-line batching and SIMD.
 
-`QueryPlanResult` stores both the logical `PlanNode` and vectorized `VecExecNode`. `cost()` returns vectorized cost (default), `logical_cost()` returns pre-lowering cost. `explain()` shows vectorized plan, `explain_logical()` shows logical plan. `root()` returns `&PlanNode` for test introspection.
+`QueryPlanResult` stores both the logical `PlanNode` and vectorized `VecExecNode`. `cost()` returns vectorized cost (default), `logical_cost()` returns pre-lowering cost. `explain()` shows vectorized plan, `explain_logical()` shows logical plan. `root()` returns `&PlanNode` for test introspection. Three execution methods: `execute(&mut self, &mut World) -> &[Entity]` collects matching entities into plan-owned scratch (supports joins), `for_each(&mut self, &mut World, callback)` iterates scan-only plans with zero allocation, `for_each_raw(&mut self, &World, callback)` is the transactional read path (no tick advancement, no cache mutation, takes `&World`).
 
 `Indexed<T>` is a compile-time witness that an index exists for component `T`. Cannot be constructed directly — only via `Indexed::btree(&index)` or `Indexed::hash(&index)`. Used by `SubscriptionBuilder` to enforce that every predicate in a subscription query is backed by an index.
 

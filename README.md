@@ -118,7 +118,7 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 
 ### Query Planner
 
-`QueryPlanner` compiles queries into cost-optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection, then executes them against the live world. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization. `plan.execute(&world)` returns the matching entity set.
+`QueryPlanner` compiles queries into cost-optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection, then executes them against the live world. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization. Three execution modes: `execute(&mut World) -> &[Entity]` (collects into plan-owned scratch buffer, supports joins), `for_each(&mut World, callback)` (zero-allocation scan iteration), and `for_each_raw(&World, callback)` (transactional read-only path).
 
 ```rust
 use minkowski::{QueryPlanner, Predicate, JoinKind};
@@ -127,7 +127,7 @@ let mut planner = QueryPlanner::new(&world);
 planner.add_btree_index::<Score>(&score_index, &world);
 planner.add_hash_index::<Team>(&team_index, &world);
 
-let plan = planner
+let mut plan = planner
     .scan::<(&Pos, &Score)>()
     .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
     .build();
@@ -135,12 +135,17 @@ let plan = planner
 // Inspect the plan
 println!("{}", plan.explain());  // shows vectorized execution plan
 
-// Execute the plan against a live world
-let entities = plan.execute(&world);
-for e in &entities {
+// Execute: collect matching entities into plan-owned scratch buffer
+let entities = plan.execute(&mut world);  // returns &[Entity]
+for e in entities {
     let score = world.get::<Score>(*e).unwrap();
     // only entities with Score in [10..50) are returned
 }
+
+// Zero-alloc iteration for scan-only plans
+plan.for_each(&mut world, |entity| {
+    // process each matching entity directly — no intermediate buffer
+});
 ```
 
 `TablePlanner<T>` adds compile-time enforcement: if a table field is annotated with `#[index(btree)]` or `#[index(hash)]`, the planner requires the corresponding index at the type level. Missing indexes are type errors, not runtime warnings. See [Schema & Mutation](#schema--mutation) for the annotation syntax.
