@@ -210,7 +210,7 @@ fn main() {
     // Drop planner to release the &world borrow before execute() needs &mut world.
     drop(planner);
 
-    println!("=== 8. Plan Execution ===\n");
+    println!("=== 8. Plan Execution (execute → &[Entity]) ===\n");
 
     // Plans aren't just advisory — execute() runs them against the live world.
     // Each block builds a fresh planner because execute() takes &mut World.
@@ -286,6 +286,74 @@ fn main() {
         let entities = plan.execute(&mut world);
         println!("Even scores: {} entities (expected 500)", entities.len());
         assert_eq!(entities.len(), 500);
+    }
+
+    println!("\n=== 9. Zero-Alloc Scan (for_each) ===\n");
+
+    // for_each avoids the scratch buffer entirely — no intermediate Vec.
+    // Ideal for scan-only plans where you process entities one at a time.
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score, &Pos)>().build();
+        let mut count = 0;
+        plan.for_each(&mut world, |_entity| {
+            count += 1;
+        });
+        println!(
+            "for_each scan: {count} entities (expected {})",
+            world.entity_count()
+        );
+        assert_eq!(count, world.entity_count());
+    }
+
+    // for_each with filter: only high scores
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(900)..Score(1000)))
+            .build();
+        let mut count = 0;
+        plan.for_each(&mut world, |_entity| {
+            count += 1;
+        });
+        println!("for_each filtered [900..1000): {count} entities (expected 100)");
+        assert_eq!(count, 100);
+    }
+
+    println!("\n=== 10. Transactional Read (for_each_raw) ===\n");
+
+    // for_each_raw takes &World instead of &mut World — no tick advancement,
+    // no query cache mutation. Designed for use inside transactions where
+    // only a shared reference is available.
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score, &Pos)>().build();
+        let mut count = 0;
+        plan.for_each_raw(&world, |_entity| {
+            count += 1;
+        });
+        println!("Read-only scan found {count} entities (no &mut World needed)");
+        assert_eq!(count, world.entity_count());
+    }
+
+    // for_each_raw with filter
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+        let mut found = Vec::new();
+        plan.for_each_raw(&world, |entity| {
+            found.push(entity);
+        });
+        println!(
+            "Read-only filtered: {} entity with Score(42) (expected 1)",
+            found.len()
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(*world.get::<Score>(found[0]).unwrap(), Score(42));
     }
 
     println!("\nDone.");
