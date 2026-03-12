@@ -222,7 +222,10 @@ fn main() {
         .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
         .build();
     let entities = plan.execute(&world);
-    println!("Score in [100..200): {} entities (expected 100)", entities.len());
+    println!(
+        "Score in [100..200): {} entities (expected 100)",
+        entities.len()
+    );
     // Verify correctness
     for e in &entities {
         let s = world.get::<Score>(*e).unwrap().0;
@@ -246,10 +249,7 @@ fn main() {
         .join::<(&Team,)>(JoinKind::Inner)
         .build();
     let entities = plan.execute(&world);
-    println!(
-        "(&Score, &Pos) JOIN (&Team,): {} entities",
-        entities.len()
-    );
+    println!("(&Score, &Pos) JOIN (&Team,): {} entities", entities.len());
     // All entities have both Score+Pos and Team, so all 1000 match
     assert_eq!(entities.len(), 1000);
 
