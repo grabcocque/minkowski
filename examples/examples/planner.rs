@@ -10,7 +10,9 @@
 //! - Subscription queries with compiler-enforced indexes
 //! - Constraint-based validation
 //! - EXPLAIN output for plan inspection
-//! - Plan execution against a live World
+//! - Plan execution against a live World (execute returns &[Entity])
+//! - Zero-allocation for_each iteration for scan-only plans
+//! - Transactional for_each_raw with &World (no tick advancement)
 
 use std::sync::Arc;
 
