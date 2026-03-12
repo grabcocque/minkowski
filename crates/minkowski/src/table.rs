@@ -51,13 +51,13 @@ pub unsafe trait TableRow<'w>: Sized {
 
 /// Cache of resolved TableDescriptors, keyed by TypeId.
 pub(crate) struct TableCache {
-    descriptors: HashMap<TypeId, TableDescriptor>,
+    descriptors: HashMap<TypeId, TableDescriptor, crate::component::TypeIdBuildHasher>,
 }
 
 impl TableCache {
     pub fn new() -> Self {
         Self {
-            descriptors: HashMap::new(),
+            descriptors: HashMap::with_hasher(crate::component::TypeIdBuildHasher),
         }
     }
 
