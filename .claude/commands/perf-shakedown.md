@@ -46,6 +46,9 @@ Determine which files to analyze:
 **Entity allocation (concurrent spawner path)** — `crates/minkowski/src/`
 - `entity.rs` — `EntityAllocator::reserve` (atomic), `alloc`, `materialize_reserved`
 
+**Query planner & executor (plan execution)** — `crates/minkowski/src/`
+- `planner.rs` — `ExecNode::execute` (scan, filter, join dispatch), `scan_matching_entities` (archetype scan + entity collection), `ProbeSet::contains` (hash join probe), `lower_to_executable` (closure tree → exec tree lowering)
+
 **Transaction (commit path)** — `crates/minkowski/src/`
 - `transaction.rs` — `try_commit`, `begin`, tick validation, changeset apply
 - `lock_table.rs` — `acquire`, `release`
@@ -107,6 +110,26 @@ Agents should verify these invariants are maintained when modifying the listed f
    `DynamicCtx::write` and `DynamicResolved::lookup` must remain `#[inline]`.
    Benchmark: `reducer/dynamic_for_each_10k`.
 
+5. **Query planner ownership lowering** (`planner.rs`):
+   `lower_to_executable` must take `ClosureNode` by value (not `&ClosureNode`) to avoid
+   `Arc::clone` on every scan_fn/filter_fn/lookup_fn during the lowering pass.
+   `find_best_index` must return `&IndexDescriptor` (not `IndexDescriptor` by clone).
+   Index snapshot closures must return `Arc<[Entity]>` (not `Vec<Entity>` clone).
+   Benchmark: none yet — exercise via `cargo run -p minkowski-examples --example planner --release`.
+
+6. **Query planner `#[inline]` on accessors** (`planner.rs`):
+   `Cost::rows`, `Cost::cpu`, `Cost::total`, `PlanNode::cost`, `PlanNode::estimated_rows`,
+   `VecExecNode::cost`, `ProbeSet::contains` must remain `#[inline]`.
+
+7. **Query planner `PredicateKind` is fieldless for `Eq`/`Range`** (`planner.rs`):
+   `PredicateKind::Eq` and `PredicateKind::Range` must remain unit variants (no `String`
+   payload). The Debug impl uses `component_name` from the parent `Predicate` struct.
+   Adding payload strings back would re-introduce 2 heap allocations per predicate.
+
+8. **Query planner IndexGather sort uses pre-computed keys** (`planner.rs`):
+   The `IndexGather` execution path must pre-compute archetype IDs into a `Vec<(usize, Entity)>`
+   before sorting, giving O(N) entity_locations lookups instead of O(N log N).
+
 ### Known Bottlenecks (profiled, residual after optimization)
 
 These have been analyzed and are documented here to prevent re-discovery:
@@ -129,6 +152,12 @@ These have been analyzed and are documented here to prevent re-discovery:
 4. **`for_each` vs `for_each_chunk` 9x gap** — per-element callback prevents SIMD auto-vectorization. `for_each_chunk` yields contiguous `&[T]` slices. This is the single biggest "free win" for users switching iteration style. Not an engine optimization — it's API choice.
 
 5. **Changeset spawn ~1.5x direct** — arena allocation + mutation log overhead on top of the same archetype push work. Inherent to the data-driven mutation model.
+
+6. **Query planner FilterFn is `Arc<dyn Fn>`** — per-entity vtable call in `BatchFilter::execute` prevents SIMD vectorization of filter loops. Inherent to type-erased plan composition — monomorphic filters would require codegen per plan. Annotated with `// PERF:` at the type alias and execution site.
+
+7. **Query planner `ExecNode::execute` returns `Vec<Entity>` per node** — recursive calls create temporary Vecs at each tree level (3+ allocations for join+filter). An iterator model would avoid this but requires GATs or self-referential types. Annotated with `// PERF:`.
+
+8. **Query planner `PartitionedHashJoin` allocates HashSets per execution** — creates P `HashSet`s every `execute()` call. Caching across calls would require mutable `ExecNode`, breaking the `&self` execute signature. Annotated with `// PERF:`.
 
 ## Phase 2 — Analysis
 
@@ -226,6 +255,7 @@ After all 4 agents complete, aggregate their reports into the output format belo
    - `scheduler` — conflict detection + batch scheduling (6 systems)
    - `reducer` — all reducer handle types + structural mutations
    - `index` — B-tree + hash index lookups (200 entities)
+   - `planner` — query planner: scan, filter, join execution (1K entities)
 
 ## Output Format
 
