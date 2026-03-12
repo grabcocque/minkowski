@@ -94,8 +94,10 @@ use fixedbitset::FixedBitSet;
 use crate::component::{Component, ComponentRegistry};
 use crate::entity::Entity;
 use crate::index::{BTreeIndex, HashIndex};
-use crate::sync::Arc;
+// Use std Arc directly — the planner has no concurrent code, so it does not
+// need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
 use crate::world::World;
+use std::sync::Arc;
 
 // ── Cost model ───────────────────────────────────────────────────────
 
@@ -695,14 +697,30 @@ impl QueryPlanResult {
         scratch.clear();
 
         if let Some(join) = &mut self.join_exec {
-            // Join plan: collect left, then right, then compute join.
+            // Collect initial left-side entities.
             (join.left_collector)(&*world, scratch);
-            let left_len = scratch.len();
-            (join.right_collector)(&*world, scratch);
-            match join.join_kind {
-                JoinKind::Inner => scratch.sorted_intersection(left_len),
-                JoinKind::Left => &scratch.as_slice()[..left_len],
+
+            // Apply each join step. After each step the result becomes the
+            // left side for the next step, enabling A JOIN B JOIN C chains.
+            for step in &mut join.steps {
+                let left_len = scratch.len();
+                (step.right_collector)(&*world, scratch);
+                match step.join_kind {
+                    JoinKind::Inner => {
+                        let match_count = scratch.sorted_intersection(left_len).len();
+                        if match_count > 0 {
+                            let total = scratch.entities.len();
+                            scratch.entities.copy_within(total - match_count.., 0);
+                        }
+                        scratch.entities.truncate(match_count);
+                    }
+                    JoinKind::Left => {
+                        // Keep only left entities (discard right).
+                        scratch.entities.truncate(left_len);
+                    }
+                }
             }
+            scratch.as_slice()
         } else if let Some(compiled) = &mut self.compiled_for_each {
             // Scan-only plan: use the compiled scan closure to collect entities.
             compiled(&*world, &mut |entity: Entity| {
@@ -1108,13 +1126,20 @@ type FilterFn = Arc<dyn Fn(&World, Entity) -> bool + Send + Sync>;
 /// [`ScratchBuffer`]. Used by join plans to gather left and right entity sets.
 type EntityCollector = Box<dyn FnMut(&World, &mut ScratchBuffer)>;
 
-/// Execution state for join plans. Captures left and right entity-collecting
-/// closures at `build()` time. [`QueryPlanResult::execute`] uses these to
-/// populate the scratch buffer, then computes the join via sorted intersection.
-struct JoinExec {
-    left_collector: EntityCollector,
+/// A single join step: collect right-side entities and intersect with the
+/// accumulated left result.
+struct JoinStep {
     right_collector: EntityCollector,
     join_kind: JoinKind,
+}
+
+/// Execution state for join plans. The left collector populates the initial
+/// entity set, then each `JoinStep` iteratively applies one join. Supports
+/// arbitrary join chains: `A JOIN B JOIN C` becomes
+/// `left_collector(A) → step[0](B) → step[1](C)`.
+struct JoinExec {
+    left_collector: EntityCollector,
+    steps: Vec<JoinStep>,
 }
 
 /// Collect all entities from archetypes matching a component bitset
@@ -1344,9 +1369,9 @@ impl ScanBuilder<'_> {
         let vec_root = lower_to_vectorized(&node, &opts);
 
         // Phase 7: Build join execution state if joins are present.
-        // For join plans, capture left and right entity-collecting closures
-        // that write directly to the scratch buffer.
-        let join_exec = if let Some(join) = self.joins.first() {
+        // Captures a left collector + one JoinStep per join, supporting
+        // multi-join chains (A JOIN B JOIN C).
+        let join_exec = if !self.joins.is_empty() {
             let left_required = self
                 .left_required
                 .clone()
@@ -1369,16 +1394,25 @@ impl ScanBuilder<'_> {
                     }
                 });
 
-            let right_required = join.right_required.clone();
-            let right_collector: EntityCollector =
-                Box::new(move |world: &World, scratch: &mut ScratchBuffer| {
-                    collect_matching_entities(world, &right_required, scratch);
-                });
+            let steps: Vec<JoinStep> = self
+                .joins
+                .iter()
+                .map(|join| {
+                    let right_required = join.right_required.clone();
+                    JoinStep {
+                        right_collector: Box::new(
+                            move |world: &World, scratch: &mut ScratchBuffer| {
+                                collect_matching_entities(world, &right_required, scratch);
+                            },
+                        ),
+                        join_kind: join.join_kind,
+                    }
+                })
+                .collect();
 
             Some(JoinExec {
                 left_collector,
-                right_collector,
-                join_kind: join.join_kind,
+                steps,
             })
         } else {
             None
@@ -4191,6 +4225,37 @@ mod tests {
         let result = plan.execute(&mut world);
         // Left join: all 8 Score entities preserved.
         assert_eq!(result.len(), 8);
+    }
+
+    #[test]
+    fn execute_multi_join_intersects_all() {
+        let mut world = World::new();
+        let mut all_three = Vec::new();
+        for i in 0..10u32 {
+            all_three.push(world.spawn((Score(i), Team(i % 3), Health(100))));
+        }
+        // 5 entities with only Score + Team (no Health)
+        for i in 10..15u32 {
+            world.spawn((Score(i), Team(i % 3)));
+        }
+        // 5 entities with only Score + Health (no Team)
+        for i in 15..20u32 {
+            world.spawn((Score(i), Health(50)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Health,)>(JoinKind::Inner)
+            .build();
+
+        let result = plan.execute(&mut world);
+        // Score ∩ Team ∩ Health = the 10 entities with all three
+        let mut found: Vec<Entity> = result.to_vec();
+        found.sort_by_key(|e| e.to_bits());
+        all_three.sort_by_key(|e| e.to_bits());
+        assert_eq!(found, all_three);
     }
 
     // ── ScratchBuffer tests ──────────────────────────────────────────
