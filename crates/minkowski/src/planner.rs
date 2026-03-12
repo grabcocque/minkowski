@@ -2478,7 +2478,7 @@ fn lower_to_vectorized(node: &PlanNode, opts: &VectorizeOpts) -> VecExecNode {
             // partitions = ceil(build_rows * avg_component_bytes / l2_cache_bytes)
             let build_bytes = left.cost().rows as usize * opts.avg_component_bytes;
             let l2 = opts.l2_cache_bytes.max(1); // guard against zero
-            let partitions = (build_bytes / l2).max(1);
+            let partitions = build_bytes.div_ceil(l2).max(1);
 
             // Partitioned join reduces cache misses. Model as ~0.7x of naive hash join.
             let partition_factor = if partitions > 1 { 0.7 } else { 0.9 };
