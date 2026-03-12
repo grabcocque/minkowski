@@ -256,7 +256,7 @@ fn main() {
     // Custom filter: even scores only
     let plan = planner
         .scan::<(&Score,)>()
-        .filter(Predicate::custom_fn::<Score>("even", 0.5, |w, e| {
+        .filter(Predicate::custom::<Score>("even", 0.5, |w, e| {
             w.get::<Score>(e).is_some_and(|s| s.0 % 2 == 0)
         }))
         .build();

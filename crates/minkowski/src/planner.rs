@@ -296,28 +296,15 @@ impl Predicate {
         }
     }
 
-    /// Custom predicate with a user-provided description.
-    /// Always applied as a post-fetch filter (cannot be pushed into an index).
-    ///
-    /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
-    pub fn custom<T: Component>(description: &str, selectivity: f64) -> Self {
-        Predicate {
-            component_type: TypeId::of::<T>(),
-            component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Custom(description.into()),
-            selectivity: sanitize_selectivity(selectivity),
-            filter_fn: None,
-        }
-    }
-
     /// Custom predicate with a user-provided filter closure.
     ///
+    /// Always applied as a post-fetch filter (cannot be pushed into an index).
     /// The closure receives `(&World, Entity)` and returns `true` if the entity
     /// passes the predicate. This enables arbitrary filtering logic while still
     /// participating in the planner's cost model.
     ///
     /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
-    pub fn custom_fn<T: Component>(
+    pub fn custom<T: Component>(
         description: &str,
         selectivity: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
@@ -329,6 +316,16 @@ impl Predicate {
             selectivity: sanitize_selectivity(selectivity),
             filter_fn: Some(Arc::new(filter)),
         }
+    }
+
+    /// Deprecated: use [`Predicate::custom`] instead (identical signature).
+    #[deprecated(since = "0.1.0", note = "renamed to `custom`")]
+    pub fn custom_fn<T: Component>(
+        description: &str,
+        selectivity: f64,
+        filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self::custom::<T>(description, selectivity, filter)
     }
 
     /// Override the default selectivity estimate.
@@ -2825,7 +2822,11 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom::<Score>("score > threshold", 0.5))
+            .filter(Predicate::custom::<Score>(
+                "score > threshold",
+                0.5,
+                |w, e| w.get::<Score>(e).is_some_and(|s| s.0 > 50),
+            ))
             .build();
 
         // Custom predicates can never use indexes — no warning expected
@@ -3321,7 +3322,7 @@ mod tests {
         assert!((pred.selectivity - 1.0).abs() < f64::EPSILON);
 
         // custom constructor
-        let pred = Predicate::custom::<Score>("test", f64::NAN);
+        let pred = Predicate::custom::<Score>("test", f64::NAN, |_, _| true);
         assert!((pred.selectivity - 1.0).abs() < f64::EPSILON);
     }
 
@@ -3342,7 +3343,9 @@ mod tests {
         let plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
-            .filter(Predicate::custom::<Team>("team != 0", 0.8))
+            .filter(Predicate::custom::<Team>("team != 0", 0.8, |w, e| {
+                w.get::<Team>(e).is_some_and(|t| t.0 != 0)
+            }))
             .join::<(&Pos,)>(JoinKind::Inner)
             .build();
 
@@ -3493,7 +3496,9 @@ mod tests {
         // Custom predicate → branched
         let plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom::<Score>("complex check", 0.5))
+            .filter(Predicate::custom::<Score>("complex check", 0.5, |_, _| {
+                true
+            }))
             .build();
         let vec_plan = plan.vectorize(VectorizeOpts::default());
 
@@ -3573,7 +3578,9 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom::<Score>("x > 0", 0.5))
+            .filter(Predicate::custom::<Score>("x > 0", 0.5, |w, e| {
+                w.get::<Score>(e).is_some_and(|s| s.0 > 0)
+            }))
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
         let vec_plan = plan.vectorize(VectorizeOpts::default());
@@ -3926,7 +3933,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_custom_fn_filter() {
+    fn execute_custom_filter() {
         let mut world = World::new();
         for i in 0..50 {
             world.spawn((Score(i),));
@@ -3935,7 +3942,7 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_fn::<Score>(
+            .filter(Predicate::custom::<Score>(
                 "even scores",
                 0.5,
                 |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 % 2 == 0),
