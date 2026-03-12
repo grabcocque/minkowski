@@ -209,6 +209,8 @@ for w in plan.warnings() { ... }
 | `execute` | `&self, &World` → `Vec<Entity>` | `&mut self, &mut World` → `&[Entity]` |
 | `for_each` | — (new) | `&mut self, &mut World, callback` |
 | `for_each_chunk` | — (new) | `&mut self, &mut World, callback` |
+| `for_each_raw` | — (new) | `&mut self, &World, callback` (transactional) |
+| `execute_raw` | — (new) | `&mut self, &World` → `&[Entity]` (transactional) |
 
 ## What Changes vs What Stays
 
@@ -240,6 +242,67 @@ for w in plan.warnings() { ... }
 - EXPLAIN output format
 - All planning tests (index selection, join ordering, warnings, cost)
 
+## Transactional Integration
+
+Compiled plans compose with the existing `Transact` and `Durable` layers.
+The plan is a **read-only query strategy** — it reads entities matching the
+plan, and the reducer logic decides what to write.
+
+### Execution Modes
+
+The scan closure needs two compilation variants, both captured at `build()`
+time while `Q` is in scope:
+
+| Context | World access | Query path | Cache/ticks |
+|---------|-------------|------------|-------------|
+| Direct | `&mut World` | `world.query::<Q>()` | Yes |
+| Transactional | `&World` | `world.query_raw::<Q>()` | No (skips) |
+
+The direct path uses `for_each(&mut self, &mut World, callback)` — the
+normal hot-path method. The transactional path uses
+`for_each_raw(&mut self, &World, callback)` — read-only, no tick advancement,
+requires `Q: ReadOnlyWorldQuery`. This mirrors how `QueryRef` uses
+`world.query()` (direct, `&mut World`) while `Tx::query()` uses
+`world.query_raw()` (shared, `&World`).
+
+### Reducer Composition
+
+A compiled plan inside a reducer reads via the plan, writes via reducer
+handles:
+
+```rust
+// QueryWriter-style: plan reads, changeset writes
+registry.register("update_scores", &mut world, |tx, world, args| {
+    let mut plan = planner.scan::<(&Score, &Pos)>()
+        .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
+        .build();
+
+    plan.for_each_raw(world, |entity, score, pos| {
+        tx.write(entity, Score(score.0 + 1));
+    });
+});
+```
+
+The plan replaces the manual archetype scanning that `QueryWriter::for_each`
+does internally. The transaction layer handles conflict detection and commit
+as usual.
+
+### Durable Layer
+
+No special integration needed. `Durable<S>` wraps any `Transact` strategy —
+the plan's reads go through the same `&World` path. Writes through `tx.write()`
+are logged to the WAL on commit, same as any other reducer.
+
+### What's NOT Supported
+
+- Plans cannot write directly. No `for_each_mut` that yields `&mut T`. Writes
+  go through `tx.write()`, `EntityMut`, or other reducer handles.
+- Plans do not participate in `Access` conflict detection. The reducer that
+  contains the plan declares its access — the plan is an implementation detail
+  of the read side.
+- `Changed<T>` filtering is not supported in this version. The transactional
+  path (`query_raw`) skips ticks by design.
+
 ## Testing Strategy
 
 - Existing 54 planning tests stay — they test PlanNode/VecExecNode/cost, not execution.
@@ -254,3 +317,7 @@ for w in plan.warnings() { ... }
   - Custom predicate fallback still works
   - Empty world / empty results
   - Despawned entity filtering
+  - `for_each_raw` with `&World` (transactional read path)
+  - Composed with `Optimistic`/`Pessimistic` transaction strategies
+  - Composed with `Durable` WAL wrapper
+- New example: planned query inside a reducer with Transact+Durable writes
