@@ -302,6 +302,7 @@ pub enum JoinKind {
 
 /// A node in the query execution plan tree.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PlanNode {
     /// Full archetype scan via `world.query()`.
     Scan {
@@ -685,6 +686,9 @@ pub enum SubscriptionError {
     /// A selectivity value was NaN. Selectivity must be a finite number in
     /// `[0.0, 1.0]`.
     NanSelectivity { component_name: &'static str },
+    /// No predicates were added. A subscription with zero predicates is a
+    /// full scan, which defeats the "all predicates indexed" guarantee.
+    NoPredicates,
 }
 
 impl fmt::Display for SubscriptionError {
@@ -701,6 +705,12 @@ impl fmt::Display for SubscriptionError {
                 write!(
                     f,
                     "selectivity for `{component_name}` is NaN — must be a finite number in [0.0, 1.0]"
+                )
+            }
+            SubscriptionError::NoPredicates => {
+                write!(
+                    f,
+                    "subscription has no predicates — add at least one where_eq or where_range"
                 )
             }
         }
@@ -782,8 +792,12 @@ impl SubscriptionBuilder<'_> {
     /// Returns all [`SubscriptionError`]s if any predicates were invalid
     /// (e.g. a Hash index used with `where_range`, or a NaN selectivity).
     pub fn build(self) -> Result<SubscriptionPlan, Vec<SubscriptionError>> {
-        if !self.errors.is_empty() {
-            return Err(self.errors);
+        let mut errors = self.errors;
+        if self.indexed_predicates.is_empty() {
+            errors.push(SubscriptionError::NoPredicates);
+        }
+        if !errors.is_empty() {
+            return Err(errors);
         }
 
         let mut node: PlanNode = PlanNode::Scan {
@@ -1330,6 +1344,7 @@ impl CardinalityConstraint {
 /// vectorized form. Users inspect it via `explain()` and can access
 /// the logical plan via `root()` or `explain_logical()`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum VecExecNode {
     /// Chunked scan: yields one batch per archetype.
     /// Each batch is a contiguous column slice (64-byte aligned).
