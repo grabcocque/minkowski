@@ -625,6 +625,7 @@ pub struct QueryPlanResult {
     vec_root: VecExecNode,
     exec_root: Option<ExecNode>,
     compiled_for_each: Option<CompiledForEach>,
+    compiled_for_each_raw: Option<CompiledForEachRaw>,
     scratch: Option<ScratchBuffer>,
     opts: VectorizeOpts,
     warnings: Vec<PlanWarning>,
@@ -736,6 +737,22 @@ impl QueryPlanResult {
         compiled(&*world, &mut callback);
     }
 
+    /// Execute the compiled scan with read-only world access.
+    ///
+    /// For use inside transactions where only `&World` is available.
+    /// No query cache mutation, no tick advancement. Requires the plan's
+    /// query to be `ReadOnlyWorldQuery`.
+    ///
+    /// # Panics
+    /// Panics if the plan was not compiled with scan support.
+    pub fn for_each_raw(&mut self, world: &World, mut callback: impl FnMut(Entity)) {
+        let compiled = self
+            .compiled_for_each_raw
+            .as_mut()
+            .expect("for_each_raw requires a scan-compiled plan");
+        compiled(world, &mut callback);
+    }
+
     /// Human-readable logical plan (before vectorized lowering).
     pub fn explain_logical(&self) -> String {
         let mut out = String::new();
@@ -770,6 +787,10 @@ impl fmt::Debug for QueryPlanResult {
             .field("vec_root", &self.vec_root)
             .field("has_exec", &self.exec_root.is_some())
             .field("has_compiled_for_each", &self.compiled_for_each.is_some())
+            .field(
+                "has_compiled_for_each_raw",
+                &self.compiled_for_each_raw.is_some(),
+            )
             .field("has_scratch", &self.scratch.is_some())
             .field("opts", &self.opts)
             .field("warnings", &self.warnings)
@@ -1071,6 +1092,10 @@ type ScanFn = Arc<dyn Fn(&World) -> Vec<Entity> + Send + Sync>;
 /// data. The outer `for_each` method takes `&mut World` for query cache
 /// management, then reborrows as `&World` for the closure.
 type CompiledForEach = Box<dyn FnMut(&World, &mut dyn FnMut(Entity))>;
+
+/// Read-only variant for transactional reads via `query_raw`.
+/// Takes `&World` (shared ref) — no cache mutation, no tick advancement.
+type CompiledForEachRaw = Box<dyn FnMut(&World, &mut dyn FnMut(Entity))>;
 
 /// Type-erased index lookup function: return matching entities from the index.
 /// Returns `Arc<[Entity]>` to avoid cloning the entity list on every call —
@@ -1560,6 +1585,9 @@ pub struct ScanBuilder<'w> {
     /// Factory that produces a [`CompiledForEach`] closure. Captured from
     /// `scan::<Q>()` while Q is still in scope.
     compile_for_each: Option<Box<dyn FnOnce() -> CompiledForEach>>,
+    /// Factory that produces a [`CompiledForEachRaw`] closure for read-only
+    /// transactional access via `&World`.
+    compile_for_each_raw: Option<Box<dyn FnOnce() -> CompiledForEachRaw>>,
 }
 
 struct JoinSpec {
@@ -1824,9 +1852,12 @@ impl ScanBuilder<'_> {
         // partition counts, sort-by-archetype, batch sizes).
         let exec_root = closures.map(|cn| lower_to_executable(cn, &vec_root));
 
-        // Phase 8: Compile zero-alloc for_each for scan-only plans.
+        // Phase 8: Compile zero-alloc for_each / for_each_raw for scan-only plans.
         // Enabled when there are no joins — predicates are fused as
         // per-entity filters into the scan closure.
+        // Clone filter fns for the raw variant (Arc clone is a ref-count bump).
+        let all_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
+
         let compiled_for_each = if self.joins.is_empty() {
             self.compile_for_each.map(|factory| {
                 let mut scan_fn = factory();
@@ -1837,6 +1868,26 @@ impl ScanBuilder<'_> {
                     Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
                         scan_fn(world, &mut |entity: Entity| {
                             if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        });
+                    })
+                }
+            })
+        } else {
+            None
+        };
+
+        let compiled_for_each_raw = if self.joins.is_empty() {
+            self.compile_for_each_raw.map(|factory| {
+                let mut scan_fn = factory();
+
+                if all_filter_fns_raw.is_empty() {
+                    scan_fn
+                } else {
+                    Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
+                        scan_fn(world, &mut |entity: Entity| {
+                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
                                 callback(entity);
                             }
                         });
@@ -1861,6 +1912,7 @@ impl ScanBuilder<'_> {
             vec_root,
             exec_root,
             compiled_for_each,
+            compiled_for_each_raw,
             scratch,
             opts,
             warnings,
@@ -2026,6 +2078,7 @@ impl<'w> QueryPlanner<'w> {
     pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let required_for_each = required.clone();
+        let required_for_each_raw = required.clone();
         ScanBuilder {
             planner: self,
             query_name: std::any::type_name::<Q>(),
@@ -2037,6 +2090,18 @@ impl<'w> QueryPlanner<'w> {
             })),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
+                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
+                    for arch in &world.archetypes.archetypes {
+                        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+                            for &entity in &arch.entities {
+                                callback(entity);
+                            }
+                        }
+                    }
+                })
+            })),
+            compile_for_each_raw: Some(Box::new(move || {
+                let required = required_for_each_raw;
                 Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
                     for arch in &world.archetypes.archetypes {
                         if !arch.is_empty() && required.is_subset(&arch.component_ids) {
@@ -2060,6 +2125,7 @@ impl<'w> QueryPlanner<'w> {
     ) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let required_for_each = required.clone();
+        let required_for_each_raw = required.clone();
         ScanBuilder {
             planner: self,
             query_name: std::any::type_name::<Q>(),
@@ -2071,6 +2137,18 @@ impl<'w> QueryPlanner<'w> {
             })),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
+                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
+                    for arch in &world.archetypes.archetypes {
+                        if !arch.is_empty() && required.is_subset(&arch.component_ids) {
+                            for &entity in &arch.entities {
+                                callback(entity);
+                            }
+                        }
+                    }
+                })
+            })),
+            compile_for_each_raw: Some(Box::new(move || {
+                let required = required_for_each_raw;
                 Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
                     for arch in &world.archetypes.archetypes {
                         if !arch.is_empty() && required.is_subset(&arch.component_ids) {
@@ -4939,5 +5017,42 @@ mod tests {
             found.push(entity);
         });
         assert_eq!(found.len(), 50);
+    }
+
+    // ── CompiledScan for_each_raw ────────────────────────────────────
+
+    #[test]
+    fn for_each_raw_yields_entities_without_mut_world() {
+        let mut world = World::new();
+        for i in 0..10u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut found = Vec::new();
+        plan.for_each_raw(&world, |entity: Entity| {
+            found.push(entity);
+        });
+        assert_eq!(found.len(), 10);
+    }
+
+    #[test]
+    fn for_each_raw_with_filter() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+
+        let mut found = Vec::new();
+        plan.for_each_raw(&world, |entity: Entity| {
+            found.push(entity);
+        });
+        assert_eq!(found.len(), 1);
     }
 }
