@@ -961,12 +961,16 @@ impl ScanBuilder<'_> {
             let use_hash = left_cost.rows >= 64.0 || right_cost.rows >= 64.0;
 
             if use_hash {
-                // Put smaller side on left (build side).
-                let (build, probe) = if left_cost.rows <= right_cost.rows {
-                    (node, right_node)
-                } else {
-                    (right_node, node)
-                };
+                // For inner joins, put smaller side on left (build side)
+                // for cache locality. Left joins are not commutative — the
+                // semantic left side must stay on the left to preserve all
+                // its rows, so we only reorder for Inner.
+                let (build, probe) =
+                    if join.join_kind == JoinKind::Inner && left_cost.rows > right_cost.rows {
+                        (right_node, node)
+                    } else {
+                        (node, right_node)
+                    };
                 let cost = Cost::hash_join(build.cost(), probe.cost());
                 node = PlanNode::HashJoin {
                     left: Box::new(build),
@@ -1025,8 +1029,9 @@ impl ScanBuilder<'_> {
 ///
 /// The planner selects between hash join and nested-loop join based on
 /// estimated cardinalities:
-/// - **Hash join** when either side has ≥ 64 rows (smaller side becomes the
-///   build table for cache locality)
+/// - **Hash join** when either side has ≥ 64 rows (for inner joins, the
+///   smaller side becomes the build table for cache locality; for left
+///   joins, the semantic left side is always preserved as the build side)
 /// - **Nested-loop join** for very small cardinalities
 ///
 /// Join order is determined by intermediate result size — the smallest
@@ -2133,6 +2138,78 @@ mod tests {
                 assert!(
                     left.estimated_rows() <= right.estimated_rows(),
                     "build side should be smaller: left={:.0} right={:.0}",
+                    left.estimated_rows(),
+                    right.estimated_rows()
+                );
+            }
+            other => panic!("expected HashJoin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn left_join_preserves_left_side_when_right_is_smaller() {
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+
+        // Left side is larger (500) than right side (100).
+        // For an Inner join, the planner would swap them to put the smaller
+        // side on the build (left) side. But Left join must preserve the
+        // semantic left side — all its rows must appear in the output.
+        let plan = planner
+            .scan_with_estimate::<(&Score,)>(500)
+            .join::<(&Team,)>(JoinKind::Left)
+            .with_right_estimate(100)
+            .build();
+
+        match plan.root() {
+            PlanNode::HashJoin {
+                left,
+                right,
+                join_kind,
+                ..
+            } => {
+                assert_eq!(*join_kind, JoinKind::Left);
+                // Left side must be the original scan (500 rows), not swapped.
+                assert_eq!(
+                    left.estimated_rows(),
+                    500.0,
+                    "left join must keep original left side (500 rows), got {}",
+                    left.estimated_rows()
+                );
+                assert_eq!(
+                    right.estimated_rows(),
+                    100.0,
+                    "right side should be 100 rows, got {}",
+                    right.estimated_rows()
+                );
+            }
+            other => panic!("expected HashJoin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inner_join_still_reorders_smaller_to_build_side() {
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+
+        // Inner join: left (500) > right (100), should swap.
+        let plan = planner
+            .scan_with_estimate::<(&Score,)>(500)
+            .join::<(&Team,)>(JoinKind::Inner)
+            .with_right_estimate(100)
+            .build();
+
+        match plan.root() {
+            PlanNode::HashJoin { left, right, .. } => {
+                assert!(
+                    left.estimated_rows() <= right.estimated_rows(),
+                    "inner join build side should be smaller: left={} right={}",
                     left.estimated_rows(),
                     right.estimated_rows()
                 );
