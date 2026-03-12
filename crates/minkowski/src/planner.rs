@@ -718,7 +718,9 @@ impl QueryPlanResult {
             .compiled_for_each
             .as_mut()
             .expect("for_each requires a scan-compiled plan");
-        compiled(world, &mut callback);
+        // Reborrow as &World — the compiled closure only reads archetype data.
+        // &mut World is taken for query cache management (future use).
+        compiled(&*world, &mut callback);
     }
 
     /// Human-readable logical plan (before vectorized lowering).
@@ -1051,7 +1053,10 @@ type ScanFn = Arc<dyn Fn(&World) -> Vec<Entity> + Send + Sync>;
 
 /// Type-erased scan execution captured at `build()` time.
 /// The monomorphic `Q` iteration code is baked in at compile time.
-type CompiledForEach = Box<dyn FnMut(&mut World, &mut dyn FnMut(Entity))>;
+/// Takes `&World` (shared ref) because the compiled scan only reads archetype
+/// data. The outer `for_each` method takes `&mut World` for query cache
+/// management, then reborrows as `&World` for the closure.
+type CompiledForEach = Box<dyn FnMut(&World, &mut dyn FnMut(Entity))>;
 
 /// Type-erased index lookup function: return matching entities from the index.
 /// Returns `Arc<[Entity]>` to avoid cloning the entity list on every call —
@@ -1815,23 +1820,9 @@ impl ScanBuilder<'_> {
                 if all_filter_fns.is_empty() {
                     scan_fn
                 } else {
-                    Box::new(move |world: &mut World, callback: &mut dyn FnMut(Entity)| {
-                        // SAFETY: The scan closure only reads
-                        // `world.archetypes` (immutable iteration over
-                        // archetype entity lists). The filter closures
-                        // only call `world.get::<T>(entity)` which is a
-                        // read-only accessor into the same archetype
-                        // storage. Neither path performs mutation. The
-                        // `&mut World` in the signature exists for query
-                        // cache mutation in the general case, but the
-                        // compiled scan bypasses the cache entirely.
-                        // Creating a shared `&World` from the mutable
-                        // reference is sound because no mutation occurs
-                        // through either borrow during this call.
-                        let world_ptr: *const World = &*world;
+                    Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
                         scan_fn(world, &mut |entity: Entity| {
-                            let world_ref = unsafe { &*world_ptr };
-                            if all_filter_fns.iter().all(|f| f(world_ref, entity)) {
+                            if all_filter_fns.iter().all(|f| f(world, entity)) {
                                 callback(entity);
                             }
                         });
@@ -2022,7 +2013,7 @@ impl<'w> QueryPlanner<'w> {
             })),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
-                Box::new(move |world: &mut World, callback: &mut dyn FnMut(Entity)| {
+                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
                     for arch in &world.archetypes.archetypes {
                         if !arch.is_empty() && required.is_subset(&arch.component_ids) {
                             for &entity in &arch.entities {
@@ -2056,7 +2047,7 @@ impl<'w> QueryPlanner<'w> {
             })),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
-                Box::new(move |world: &mut World, callback: &mut dyn FnMut(Entity)| {
+                Box::new(move |world: &World, callback: &mut dyn FnMut(Entity)| {
                     for arch in &world.archetypes.archetypes {
                         if !arch.is_empty() && required.is_subset(&arch.component_ids) {
                             for &entity in &arch.entities {
