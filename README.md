@@ -116,6 +116,35 @@ world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
 });
 ```
 
+### Query Planner
+
+`QueryPlanner` compiles queries into cost-optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection, then executes them against the live world. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization. `plan.execute(&world)` returns the matching entity set.
+
+```rust
+use minkowski::{QueryPlanner, Predicate, JoinKind};
+
+let mut planner = QueryPlanner::new(&world);
+planner.add_btree_index::<Score>(&score_index, &world);
+planner.add_hash_index::<Team>(&team_index, &world);
+
+let plan = planner
+    .scan::<(&Pos, &Score)>()
+    .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
+    .build();
+
+// Inspect the plan
+println!("{}", plan.explain());  // shows vectorized execution plan
+
+// Execute the plan against a live world
+let entities = plan.execute(&world);
+for e in &entities {
+    let score = world.get::<Score>(*e).unwrap();
+    // only entities with Score in [10..50) are returned
+}
+```
+
+`TablePlanner<T>` adds compile-time enforcement: if a table field is annotated with `#[index(btree)]` or `#[index(hash)]`, the planner requires the corresponding index at the type level. Missing indexes are type errors, not runtime warnings. See [Schema & Mutation](#schema--mutation) for the annotation syntax.
+
 ## Typed Reducers
 
 Reducers are closures registered with the `ReducerRegistry`. The type signature declares exactly what the closure can access, and the registry extracts `Access` metadata at registration time for conflict detection.
@@ -159,18 +188,28 @@ durable.transact(&mut world, access, |tx, world| { /* ... */ });
 
 ## Schema & Mutation
 
-`#[derive(Table)]` declares a named schema with typed row accessors — queries against a table skip archetype matching entirely:
+`#[derive(Table)]` declares a named schema with typed row accessors — queries against a table skip archetype matching entirely. Fields can be annotated with `#[index(btree)]` or `#[index(hash)]` to declare compile-time index requirements:
 
 ```rust
 #[derive(Table)]
-struct Transform {
-    pos: Pos,
-    vel: Vel,
+struct Scores {
+    #[index(btree)]
+    score: Score,       // generates HasBTreeIndex<Score> for Scores
+    #[index(hash)]
+    team: Team,         // generates HasHashIndex<Team> for Scores
+    name: Name,         // no index — querying by name is a type error in TablePlanner
 }
 
-for row in world.query_table::<Transform>() {
-    println!("{}, {}", row.pos.x, row.vel.dx);
+// Table query — skips archetype matching
+for row in world.query_table::<Scores>() {
+    println!("{:?}, {:?}", row.score, row.team);
 }
+
+// Compile-time index enforcement via TablePlanner
+let idx = Scores::create_btree_index(&mut world);
+let mut planner = TablePlanner::<Scores>::new(&world);
+planner.add_btree_index::<Score>(&idx);  // compiles: Score has #[index(btree)]
+// planner.add_btree_index::<Name>(&idx); // type error: Name has no #[index(btree)]
 ```
 
 `EnumChangeSet` records mutations as data. `apply()` returns a reverse changeset — applying the reverse undoes the original changes, giving you automatic undo/redo. `CommandBuffer` provides deferred structural changes (spawn/despawn/insert/remove) during query iteration.
@@ -203,6 +242,8 @@ Entity churn tracking is exact — every spawn and despawn is counted. Per-arche
 Indexes are user-owned data structures that compose with the query system — World has no awareness of them. The `SpatialIndex` trait has two methods: `rebuild` (full reconstruction) and `update` (incremental via `Changed<T>`). Stale entity references are caught automatically by generational ID validation.
 
 For column-value lookups, `BTreeIndex<T>` provides O(log n) range queries and `HashIndex<T>` provides O(1) exact match. Both support validated queries (`get_valid`, `range_valid`) that filter despawned entities and removed components at query time.
+
+When using `#[derive(Table)]`, field-level `#[index(btree)]` / `#[index(hash)]` attributes generate marker traits (`HasBTreeIndex<T>`, `HasHashIndex<T>`) that let `TablePlanner` enforce index presence at compile time. See [Schema & Mutation](#schema--mutation) for usage.
 
 Indexes whose key types support [rkyv][rkyv] can be persisted to disk via `PersistentIndex`. On crash recovery, `load` + `update()` catches up from the saved tick — recovery time is proportional to the WAL tail, not world size. `AutoCheckpoint` can save registered indexes alongside snapshots automatically.
 
@@ -350,6 +391,7 @@ The commands teach the paradigm, not just the API — they encode the design pri
 | [Miri][miri] | An interpreter for Rust's Mid-level IR that detects undefined behavior (aliasing violations, use-after-free, data races) at runtime. |
 | [OCC][occ] | Optimistic concurrency control — transactions execute without locks, then validate at commit that no conflicting writes occurred. |
 | [PCC][pcc] | Pessimistic concurrency control — transactions acquire locks before accessing data, preventing conflicts at the cost of potential contention. |
+| [Query planner](#query-planner) | A Volcano-model optimizer that compiles queries into vectorized execution plans with automatic index selection. |
 | [Rayon][rayon] | A Rust library for data parallelism. Used here for `par_for_each` parallel query iteration. |
 | [Reducer](#typed-reducers) | A registered closure whose type signature declares its data access. The registry extracts conflict metadata at registration time. |
 | [SIMD][simd] | Single Instruction, Multiple Data — CPU instructions that process multiple values in parallel. Minkowski's 64-byte column alignment enables auto-vectorization. |
@@ -384,4 +426,5 @@ This project is licensed under the [Mozilla Public License 2.0](https://www.mozi
 [loom]: https://github.com/tokio-rs/loom
 [mmap]: https://en.wikipedia.org/wiki/Mmap
 [tigerbeetle]: https://tigerbeetle.com/
+[volcano]: https://en.wikipedia.org/wiki/Volcano_(query_processing)
 [wal]: https://en.wikipedia.org/wiki/Write-ahead_logging
