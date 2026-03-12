@@ -78,6 +78,7 @@ pub mod component;
 pub mod entity;
 pub mod index;
 pub(crate) mod lock_table;
+pub mod planner;
 pub(crate) mod pool;
 pub mod query;
 pub mod reducer;
@@ -96,6 +97,11 @@ pub use component::ComponentId;
 pub use entity::Entity;
 pub use index::{BTreeIndex, HashIndex, SpatialIndex};
 pub use minkowski_derive::Table;
+pub use planner::{
+    CardinalityConstraint, Cost, IndexKind, Indexed, JoinKind, PlanNode, PlanWarning, Predicate,
+    QueryPlanResult, QueryPlanner, SubscriptionBuilder, SubscriptionPlan, VecExecNode,
+    VectorizeOpts, VectorizedPlan,
+};
 pub use pool::{HugePages, PoolExhausted};
 pub use query::fetch::{Changed, ReadOnlyWorldQuery};
 pub use reducer::{
