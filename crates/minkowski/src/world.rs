@@ -78,12 +78,21 @@ pub(crate) struct QueryCacheEntry {
 
 /// Shared queue for entity IDs orphaned by aborted transactions.
 /// World owns the canonical instance; strategies clone the Arc handle.
+///
+/// Uses an `AtomicBool` flag to skip the mutex lock when the queue is empty,
+/// which is the common case during spawn-heavy workloads.
 #[derive(Clone)]
-pub(crate) struct OrphanQueue(pub(crate) Arc<Mutex<Vec<Entity>>>);
+pub(crate) struct OrphanQueue {
+    pub(crate) queue: Arc<Mutex<Vec<Entity>>>,
+    pub(crate) has_items: Arc<crate::sync::AtomicBool>,
+}
 
 impl OrphanQueue {
     fn new() -> Self {
-        Self(Arc::new(Mutex::new(Vec::new())))
+        Self {
+            queue: Arc::new(Mutex::new(Vec::new())),
+            has_items: Arc::new(crate::sync::AtomicBool::new(false)),
+        }
     }
 }
 
@@ -146,7 +155,7 @@ pub struct World {
     pub(crate) sparse: SparseStorage,
     pub(crate) entity_locations: Vec<Option<EntityLocation>>,
     pub(crate) table_cache: TableCache,
-    pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry>,
+    pub(crate) query_cache: HashMap<TypeId, QueryCacheEntry, crate::component::TypeIdBuildHasher>,
     pub(crate) current_tick: Tick,
     pub(crate) orphan_queue: OrphanQueue,
     pub(crate) pool: SharedPool,
@@ -166,7 +175,7 @@ impl World {
             sparse: SparseStorage::new(pool.clone()),
             entity_locations: Vec::new(),
             table_cache: TableCache::new(),
-            query_cache: HashMap::new(),
+            query_cache: HashMap::with_hasher(crate::component::TypeIdBuildHasher),
             current_tick: Tick::default(),
             orphan_queue: OrphanQueue::new(),
             pool,
@@ -188,9 +197,23 @@ impl World {
     /// Called automatically at the top of every &mut self entry point.
     fn drain_orphans(&mut self) {
         self.entities.materialize_reserved();
-        let mut queue = self.orphan_queue.0.lock();
+        if !self
+            .orphan_queue
+            .has_items
+            .load(crate::sync::Ordering::Acquire)
+        {
+            return;
+        }
+        let mut queue = self.orphan_queue.queue.lock();
         for entity in queue.drain(..) {
             self.entities.dealloc(entity);
+        }
+        // Clear flag while holding the lock so a concurrent Tx::drop
+        // pushing between drain and this store won't lose its flag.
+        if queue.is_empty() {
+            self.orphan_queue
+                .has_items
+                .store(false, crate::sync::Ordering::Release);
         }
     }
 
@@ -3479,14 +3502,14 @@ mod loom_tests {
 
             let q1 = queue.clone();
             let t1 = thread::spawn(move || {
-                let mut guard = q1.0.lock();
+                let mut guard = q1.queue.lock();
                 guard.push(Entity::new(10, 0));
                 guard.push(Entity::new(11, 0));
             });
 
             let q2 = queue.clone();
             let t2 = thread::spawn(move || {
-                let mut guard = q2.0.lock();
+                let mut guard = q2.queue.lock();
                 guard.push(Entity::new(20, 0));
                 guard.push(Entity::new(21, 0));
             });
@@ -3494,7 +3517,7 @@ mod loom_tests {
             t1.join().unwrap();
             t2.join().unwrap();
 
-            let mut drained: Vec<u32> = queue.0.lock().drain(..).map(|e| e.index()).collect();
+            let mut drained: Vec<u32> = queue.queue.lock().drain(..).map(|e| e.index()).collect();
             drained.sort();
             assert_eq!(drained, vec![10, 11, 20, 21]);
         });
@@ -3510,21 +3533,21 @@ mod loom_tests {
 
             let q1 = queue.clone();
             let pusher = thread::spawn(move || {
-                q1.0.lock().push(Entity::new(1, 0));
-                q1.0.lock().push(Entity::new(2, 0));
+                q1.queue.lock().push(Entity::new(1, 0));
+                q1.queue.lock().push(Entity::new(2, 0));
             });
 
             let q2 = queue.clone();
             let r = results.clone();
             let drainer = thread::spawn(move || {
-                let batch: Vec<u32> = q2.0.lock().drain(..).map(|e| e.index()).collect();
+                let batch: Vec<u32> = q2.queue.lock().drain(..).map(|e| e.index()).collect();
                 r.lock().push(batch);
             });
 
             pusher.join().unwrap();
             drainer.join().unwrap();
 
-            let remainder: Vec<u32> = queue.0.lock().drain(..).map(|e| e.index()).collect();
+            let remainder: Vec<u32> = queue.queue.lock().drain(..).map(|e| e.index()).collect();
             results.lock().push(remainder);
 
             let mut all: Vec<u32> = results
