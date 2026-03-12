@@ -162,12 +162,12 @@ pub(crate) struct ResolvedComponents(pub(crate) Vec<ComponentId>);
 struct TypeIdHasher(u64);
 
 impl Hasher for TypeIdHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        // TypeId is a u64 — grab the first 8 bytes directly.
-        debug_assert!(bytes.len() <= 8);
-        let mut buf = [0u8; 8];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        self.0 = u64::from_ne_bytes(buf);
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("TypeIdHasher only supports write_u64");
+    }
+
+    fn write_u64(&mut self, val: u64) {
+        self.0 = val;
     }
 
     fn finish(&self) -> u64 {
