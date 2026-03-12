@@ -207,66 +207,86 @@ fn main() {
     println!("\nWith 128 KiB L2 cache, 32-byte components:");
     println!("{}", vec_plan_small.explain());
 
+    // Drop planner to release the &world borrow before execute() needs &mut world.
+    drop(planner);
+
     println!("=== 8. Plan Execution ===\n");
 
     // Plans aren't just advisory — execute() runs them against the live world.
+    // Each block builds a fresh planner because execute() takes &mut World.
 
     // Simple scan: find all entities with Score and Pos
-    let plan = planner.scan::<(&Score, &Pos)>().build();
-    let entities = plan.execute(&world);
-    println!(
-        "Scan(&Score, &Pos): {} entities (expected {})",
-        entities.len(),
-        world.entity_count()
-    );
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score, &Pos)>().build();
+        let entities = plan.execute(&mut world);
+        println!(
+            "Scan(&Score, &Pos): {} entities (expected {})",
+            entities.len(),
+            world.entity_count()
+        );
+    }
 
     // Filtered: only Score in [100..200)
-    let plan = planner
-        .scan::<(&Score,)>()
-        .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
-        .build();
-    let entities = plan.execute(&world);
-    println!(
-        "Score in [100..200): {} entities (expected 100)",
-        entities.len()
-    );
-    // Verify correctness
-    for e in &entities {
-        let s = world.get::<Score>(*e).unwrap().0;
-        assert!((100..200).contains(&s));
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
+            .build();
+        let entities = plan.execute(&mut world);
+        println!(
+            "Score in [100..200): {} entities (expected 100)",
+            entities.len()
+        );
+        // Verify correctness
+        for e in entities {
+            let s = world.get::<Score>(*e).unwrap().0;
+            assert!((100..200).contains(&s));
+        }
     }
 
     // Index-driven: Team == 2 via hash index
-    let plan = planner
-        .scan::<(&Score, &Team)>()
-        .filter(Predicate::eq(Team(2)))
-        .build();
-    let entities = plan.execute(&world);
-    println!("Team == 2: {} entities (expected 200)", entities.len());
-    for e in &entities {
-        assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
+    {
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&team_hash, &world);
+        let mut plan = planner
+            .scan::<(&Score, &Team)>()
+            .filter(Predicate::eq(Team(2)))
+            .build();
+        let entities = plan.execute(&mut world);
+        println!("Team == 2: {} entities (expected 200)", entities.len());
+        for e in entities {
+            assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
+        }
     }
 
     // Join execution: intersect Score+Pos entities with Team entities
-    let plan = planner
-        .scan::<(&Score, &Pos)>()
-        .join::<(&Team,)>(JoinKind::Inner)
-        .build();
-    let entities = plan.execute(&world);
-    println!("(&Score, &Pos) JOIN (&Team,): {} entities", entities.len());
-    // All entities have both Score+Pos and Team, so all 1000 match
-    assert_eq!(entities.len(), 1000);
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score, &Pos)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let entities = plan.execute(&mut world);
+        println!("(&Score, &Pos) JOIN (&Team,): {} entities", entities.len());
+        // All entities have both Score+Pos and Team, so all 1000 match
+        assert_eq!(entities.len(), 1000);
+    }
 
     // Custom filter: even scores only
-    let plan = planner
-        .scan::<(&Score,)>()
-        .filter(Predicate::custom::<Score>("even", 0.5, |w, e| {
-            w.get::<Score>(e).is_some_and(|s| s.0 % 2 == 0)
-        }))
-        .build();
-    let entities = plan.execute(&world);
-    println!("Even scores: {} entities (expected 500)", entities.len());
-    assert_eq!(entities.len(), 500);
+    {
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>("even", 0.5, |w, e| {
+                w.get::<Score>(e).is_some_and(|s| s.0 % 2 == 0)
+            }))
+            .build();
+        let entities = plan.execute(&mut world);
+        println!("Even scores: {} entities (expected 500)", entities.len());
+        assert_eq!(entities.len(), 500);
+    }
 
     println!("\nDone.");
 }

@@ -625,6 +625,7 @@ pub struct QueryPlanResult {
     vec_root: VecExecNode,
     exec_root: Option<ExecNode>,
     compiled_for_each: Option<CompiledForEach>,
+    scratch: Option<ScratchBuffer>,
     opts: VectorizeOpts,
     warnings: Vec<PlanWarning>,
 }
@@ -684,6 +685,10 @@ impl QueryPlanResult {
 
     /// Execute the plan against a live world, returning matching entities.
     ///
+    /// Results are written to an internal scratch buffer that is reused across
+    /// calls — repeated executions amortize allocation. The returned slice
+    /// borrows `self` and is valid until the next `execute()` call.
+    ///
     /// The execution engine walks the plan tree, using type-erased closures
     /// captured at build time to perform scans, index lookups, and filters
     /// against actual world data.
@@ -693,11 +698,19 @@ impl QueryPlanResult {
     /// Panics if the plan was built without execution support (e.g., from a
     /// `ScanBuilder` created by an older API path that did not capture
     /// execution closures).
-    pub fn execute(&self, world: &World) -> Vec<Entity> {
-        self.exec_root
-            .as_ref()
-            .expect("plan was built without execution support")
-            .execute(world)
+    pub fn execute(&mut self, world: &mut World) -> &[Entity] {
+        let scratch = self
+            .scratch
+            .as_mut()
+            .expect("execute() requires a join/gather plan; use for_each() for scan-only plans");
+        scratch.clear();
+        if let Some(exec) = &self.exec_root {
+            let entities = exec.execute(world);
+            for e in entities {
+                scratch.push(e);
+            }
+        }
+        scratch.as_slice()
     }
 
     /// The executable plan root (for test introspection).
@@ -757,6 +770,7 @@ impl fmt::Debug for QueryPlanResult {
             .field("vec_root", &self.vec_root)
             .field("has_exec", &self.exec_root.is_some())
             .field("has_compiled_for_each", &self.compiled_for_each.is_some())
+            .field("has_scratch", &self.scratch.is_some())
             .field("opts", &self.opts)
             .field("warnings", &self.warnings)
             .finish()
@@ -1833,11 +1847,21 @@ impl ScanBuilder<'_> {
             None
         };
 
+        // Phase 9: Pre-size scratch buffer for join/gather plans.
+        // Scan-only plans use for_each() instead, so no scratch needed.
+        let scratch = if !self.joins.is_empty() {
+            let est = node.cost().rows as usize;
+            Some(ScratchBuffer::new(est * 3)) // room for left + right + output
+        } else {
+            Some(ScratchBuffer::new(node.cost().rows as usize))
+        };
+
         QueryPlanResult {
             root: node,
             vec_root,
             exec_root,
             compiled_for_each,
+            scratch,
             opts,
             warnings,
         }
@@ -2753,7 +2777,6 @@ struct ScratchBuffer {
 /// Maximum pre-allocation cap: 64K entities.
 const SCRATCH_MAX_CAP: usize = 64 * 1024;
 
-#[cfg_attr(not(test), expect(dead_code))]
 impl ScratchBuffer {
     /// Create a new buffer with the given estimated capacity, capped at 64K entities.
     fn new(estimated_capacity: usize) -> Self {
@@ -2773,11 +2796,13 @@ impl ScratchBuffer {
     }
 
     /// Number of entities currently in the buffer.
+    #[cfg_attr(not(test), expect(dead_code))]
     fn len(&self) -> usize {
         self.entities.len()
     }
 
     /// Current allocation capacity.
+    #[cfg_attr(not(test), expect(dead_code))]
     fn capacity(&self) -> usize {
         self.entities.capacity()
     }
@@ -2793,6 +2818,7 @@ impl ScratchBuffer {
     /// Sorts the left partition in-place by `to_bits()`, then for each entity
     /// in the right partition, binary-searches the sorted left. Matches are
     /// appended to the end of the buffer. Returns a slice over the matches.
+    #[cfg_attr(not(test), expect(dead_code))]
     fn sorted_intersection(&mut self, left_len: usize) -> &[Entity] {
         let total = self.entities.len();
         debug_assert!(left_len <= total);
@@ -4043,8 +4069,8 @@ mod tests {
         }
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
-        let mut result = plan.execute(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let mut result = plan.execute(&mut world).to_vec();
         result.sort_by_key(|e| e.to_bits());
         expected.sort_by_key(|e| e.to_bits());
         assert_eq!(result, expected);
@@ -4059,8 +4085,8 @@ mod tests {
         let _e2 = world.spawn((Team(1),));
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.execute(&mut world);
         assert_eq!(result, vec![e1]);
     }
 
@@ -4072,11 +4098,11 @@ mod tests {
         }
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(42)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 1);
         assert_eq!(*world.get::<Score>(result[0]).unwrap(), Score(42));
     }
@@ -4089,11 +4115,11 @@ mod tests {
         }
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 10);
         for e in &result {
             let s = world.get::<Score>(*e).unwrap().0;
@@ -4113,11 +4139,11 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_hash_index(&Arc::new(hash), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 20); // 100 / 5 teams
         for e in &result {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -4132,12 +4158,12 @@ mod tests {
         }
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
             .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         for e in &result {
             let s = world.get::<Score>(*e).unwrap().0;
             let t = world.get::<Team>(*e).unwrap().0;
@@ -4162,11 +4188,11 @@ mod tests {
         }
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let mut result = plan.execute(&world);
+        let mut result = plan.execute(&mut world).to_vec();
         result.sort_by_key(|e| e.to_bits());
         both.sort_by_key(|e| e.to_bits());
         assert_eq!(result, both);
@@ -4180,7 +4206,7 @@ mod tests {
         }
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::custom::<Score>(
                 "even scores",
@@ -4188,7 +4214,7 @@ mod tests {
                 |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 % 2 == 0),
             ))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 25);
         for e in &result {
             assert!(world.get::<Score>(*e).unwrap().0.is_multiple_of(2));
@@ -4197,10 +4223,10 @@ mod tests {
 
     #[test]
     fn execute_empty_world() {
-        let world = World::new();
+        let mut world = World::new();
         let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
-        let result = plan.execute(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.execute(&mut world);
         assert!(result.is_empty());
     }
 
@@ -4212,12 +4238,12 @@ mod tests {
         let e3 = world.spawn((Score(3),));
 
         let planner = QueryPlanner::new(&world);
-        let plan = planner.scan::<(&Score,)>().build();
+        let mut plan = planner.scan::<(&Score,)>().build();
 
         // Despawn e2 after plan construction
         world.despawn(e2);
 
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world);
         // Scan walks archetypes — despawned entity is replaced via swap_remove,
         // so the archetype only contains live entities.
         assert_eq!(result.len(), 2);
@@ -4247,11 +4273,11 @@ mod tests {
         planner.add_hash_index(&Arc::new(hash), &world);
 
         // scan::<(&Score, &Team)> requires BOTH components
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(1)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         // Only entities with both Score AND Team(1) should appear
         for e in &result {
             assert!(world.get::<Score>(*e).is_some(), "missing Score");
@@ -4277,11 +4303,11 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_btree_index(&Arc::new(btree), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(42)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 1);
         assert_eq!(*world.get::<Score>(result[0]).unwrap(), Score(42));
     }
@@ -4300,11 +4326,11 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_btree_index(&Arc::new(btree), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(10)..Score(20)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 10); // scores 10..20
         for e in &result {
             let s = world.get::<Score>(*e).unwrap().0;
@@ -4326,11 +4352,11 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_hash_index(&Arc::new(hash), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(3)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 20); // 200 / 10 teams
         for e in &result {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(3));
@@ -4349,11 +4375,11 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_btree_index(&Arc::new(btree), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(999)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world);
         assert!(result.is_empty());
     }
 
@@ -4369,11 +4395,11 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_hash_index(&Arc::new(hash), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Team,)>()
             .filter(Predicate::eq(Team(999)))
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world);
         assert!(result.is_empty());
     }
 
@@ -4394,13 +4420,13 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_btree_index(&btree, &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::eq(Score(42)))
             .build();
 
         // First execute: should find Score(42)
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world);
         assert_eq!(result.len(), 1);
 
         // Spawn more entities and rebuild the index via a new Arc.
@@ -4413,8 +4439,8 @@ mod tests {
 
         // Verify scan (non-index) path sees new entities immediately
         let planner2 = QueryPlanner::new(&world);
-        let scan_plan = planner2.scan::<(&Score,)>().build();
-        assert_eq!(scan_plan.execute(&world).len(), 100);
+        let mut scan_plan = planner2.scan::<(&Score,)>().build();
+        assert_eq!(scan_plan.execute(&mut world).len(), 100);
     }
 
     #[test]
@@ -4430,12 +4456,12 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_hash_index(&hash, &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Team,)>()
             .filter(Predicate::eq(Team(2)))
             .build();
 
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 10); // 50 / 5 teams
         for e in &result {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -4522,7 +4548,7 @@ mod tests {
         let mut planner = QueryPlanner::new(&world);
         planner.add_btree_index(&Arc::new(btree), &world);
 
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(0)..Score(100)))
             .build();
@@ -4544,7 +4570,7 @@ mod tests {
         assert_eq!(gather.sort_by_archetype(), Some(true));
 
         // Execute and verify entities come out sorted by archetype
-        let entities = plan.execute(&world);
+        let entities = plan.execute(&mut world).to_vec();
         assert!(!entities.is_empty());
         // Verify archetype ordering: all entities from archetype A should
         // appear before entities from archetype B (monotonic archetype IDs).
@@ -4628,13 +4654,13 @@ mod tests {
         planner.add_hash_index(&Arc::new(hash), &world);
 
         // Complex plan: index + filter + join
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::range::<Score, _>(Score(100)..Score(300)))
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
 
-        let entities = plan.execute(&world);
+        let entities = plan.execute(&mut world).to_vec();
         // All 500 entities have Team, so the join doesn't reduce the set.
         // The range filter should give us Score 100..300 = 200 entities.
         assert_eq!(entities.len(), 200);
@@ -4662,11 +4688,11 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         // Left join: all Score entities should appear, even those without Team.
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Left)
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         // All 30 Score entities must be present.
         assert_eq!(result.len(), 30);
         for e in &score_only {
@@ -4692,11 +4718,11 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         // Inner join: only entities with both Score and Team.
-        let plan = planner
+        let mut plan = planner
             .scan::<(&Score,)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world).to_vec();
         assert_eq!(result.len(), 10);
         for e in &both {
             assert!(result.contains(e));
@@ -4717,12 +4743,12 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
         // Small estimates → nested-loop join path.
-        let plan = planner
+        let mut plan = planner
             .scan_with_estimate::<(&Score,)>(8)
             .join::<(&Team,)>(JoinKind::Left)
             .with_right_estimate(3)
             .build();
-        let result = plan.execute(&world);
+        let result = plan.execute(&mut world);
         // Left join: all 8 Score entities preserved.
         assert_eq!(result.len(), 8);
     }
@@ -4786,6 +4812,47 @@ mod tests {
         let mut result_indices: Vec<u32> = result.iter().map(|e| e.index()).collect();
         result_indices.sort_unstable();
         assert_eq!(result_indices, vec![3, 7]);
+    }
+
+    // ── Execute with ScratchBuffer ─────────────────────────────────
+
+    #[test]
+    fn execute_with_scratch_returns_all_entities() {
+        let mut world = World::new();
+        let mut expected = Vec::new();
+        for i in 0..10u32 {
+            let e = world.spawn((Score(i), Team(i % 3)));
+            expected.push(e);
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let result = plan.execute(&mut world);
+        let mut found: Vec<Entity> = result.to_vec();
+        found.sort_by_key(|e| e.to_bits());
+        expected.sort_by_key(|e| e.to_bits());
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn execute_scratch_reuse_no_realloc() {
+        let mut world = World::new();
+        for i in 0..10u32 {
+            world.spawn((Score(i), Team(i % 3)));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let _ = plan.execute(&mut world);
+        let result = plan.execute(&mut world);
+        assert_eq!(result.len(), 10);
     }
 
     // ── CompiledScan for_each ──────────────────────────────────────
