@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name = "reducer"
 harness = false
+
+[[bench]]
+name = "changeset_micro"
+harness = false

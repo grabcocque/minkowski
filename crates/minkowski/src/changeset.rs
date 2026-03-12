@@ -54,8 +54,16 @@ impl Arena {
         }
     }
 
+    /// Pre-allocate at least `bytes` of arena capacity.
+    pub fn reserve(&mut self, bytes: usize) {
+        if bytes > self.capacity {
+            self.grow(bytes);
+        }
+    }
+
     /// Copy `layout.size()` bytes from `src` into the arena.
     /// Returns the byte offset where data was written.
+    #[inline]
     pub fn alloc(&mut self, src: *const u8, layout: Layout) -> usize {
         if layout.size() == 0 {
             return 0;
@@ -76,6 +84,7 @@ impl Arena {
     }
 
     /// Get a raw pointer to data at the given offset.
+    #[inline]
     pub fn get(&self, offset: usize) -> *const u8 {
         debug_assert!(
             offset <= self.len,
@@ -211,6 +220,20 @@ impl EnumChangeSet {
         Self::new_in(default_pool())
     }
 
+    /// Create a changeset pre-allocated for `mutations` mutations, each up to
+    /// `bytes_per_mutation` bytes of component data. Avoids reallocation during
+    /// recording when the mutation count is known ahead of time.
+    pub fn with_capacity(mutations: usize, bytes_per_mutation: usize) -> Self {
+        let pool = default_pool();
+        let mut arena = Arena::new(pool.clone());
+        arena.reserve(mutations * bytes_per_mutation);
+        Self {
+            mutations: Vec::with_capacity(mutations),
+            arena,
+            drop_entries: Vec::new(),
+        }
+    }
+
     pub(crate) fn new_in(pool: SharedPool) -> Self {
         Self {
             mutations: Vec::new(),
@@ -258,6 +281,7 @@ impl EnumChangeSet {
 
     /// Record inserting a component on an entity. Returns the arena byte offset
     /// where the component data was stored.
+    #[inline]
     pub fn record_insert(
         &mut self,
         entity: Entity,
@@ -415,6 +439,7 @@ impl EnumChangeSet {
     /// Insert with a pre-resolved ComponentId. Same as `insert()` but
     /// skips `world.register_component::<T>()`. Used by typed reducer handles.
     #[allow(dead_code)]
+    #[inline]
     pub(crate) fn insert_raw<T: Component>(
         &mut self,
         entity: Entity,

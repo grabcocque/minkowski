@@ -785,6 +785,7 @@ impl<'a, T: Component> WritableRef<'a, T> {
 
     /// Buffer a write. The value is stored in the changeset and applied on commit.
     #[allow(dead_code)]
+    #[inline]
     pub fn set(&mut self, value: T) {
         // Safety: the raw pointer is valid for the lifetime of the transaction.
         // Multiple WritableRefs in a tuple query share this pointer, but the
@@ -796,6 +797,7 @@ impl<'a, T: Component> WritableRef<'a, T> {
 
     /// Clone the current value, apply `f`, and buffer the result.
     #[allow(dead_code)]
+    #[inline]
     pub fn modify(&mut self, f: impl FnOnce(&mut T))
     where
         T: Clone,
@@ -1063,6 +1065,29 @@ impl<'a, Q: WriterQuery + 'static> QueryWriter<'a, Q> {
 
         let required = Q::required_ids(&self.world.components);
         let cs_ptr = self.changeset;
+
+        // Pre-allocate changeset capacity based on matching entity count,
+        // capped to avoid worst-case overallocation when only a fraction of
+        // matched entities are actually written (conditional-update reducers).
+        {
+            const MAX_PREALLOC_MUTATIONS: usize = 64 * 1024;
+            let mut entity_count = 0;
+            for arch in &self.world.archetypes.archetypes {
+                if !arch.is_empty()
+                    && required.is_subset(&arch.component_ids)
+                    && Q::matches_filters(arch, &self.world.components, last_tick)
+                {
+                    entity_count += arch.len();
+                }
+            }
+            if entity_count > 0 {
+                let cs = unsafe { &mut *cs_ptr };
+                let mutable_count = Q::mutable_ids(&self.world.components).count_ones(..);
+                let mutations_needed = (entity_count * mutable_count).min(MAX_PREALLOC_MUTATIONS);
+                cs.mutations.reserve(mutations_needed);
+                cs.arena.reserve(mutations_needed * 64);
+            }
+        }
 
         for arch in &self.world.archetypes.archetypes {
             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
