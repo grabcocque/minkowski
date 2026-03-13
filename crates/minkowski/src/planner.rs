@@ -1149,6 +1149,21 @@ struct JoinExec {
     steps: Vec<JoinStep>,
 }
 
+/// Returns true if all columns in `changed` have a tick newer than `tick`.
+/// When `changed` is empty (no `Changed<T>` terms), returns true immediately.
+#[inline]
+fn passes_change_filter(
+    arch: &crate::storage::archetype::Archetype,
+    changed: &FixedBitSet,
+    tick: Tick,
+) -> bool {
+    changed.is_clear()
+        || changed.ones().all(|bit| {
+            arch.column_index(bit)
+                .is_some_and(|col| arch.columns[col].changed_tick.is_newer_than(tick))
+        })
+}
+
 /// Collect all entities from archetypes matching a component bitset
 /// into a scratch buffer, skipping archetypes whose changed columns
 /// are not newer than `tick`.
@@ -1163,12 +1178,7 @@ fn collect_matching_entities(
         if arch.is_empty() || !required.is_subset(&arch.component_ids) {
             continue;
         }
-        if !changed.is_clear()
-            && !changed.ones().all(|bit| {
-                arch.column_index(bit)
-                    .is_some_and(|col| arch.columns[col].changed_tick.is_newer_than(tick))
-            })
-        {
+        if !passes_change_filter(arch, changed, tick) {
             continue;
         }
         for &entity in &arch.entities {
@@ -1422,13 +1432,7 @@ impl ScanBuilder<'_> {
                             if arch.is_empty() || !left_required.is_subset(&arch.component_ids) {
                                 continue;
                             }
-                            if !left_changed.is_clear()
-                                && !left_changed.ones().all(|bit| {
-                                    arch.column_index(bit).is_some_and(|col| {
-                                        arch.columns[col].changed_tick.is_newer_than(tick)
-                                    })
-                                })
-                            {
+                            if !passes_change_filter(arch, &left_changed, tick) {
                                 continue;
                             }
                             for &entity in &arch.entities {
@@ -1723,13 +1727,7 @@ impl<'w> QueryPlanner<'w> {
                             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                                 continue;
                             }
-                            if !changed.is_clear()
-                                && !changed.ones().all(|bit| {
-                                    arch.column_index(bit).is_some_and(|col| {
-                                        arch.columns[col].changed_tick.is_newer_than(tick)
-                                    })
-                                })
-                            {
+                            if !passes_change_filter(arch, &changed, tick) {
                                 continue;
                             }
                             for &entity in &arch.entities {
@@ -1748,13 +1746,7 @@ impl<'w> QueryPlanner<'w> {
                             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                                 continue;
                             }
-                            if !changed.is_clear()
-                                && !changed.ones().all(|bit| {
-                                    arch.column_index(bit).is_some_and(|col| {
-                                        arch.columns[col].changed_tick.is_newer_than(tick)
-                                    })
-                                })
-                            {
+                            if !passes_change_filter(arch, &changed, tick) {
                                 continue;
                             }
                             for &entity in &arch.entities {
@@ -1800,13 +1792,7 @@ impl<'w> QueryPlanner<'w> {
                             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                                 continue;
                             }
-                            if !changed.is_clear()
-                                && !changed.ones().all(|bit| {
-                                    arch.column_index(bit).is_some_and(|col| {
-                                        arch.columns[col].changed_tick.is_newer_than(tick)
-                                    })
-                                })
-                            {
+                            if !passes_change_filter(arch, &changed, tick) {
                                 continue;
                             }
                             for &entity in &arch.entities {
@@ -1825,13 +1811,7 @@ impl<'w> QueryPlanner<'w> {
                             if arch.is_empty() || !required.is_subset(&arch.component_ids) {
                                 continue;
                             }
-                            if !changed.is_clear()
-                                && !changed.ones().all(|bit| {
-                                    arch.column_index(bit).is_some_and(|col| {
-                                        arch.columns[col].changed_tick.is_newer_than(tick)
-                                    })
-                                })
-                            {
+                            if !passes_change_filter(arch, &changed, tick) {
                                 continue;
                             }
                             for &entity in &arch.entities {
@@ -4871,5 +4851,33 @@ mod tests {
         plan.for_each(&mut world, |entity| found.push(entity));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0], e1);
+    }
+
+    #[test]
+    fn for_each_changed_with_predicate_filter() {
+        let mut world = World::new();
+        // All in one archetype
+        for i in 0..10u32 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(Changed<Score>, &Score)>()
+            .filter(Predicate::custom::<Score>(
+                "score < 5",
+                0.5,
+                |world: &World, entity: Entity| world.get::<Score>(entity).is_some_and(|s| s.0 < 5),
+            ))
+            .build();
+
+        // First call: Changed passes (everything new), predicate filters to 5
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 5);
+
+        // Second call: Changed skips the archetype entirely
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 0);
     }
 }
