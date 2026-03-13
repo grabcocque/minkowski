@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use minkowski::{
-    BTreeIndex, CardinalityConstraint, HashIndex, Indexed, JoinKind, Predicate, QueryPlanner,
-    SpatialIndex, VectorizeOpts, World,
+    BTreeIndex, CardinalityConstraint, Changed, HashIndex, Indexed, JoinKind, Predicate,
+    QueryPlanner, SpatialIndex, VectorizeOpts, World,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -356,6 +356,54 @@ fn main() {
         );
         assert_eq!(found.len(), 1);
         assert_eq!(*world.get::<Score>(found[0]).unwrap(), Score(42));
+    }
+
+    println!("\n=== 11. Changed<T> Filtering ===\n");
+
+    // Changed<T> skips archetypes whose column tick hasn't advanced since
+    // the last for_each call. Entities in different archetypes can be
+    // selectively matched — only archetypes with a mutated Score column
+    // pass the filter.
+    //
+    // We need a fresh world for this demo so the tick baseline is clean.
+    // Two archetypes: Score-only (5 entities) and Score+Team (5 entities).
+    {
+        let mut cworld = World::new();
+        let score_only: Vec<_> = (0u32..5).map(|i| cworld.spawn((Score(i),))).collect();
+        let _score_team: Vec<_> = (0u32..5)
+            .map(|i| cworld.spawn((Score(i + 100), Team(i))))
+            .collect();
+
+        let planner = QueryPlanner::new(&cworld);
+        let mut plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // First call: both archetypes were written at spawn time, so
+        // Changed<Score> matches both. Every entity is visible.
+        let mut first_count = 0;
+        plan.for_each(&mut cworld, |_| first_count += 1);
+        println!("First for_each (all new): {first_count} entities (expected 10, both archetypes)");
+        assert_eq!(first_count, 10);
+
+        // Mutate one entity in the Score-only archetype via get_mut,
+        // which marks that column's changed_tick.
+        let _ = cworld.get_mut::<Score>(score_only[0]);
+
+        // Second call: only the Score-only archetype column was touched.
+        // Score+Team archetype is stale — skipped entirely.
+        let mut second_count = 0;
+        plan.for_each(&mut cworld, |_| second_count += 1);
+        println!(
+            "Second for_each (one archetype mutated): {second_count} entities (expected 5, Score-only archetype)"
+        );
+        assert_eq!(second_count, 5);
+
+        // Third call: nothing changed since the last read tick.
+        let mut third_count = 0;
+        plan.for_each(&mut cworld, |_| third_count += 1);
+        println!(
+            "Third for_each (no new changes): {third_count} entities (expected 0, nothing changed)"
+        );
+        assert_eq!(third_count, 0);
     }
 
     println!("\nDone.");
