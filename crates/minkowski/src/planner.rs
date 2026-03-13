@@ -93,7 +93,7 @@ use fixedbitset::FixedBitSet;
 
 use crate::component::{Component, ComponentRegistry};
 use crate::entity::Entity;
-use crate::index::{BTreeIndex, HashIndex};
+use crate::index::{BTreeIndex, HashIndex, SpatialCost, SpatialExpr, SpatialIndex};
 use crate::tick::Tick;
 // Use std Arc directly — the planner has no concurrent code, so it does not
 // need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
@@ -150,6 +150,13 @@ impl Cost {
         }
     }
 
+    fn spatial_lookup(spatial_cost: &SpatialCost) -> Self {
+        Cost {
+            rows: spatial_cost.estimated_rows,
+            cpu: spatial_cost.cpu,
+        }
+    }
+
     fn filter(input: Cost, selectivity: f64) -> Self {
         Cost {
             rows: (input.rows * selectivity).max(0.0),
@@ -190,6 +197,79 @@ pub enum IndexKind {
     BTree,
     /// HashIndex — supports exact match only.
     Hash,
+    /// SpatialIndex — supports spatial predicates (within, intersects).
+    Spatial,
+}
+
+/// A spatial predicate recognized by the query planner's IR.
+///
+/// When the planner encounters a spatial predicate, it checks whether any
+/// registered `SpatialIndex` can accelerate the expression via
+/// [`SpatialIndex::supports`]. If so, the planner emits a `SpatialLookup`
+/// plan node instead of a full scan + post-filter.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SpatialPredicate {
+    /// Point-radius proximity: entities within `radius` of `(x, y)`.
+    /// Maps to `SpatialExpr::Within` for capability discovery.
+    Within {
+        /// X coordinate of the query center.
+        x: f64,
+        /// Y coordinate of the query center.
+        y: f64,
+        /// Search radius.
+        radius: f64,
+    },
+    /// AABB intersection: entities whose spatial extent overlaps the
+    /// given rectangle. Maps to `SpatialExpr::Intersects`.
+    Intersects {
+        /// Minimum X of the query rectangle.
+        min_x: f64,
+        /// Minimum Y of the query rectangle.
+        min_y: f64,
+        /// Maximum X of the query rectangle.
+        max_x: f64,
+        /// Maximum Y of the query rectangle.
+        max_y: f64,
+    },
+}
+
+impl SpatialPredicate {
+    /// Convert to the type-erased `SpatialExpr` used by capability discovery.
+    pub fn to_expr(&self) -> SpatialExpr {
+        match *self {
+            SpatialPredicate::Within { x, y, radius } => SpatialExpr::Within { x, y, radius },
+            SpatialPredicate::Intersects {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            } => SpatialExpr::Intersects {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            },
+        }
+    }
+}
+
+impl fmt::Display for SpatialPredicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SpatialPredicate::Within { x, y, radius } => {
+                write!(f, "ST_Within(({x}, {y}), {radius})")
+            }
+            SpatialPredicate::Intersects {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            } => {
+                write!(f, "ST_Intersects(({min_x}, {min_y}), ({max_x}, {max_y}))")
+            }
+        }
+    }
 }
 
 /// Type-erased lookup function for predicate-specific index access.
@@ -257,10 +337,12 @@ pub struct Predicate {
     lookup_value: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
+#[derive(Debug)]
 enum PredicateKind {
     Eq,
     Range,
     Custom(Box<str>), // description only — always post-filter
+    Spatial(SpatialPredicate),
 }
 
 impl Predicate {
@@ -356,6 +438,62 @@ impl Predicate {
         }
     }
 
+    /// Spatial proximity predicate: entities within `radius` of `(x, y)`.
+    ///
+    /// The component type `T` identifies which column holds the spatial data.
+    /// If a `SpatialIndex` is registered for `T` and its
+    /// [`supports`](SpatialIndex::supports) method returns `Some` for this
+    /// expression, the planner emits a `SpatialLookup` node. Otherwise it
+    /// falls back to a scan + post-filter using the provided closure.
+    pub fn within<T: Component>(
+        x: f64,
+        y: f64,
+        radius: f64,
+        filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        // Rough selectivity: area ratio of circle to a notional unit world.
+        // Clamped so the planner doesn't underestimate for small radii.
+        let selectivity = (std::f64::consts::PI * radius * radius).clamp(0.001, 1.0);
+        Predicate {
+            component_type: TypeId::of::<T>(),
+            component_name: std::any::type_name::<T>(),
+            kind: PredicateKind::Spatial(SpatialPredicate::Within { x, y, radius }),
+            selectivity,
+            filter_fn: Some(Arc::new(filter)),
+            lookup_value: None,
+        }
+    }
+
+    /// Spatial AABB intersection predicate.
+    ///
+    /// The component type `T` identifies which column holds the spatial data.
+    /// If a `SpatialIndex` is registered for `T` and its
+    /// [`supports`](SpatialIndex::supports) method returns `Some` for this
+    /// expression, the planner emits a `SpatialLookup` node.
+    pub fn intersects<T: Component>(
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+        filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let area = (max_x - min_x) * (max_y - min_y);
+        let selectivity = area.abs().clamp(0.001, 1.0);
+        Predicate {
+            component_type: TypeId::of::<T>(),
+            component_name: std::any::type_name::<T>(),
+            kind: PredicateKind::Spatial(SpatialPredicate::Intersects {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            }),
+            selectivity,
+            filter_fn: Some(Arc::new(filter)),
+            lookup_value: None,
+        }
+    }
+
     /// Override the default selectivity estimate.
     ///
     /// NaN selectivity is normalized to 1.0 (worst-case, full scan).
@@ -372,6 +510,10 @@ impl Predicate {
         matches!(self.kind, PredicateKind::Eq)
     }
 
+    fn can_use_spatial(&self) -> bool {
+        matches!(self.kind, PredicateKind::Spatial(_))
+    }
+
     /// Whether this predicate can be lowered to branchless SIMD comparison.
     fn is_branchless_eligible(&self) -> bool {
         matches!(self.kind, PredicateKind::Eq | PredicateKind::Range)
@@ -384,6 +526,7 @@ impl fmt::Debug for Predicate {
             PredicateKind::Eq => write!(f, "Eq({})", self.component_name),
             PredicateKind::Range => write!(f, "Range({})", self.component_name),
             PredicateKind::Custom(desc) => write!(f, "Custom({}: {})", self.component_name, desc),
+            PredicateKind::Spatial(sp) => write!(f, "Spatial({}: {})", self.component_name, sp),
         }
     }
 }
@@ -412,6 +555,13 @@ pub enum PlanNode {
     /// Index-driven lookup (point or range).
     IndexLookup {
         index_kind: IndexKind,
+        component_name: &'static str,
+        predicate: String,
+        estimated_rows: usize,
+        cost: Cost,
+    },
+    /// Spatial index lookup (within, intersects).
+    SpatialLookup {
         component_name: &'static str,
         predicate: String,
         estimated_rows: usize,
@@ -450,6 +600,7 @@ impl PlanNode {
         match self {
             PlanNode::Scan { cost, .. }
             | PlanNode::IndexLookup { cost, .. }
+            | PlanNode::SpatialLookup { cost, .. }
             | PlanNode::Filter { cost, .. }
             | PlanNode::HashJoin { cost, .. }
             | PlanNode::NestedLoopJoin { cost, .. } => *cost,
@@ -489,6 +640,18 @@ impl PlanNode {
                 writeln!(
                     f,
                     "IndexLookup [{index_kind:?} on {component_name}] {predicate} rows={estimated_rows} cpu={:.1}",
+                    cost.cpu
+                )
+            }
+            PlanNode::SpatialLookup {
+                component_name,
+                predicate,
+                estimated_rows,
+                cost,
+            } => {
+                writeln!(
+                    f,
+                    "SpatialLookup [Spatial on {component_name}] {predicate} rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
             }
@@ -1268,13 +1431,22 @@ impl ScanBuilder<'_> {
     pub fn build(self) -> QueryPlanResult {
         let mut warnings = Vec::new();
 
-        // Phase 1: Classify predicates — index-driven vs post-filter.
+        // Phase 1: Classify predicates — index-driven vs spatial vs post-filter.
         let mut index_preds: Vec<(Predicate, &IndexDescriptor)> = Vec::new();
+        let mut spatial_preds: Vec<(Predicate, SpatialCost)> = Vec::new();
         let mut filter_preds = Vec::new();
         let planner = self.planner;
 
         for pred in self.predicates {
-            if let Some(idx) = planner.find_best_index(&pred) {
+            if pred.can_use_spatial() {
+                // Spatial predicate — check if a spatial index can accelerate it.
+                if let Some((_name, cost)) = planner.find_spatial_index(&pred) {
+                    spatial_preds.push((pred, cost));
+                } else {
+                    planner.warn_missing_index(&pred, &mut warnings);
+                    filter_preds.push(pred);
+                }
+            } else if let Some(idx) = planner.find_best_index(&pred) {
                 index_preds.push((pred, idx));
             } else {
                 // Generate warnings for missing indexes.
@@ -1285,6 +1457,7 @@ impl ScanBuilder<'_> {
 
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
+        spatial_preds.sort_by(|a, b| a.1.estimated_rows.total_cmp(&b.1.estimated_rows));
 
         // Collect all filter closures for compiled scan fusion.
         // Must happen before Phase 4 consumes filter_preds.
@@ -1307,6 +1480,11 @@ impl ScanBuilder<'_> {
             .iter()
             .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone))
             .chain(
+                spatial_preds
+                    .iter()
+                    .filter_map(|(p, _)| p.filter_fn.as_ref().map(Arc::clone)),
+            )
+            .chain(
                 filter_preds
                     .iter()
                     .filter_map(|p| p.filter_fn.as_ref().map(Arc::clone)),
@@ -1314,9 +1492,61 @@ impl ScanBuilder<'_> {
             .collect();
 
         // Phase 3: Build the logical plan tree.
+        //
+        // Priority: spatial index → BTree/Hash index → full scan.
+        // We pick the driving access by lowest estimated cost among all
+        // index-eligible predicates.
         let mut node: PlanNode;
 
-        if let Some((first_pred, first_idx)) = index_preds.first() {
+        // Determine driving access: compare best spatial vs best BTree/Hash.
+        let best_spatial_cost = spatial_preds
+            .first()
+            .map(|(_, sc)| Cost::spatial_lookup(sc).total());
+        let best_index_cost = index_preds
+            .first()
+            .map(|(p, _)| Cost::index_lookup(p.selectivity, self.estimated_rows).total());
+
+        let use_spatial_driver = match (best_spatial_cost, best_index_cost) {
+            (Some(sc), Some(ic)) => sc <= ic,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if use_spatial_driver && !spatial_preds.is_empty() {
+            // Driving access is a spatial lookup.
+            let (first_pred, first_cost) = &spatial_preds[0];
+            let est = first_cost.estimated_rows.max(1.0) as usize;
+            node = PlanNode::SpatialLookup {
+                component_name: first_pred.component_name,
+                predicate: format!("{:?}", first_pred),
+                estimated_rows: est,
+                cost: Cost::spatial_lookup(first_cost),
+            };
+
+            // Additional spatial predicates become filters.
+            for (pred, _) in spatial_preds.iter().skip(1) {
+                let parent_cost = node.cost();
+                node = PlanNode::Filter {
+                    predicate: format!("{:?}", pred),
+                    selectivity: pred.selectivity,
+                    branchless_eligible: false, // spatial predicates are not branchless
+                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    child: Box::new(node),
+                };
+            }
+
+            // All index predicates become filters too.
+            for (pred, _idx) in &index_preds {
+                let parent_cost = node.cost();
+                node = PlanNode::Filter {
+                    predicate: format!("{:?}", pred),
+                    selectivity: pred.selectivity,
+                    branchless_eligible: pred.is_branchless_eligible(),
+                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    child: Box::new(node),
+                };
+            }
+        } else if let Some((first_pred, first_idx)) = index_preds.first() {
             // Driving access is an index lookup.
             let est = (self.estimated_rows as f64 * first_pred.selectivity).max(1.0) as usize;
             node = PlanNode::IndexLookup {
@@ -1334,6 +1564,38 @@ impl ScanBuilder<'_> {
                     predicate: format!("{:?}", pred),
                     selectivity: pred.selectivity,
                     branchless_eligible: pred.is_branchless_eligible(),
+                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    child: Box::new(node),
+                };
+            }
+
+            // Spatial predicates that aren't the driver become filters.
+            for (pred, _) in &spatial_preds {
+                let parent_cost = node.cost();
+                node = PlanNode::Filter {
+                    predicate: format!("{:?}", pred),
+                    selectivity: pred.selectivity,
+                    branchless_eligible: false,
+                    cost: Cost::filter(parent_cost, pred.selectivity),
+                    child: Box::new(node),
+                };
+            }
+        } else if let Some((first_pred, first_cost)) = spatial_preds.first() {
+            // No BTree/Hash but we have a spatial index.
+            let est = first_cost.estimated_rows.max(1.0) as usize;
+            node = PlanNode::SpatialLookup {
+                component_name: first_pred.component_name,
+                predicate: format!("{:?}", first_pred),
+                estimated_rows: est,
+                cost: Cost::spatial_lookup(first_cost),
+            };
+
+            for (pred, _) in spatial_preds.iter().skip(1) {
+                let parent_cost = node.cost();
+                node = PlanNode::Filter {
+                    predicate: format!("{:?}", pred),
+                    selectivity: pred.selectivity,
+                    branchless_eligible: false,
                     cost: Cost::filter(parent_cost, pred.selectivity),
                     child: Box::new(node),
                 };
@@ -1580,8 +1842,24 @@ impl ScanBuilder<'_> {
 ///
 /// Join order is determined by intermediate result size — the smallest
 /// intermediate result drives subsequent joins.
+/// Descriptor for a registered spatial index.
+struct SpatialIndexDescriptor {
+    component_name: &'static str,
+    /// The spatial index, behind Arc for shared access at execution time.
+    index: Arc<dyn SpatialIndex + Send + Sync>,
+}
+
+impl fmt::Debug for SpatialIndexDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpatialIndexDescriptor")
+            .field("component_name", &self.component_name)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct QueryPlanner<'w> {
     indexes: HashMap<TypeId, IndexDescriptor>,
+    spatial_indexes: HashMap<TypeId, SpatialIndexDescriptor>,
     total_entities: usize,
     /// Component registry for resolving query type → component bitset.
     components: &'w ComponentRegistry,
@@ -1596,6 +1874,7 @@ impl<'w> QueryPlanner<'w> {
     pub fn new(world: &'w World) -> Self {
         QueryPlanner {
             indexes: HashMap::new(),
+            spatial_indexes: HashMap::new(),
             total_entities: world.entity_count(),
             components: &world.components,
             _world: PhantomData,
@@ -1703,6 +1982,33 @@ impl<'w> QueryPlanner<'w> {
                 eq_lookup_fn: Some(eq_fn),
                 range_lookup_fn: None, // Hash doesn't support range queries.
             });
+    }
+
+    /// Register a spatial index for a component type.
+    ///
+    /// The planner will call [`SpatialIndex::supports`] to check whether the
+    /// index can accelerate spatial predicates on `T`. Multiple spatial indexes
+    /// can be registered for different component types, but only one per type.
+    ///
+    /// # Panics
+    /// Panics if `T` has not been registered as a component in `world`.
+    pub fn add_spatial_index<T: Component>(
+        &mut self,
+        index: Arc<dyn SpatialIndex + Send + Sync>,
+        world: &World,
+    ) {
+        assert!(
+            world.component_id::<T>().is_some(),
+            "QueryPlanner::add_spatial_index: component `{}` not registered in this World",
+            std::any::type_name::<T>()
+        );
+        self.spatial_indexes.insert(
+            TypeId::of::<T>(),
+            SpatialIndexDescriptor {
+                component_name: std::any::type_name::<T>(),
+                index,
+            },
+        );
     }
 
     /// Start building a scan plan for query type `Q`.
@@ -1851,6 +2157,21 @@ impl<'w> QueryPlanner<'w> {
         }
     }
 
+    /// Check if a spatial predicate can be accelerated by a registered spatial index.
+    ///
+    /// Returns the cost reported by the index if it supports the expression,
+    /// along with the component name for plan node construction.
+    fn find_spatial_index(&self, pred: &Predicate) -> Option<(&'static str, SpatialCost)> {
+        if let PredicateKind::Spatial(sp) = &pred.kind {
+            let desc = self.spatial_indexes.get(&pred.component_type)?;
+            let expr = sp.to_expr();
+            let cost = desc.index.supports(&expr)?;
+            Some((desc.component_name, cost))
+        } else {
+            None
+        }
+    }
+
     /// Generate warnings for predicates that can't use an index.
     fn warn_missing_index(&self, pred: &Predicate, warnings: &mut Vec<PlanWarning>) {
         match &pred.kind {
@@ -1890,6 +2211,18 @@ impl<'w> QueryPlanner<'w> {
                         suggestion: "add a BTreeIndex<T>",
                     });
                 }
+            }
+            PredicateKind::Spatial(_) => {
+                if !self.spatial_indexes.contains_key(&pred.component_type) {
+                    warnings.push(PlanWarning::MissingIndex {
+                        component_name: pred.component_name,
+                        predicate_kind: "spatial",
+                        suggestion: "add a SpatialIndex via add_spatial_index::<T>()",
+                    });
+                }
+                // If the spatial index exists but doesn't support the expression,
+                // the predicate will fall back to a filter. No warning needed —
+                // the index simply can't accelerate this particular expression.
             }
         }
     }
@@ -1979,6 +2312,14 @@ pub enum VecExecNode {
         cost: Cost,
     },
 
+    /// Spatial index gather: lookup entities via a spatial index.
+    SpatialGather {
+        component_name: &'static str,
+        predicate: String,
+        estimated_rows: usize,
+        cost: Cost,
+    },
+
     /// SIMD-friendly filter: applied to contiguous slices.
     /// The filter function operates on `&[T]` and produces a selection
     /// vector (bitmask) — no branching per row.
@@ -2019,6 +2360,7 @@ impl VecExecNode {
         match self {
             VecExecNode::ChunkedScan { cost, .. }
             | VecExecNode::IndexGather { cost, .. }
+            | VecExecNode::SpatialGather { cost, .. }
             | VecExecNode::SIMDFilter { cost, .. }
             | VecExecNode::PartitionedHashJoin { cost, .. }
             | VecExecNode::BatchNestedLoopJoin { cost, .. } => *cost,
@@ -2054,6 +2396,19 @@ impl VecExecNode {
                 writeln!(
                     f,
                     "IndexGather [{index_kind:?} on {component_name}] \
+                     {predicate} rows={estimated_rows} cpu={:.1}",
+                    cost.cpu
+                )
+            }
+            VecExecNode::SpatialGather {
+                component_name,
+                predicate,
+                estimated_rows,
+                cost,
+            } => {
+                writeln!(
+                    f,
+                    "SpatialGather [Spatial on {component_name}] \
                      {predicate} rows={estimated_rows} cpu={:.1}",
                     cost.cpu
                 )
@@ -2287,6 +2642,29 @@ fn lower_to_vectorized(node: &PlanNode, opts: &VectorizeOpts) -> VecExecNode {
 
             VecExecNode::IndexGather {
                 index_kind: *index_kind,
+                component_name,
+                predicate: predicate.clone(),
+                estimated_rows: *estimated_rows,
+                cost: vec_cost,
+            }
+        }
+
+        PlanNode::SpatialLookup {
+            component_name,
+            predicate,
+            estimated_rows,
+            cost,
+        } => {
+            // Spatial gather: similar to index gather but via spatial index.
+            // Spatial lookups already produce entity lists, so the overhead
+            // is just the archetype-sort for sequential access.
+            let sort_overhead = (*estimated_rows as f64).log2().max(1.0);
+            let vec_cost = Cost {
+                rows: cost.rows,
+                cpu: cost.cpu * 0.9 + sort_overhead, // spatial indexes have good cache behavior
+            };
+
+            VecExecNode::SpatialGather {
                 component_name,
                 predicate: predicate.clone(),
                 estimated_rows: *estimated_rows,
@@ -2604,7 +2982,6 @@ mod tests {
     struct Team(u32);
 
     #[derive(Clone, Copy, Debug)]
-    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,
@@ -4946,5 +5323,403 @@ mod tests {
 
         // Second call: right side stale, but Left join keeps all left entities
         assert_eq!(plan.execute(&mut world).len(), 5);
+    }
+
+    // ── Spatial predicate tests ──────────────────────────────────
+
+    /// Grid index that supports `Within` queries for testing.
+    struct TestGridIndex {
+        entities: Vec<Entity>,
+    }
+
+    impl TestGridIndex {
+        fn new() -> Self {
+            Self {
+                entities: Vec::new(),
+            }
+        }
+    }
+
+    impl SpatialIndex for TestGridIndex {
+        fn rebuild(&mut self, world: &mut World) {
+            self.entities = world.query::<(Entity, &Pos)>().map(|(e, _)| e).collect();
+        }
+
+        fn supports(&self, expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            match expr {
+                crate::index::SpatialExpr::Within { .. } => Some(crate::index::SpatialCost {
+                    estimated_rows: (self.entities.len() as f64 * 0.1).max(1.0),
+                    cpu: 5.0,
+                }),
+                crate::index::SpatialExpr::Intersects { .. } => Some(crate::index::SpatialCost {
+                    estimated_rows: (self.entities.len() as f64 * 0.2).max(1.0),
+                    cpu: 8.0,
+                }),
+            }
+        }
+    }
+
+    /// Grid index that does NOT support any spatial queries.
+    struct UnsupportedGridIndex;
+
+    impl SpatialIndex for UnsupportedGridIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+    }
+
+    #[test]
+    fn spatial_predicate_within_creates_spatial_lookup() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .build();
+
+        // The root of the logical plan should be a SpatialLookup.
+        match plan.root() {
+            PlanNode::SpatialLookup {
+                component_name,
+                cost,
+                ..
+            } => {
+                assert!(component_name.contains("Pos"));
+                assert!(cost.rows > 0.0);
+            }
+            other => panic!("expected SpatialLookup, got {:?}", other),
+        }
+
+        // No warnings expected — spatial index was registered.
+        assert!(plan.warnings().is_empty());
+    }
+
+    #[test]
+    fn spatial_predicate_intersects_creates_spatial_lookup() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::intersects::<Pos>(
+                0.0,
+                0.0,
+                25.0,
+                25.0,
+                |_, _| true,
+            ))
+            .build();
+
+        match plan.root() {
+            PlanNode::SpatialLookup { .. } => {}
+            other => panic!("expected SpatialLookup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spatial_predicate_without_index_falls_back_to_filter() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .build();
+
+        // Without a spatial index, should fall back to Scan + Filter.
+        match plan.root() {
+            PlanNode::Filter { child, .. } => match child.as_ref() {
+                PlanNode::Scan { .. } => {}
+                other => panic!("expected Scan child, got {:?}", other),
+            },
+            other => panic!("expected Filter, got {:?}", other),
+        }
+
+        // Should have a warning about missing spatial index.
+        assert_eq!(plan.warnings().len(), 1);
+        match &plan.warnings()[0] {
+            PlanWarning::MissingIndex { predicate_kind, .. } => {
+                assert_eq!(*predicate_kind, "spatial");
+            }
+            other => panic!("expected MissingIndex warning, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spatial_predicate_unsupported_expr_falls_back_to_filter() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        // Register a spatial index that doesn't support any queries.
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(UnsupportedGridIndex), &world);
+
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .build();
+
+        // Index exists but doesn't support Within — should fall back.
+        match plan.root() {
+            PlanNode::Filter { child, .. } => match child.as_ref() {
+                PlanNode::Scan { .. } => {}
+                other => panic!("expected Scan child, got {:?}", other),
+            },
+            other => panic!("expected Filter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spatial_lookup_vectorizes_to_spatial_gather() {
+        let mut world = World::new();
+        for i in 0..100 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .build();
+
+        match plan.vec_root() {
+            VecExecNode::SpatialGather { component_name, .. } => {
+                assert!(component_name.contains("Pos"));
+            }
+            other => panic!("expected SpatialGather, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spatial_predicate_explain_contains_spatial_lookup() {
+        let mut world = World::new();
+        for i in 0..50 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        let plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .build();
+
+        let explain = plan.explain();
+        assert!(explain.contains("SpatialGather"));
+        assert!(explain.contains("Pos"));
+
+        let logical = plan.explain_logical();
+        assert!(logical.contains("SpatialLookup"));
+    }
+
+    #[test]
+    fn spatial_predicate_with_custom_selectivity() {
+        let pred = Predicate::within::<Pos>(0.0, 0.0, 1.0, |_, _| true).with_selectivity(0.05);
+
+        // Selectivity override should work.
+        match &pred.kind {
+            PredicateKind::Spatial(SpatialPredicate::Within { radius, .. }) => {
+                assert!(*radius > 0.0);
+            }
+            other => panic!("expected Spatial(Within), got {:?}", other),
+        }
+        assert!((pred.selectivity - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn spatial_predicate_debug_format() {
+        let pred = Predicate::within::<Pos>(1.0, 2.0, 3.0, |_, _| true);
+        let dbg = format!("{:?}", pred);
+        assert!(dbg.contains("Spatial"));
+        assert!(dbg.contains("ST_Within"));
+
+        let pred2 = Predicate::intersects::<Pos>(0.0, 0.0, 10.0, 10.0, |_, _| true);
+        let dbg2 = format!("{:?}", pred2);
+        assert!(dbg2.contains("ST_Intersects"));
+    }
+
+    #[test]
+    fn spatial_vs_btree_cheaper_spatial_wins() {
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: i as f32,
+                },
+                Score(i),
+            ));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        // Spatial predicate with very low estimated cost should win.
+        let plan = planner
+            .scan::<(&Pos, &Score)>()
+            .filter(Predicate::within::<Pos>(500.0, 500.0, 5.0, |_, _| true))
+            .filter(Predicate::range::<Score, _>(Score(400)..Score(600)))
+            .build();
+
+        // The driving access should be whichever has lower cost.
+        // Our TestGridIndex reports ~100 rows for within (0.1 * 1000),
+        // vs BTree range at 0.1 selectivity → 100 rows.
+        // The spatial cost.cpu is 5.0 vs index_lookup ~ 5.0 + 100.
+        // Spatial should win.
+        match plan.root() {
+            PlanNode::Filter { child, .. } => match child.as_ref() {
+                PlanNode::SpatialLookup { .. } => {}
+                PlanNode::Filter { child, .. } => match child.as_ref() {
+                    PlanNode::SpatialLookup { .. } => {}
+                    other => panic!("expected SpatialLookup deep, got {:?}", other),
+                },
+                other => panic!("expected SpatialLookup or Filter child, got {:?}", other),
+            },
+            PlanNode::SpatialLookup { .. } => {}
+            other => panic!("expected SpatialLookup at root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spatial_predicate_for_each_works() {
+        let mut world = World::new();
+        for i in 0..20 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        // Even without a spatial index, for_each should work via filter fallback.
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>(
+                10.0,
+                10.0,
+                100.0,
+                |world, entity| {
+                    world.get::<Pos>(entity).is_some_and(|p| {
+                        ((p.x - 10.0).powi(2) + (p.y - 10.0).powi(2)).sqrt() < 100.0
+                    })
+                },
+            ))
+            .build();
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 20); // All within radius 100
+    }
+
+    #[test]
+    fn spatial_predicate_display() {
+        let sp = SpatialPredicate::Within {
+            x: 1.0,
+            y: 2.0,
+            radius: 3.0,
+        };
+        assert_eq!(format!("{}", sp), "ST_Within((1, 2), 3)");
+
+        let sp2 = SpatialPredicate::Intersects {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 10.0,
+            max_y: 10.0,
+        };
+        assert_eq!(format!("{}", sp2), "ST_Intersects((0, 0), (10, 10))");
+    }
+
+    #[test]
+    fn spatial_predicate_to_expr_round_trip() {
+        let sp = SpatialPredicate::Within {
+            x: 1.0,
+            y: 2.0,
+            radius: 3.0,
+        };
+        let expr = sp.to_expr();
+        match expr {
+            crate::index::SpatialExpr::Within { x, y, radius } => {
+                assert!((x - 1.0).abs() < f64::EPSILON);
+                assert!((y - 2.0).abs() < f64::EPSILON);
+                assert!((radius - 3.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Within, got {:?}", other),
+        }
+
+        let sp2 = SpatialPredicate::Intersects {
+            min_x: 0.0,
+            min_y: 1.0,
+            max_x: 2.0,
+            max_y: 3.0,
+        };
+        let expr2 = sp2.to_expr();
+        match expr2 {
+            crate::index::SpatialExpr::Intersects {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            } => {
+                assert!((min_x - 0.0).abs() < f64::EPSILON);
+                assert!((min_y - 1.0).abs() < f64::EPSILON);
+                assert!((max_x - 2.0).abs() < f64::EPSILON);
+                assert!((max_y - 3.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Intersects, got {:?}", other),
+        }
     }
 }
