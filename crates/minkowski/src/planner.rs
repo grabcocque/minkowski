@@ -1457,7 +1457,14 @@ impl ScanBuilder<'_> {
 
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
-        spatial_preds.sort_by(|a, b| a.1.estimated_rows.total_cmp(&b.1.estimated_rows));
+        // Sort spatial predicates by total cost (cpu), not estimated_rows alone.
+        // A predicate with fewer rows but much higher CPU should not beat one
+        // with more rows but lower total cost.
+        spatial_preds.sort_by(|a, b| {
+            Cost::spatial_lookup(&a.1)
+                .total()
+                .total_cmp(&Cost::spatial_lookup(&b.1).total())
+        });
 
         // Collect all filter closures for compiled scan fusion.
         // Must happen before Phase 4 consumes filter_preds.
