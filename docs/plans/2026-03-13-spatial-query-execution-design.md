@@ -206,7 +206,7 @@ planner.add_spatial_index::<Pos>(grid, &world)
   └─ stores in spatial_indexes[TypeId::of::<Pos>()]
 
 planner.scan::<(&Pos,)>()
-  .filter(Predicate::within::<Pos>(50, 50, 10, distance_check))
+  .filter(Predicate::within::<Pos>([50, 50], 10, distance_check))
   .build()
   │
   ├─ Phase 1: classify predicate as Spatial

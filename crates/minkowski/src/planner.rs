@@ -219,44 +219,36 @@ pub enum IndexKind {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SpatialPredicate {
-    /// Point-radius proximity: entities within `radius` of `(x, y)`.
+    /// Proximity: entities within `radius` of `center`.
     /// Maps to `SpatialExpr::Within` for capability discovery.
+    /// Dimensionality and metric are defined by the index implementation.
     Within {
-        /// X coordinate of the query center.
-        x: f64,
-        /// Y coordinate of the query center.
-        y: f64,
-        /// Search radius.
+        /// Center coordinates (dimensionality defined by the index).
+        center: Vec<f64>,
+        /// Search radius (interpretation defined by the index).
         radius: f64,
     },
-    /// AABB intersection: entities whose spatial extent overlaps the
-    /// given rectangle. Maps to `SpatialExpr::Intersects`.
+    /// Bounding-box intersection: entities whose spatial extent overlaps
+    /// the box from `min` to `max`. Maps to `SpatialExpr::Intersects`.
+    /// Dimensionality is defined by the index implementation.
     Intersects {
-        /// Minimum X of the query rectangle.
-        min_x: f64,
-        /// Minimum Y of the query rectangle.
-        min_y: f64,
-        /// Maximum X of the query rectangle.
-        max_x: f64,
-        /// Maximum Y of the query rectangle.
-        max_y: f64,
+        /// Minimum corner coordinates.
+        min: Vec<f64>,
+        /// Maximum corner coordinates.
+        max: Vec<f64>,
     },
 }
 
 impl From<&SpatialPredicate> for SpatialExpr {
     fn from(sp: &SpatialPredicate) -> Self {
-        match *sp {
-            SpatialPredicate::Within { x, y, radius } => SpatialExpr::Within { x, y, radius },
-            SpatialPredicate::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            } => SpatialExpr::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
+        match sp {
+            SpatialPredicate::Within { center, radius } => SpatialExpr::Within {
+                center: center.clone(),
+                radius: *radius,
+            },
+            SpatialPredicate::Intersects { min, max } => SpatialExpr::Intersects {
+                min: min.clone(),
+                max: max.clone(),
             },
         }
     }
@@ -265,16 +257,11 @@ impl From<&SpatialPredicate> for SpatialExpr {
 impl fmt::Display for SpatialPredicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SpatialPredicate::Within { x, y, radius } => {
-                write!(f, "ST_Within(({x}, {y}), {radius})")
+            SpatialPredicate::Within { center, radius } => {
+                write!(f, "ST_Within({center:?}, {radius})")
             }
-            SpatialPredicate::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            } => {
-                write!(f, "ST_Intersects(({min_x}, {min_y}), ({max_x}, {max_y}))")
+            SpatialPredicate::Intersects { min, max } => {
+                write!(f, "ST_Intersects({min:?}, {max:?})")
             }
         }
     }
@@ -446,21 +433,23 @@ impl Predicate {
         }
     }
 
-    /// Spatial proximity predicate: entities within `radius` of `(x, y)`.
+    /// Spatial proximity predicate: entities within `radius` of `center`.
     ///
     /// The component type `T` identifies which column holds the spatial data.
+    /// The planner makes no assumptions about dimensionality or coordinate
+    /// system — `center` is an opaque coordinate vector whose meaning is
+    /// defined by the [`SpatialIndex`] implementation.
+    ///
     /// If a `SpatialIndex` is registered for `T` and its
     /// [`supports`](SpatialIndex::supports) method returns `Some` for this
     /// expression, the planner emits a `SpatialLookup` node. Otherwise it
     /// falls back to a scan + post-filter using the provided closure.
     ///
-    /// The default selectivity heuristic assumes a unit-square world
-    /// (`PI * r²`). For real-world coordinate systems where coordinates
-    /// are much larger than 1.0, override with
-    /// [`.with_selectivity()`](Self::with_selectivity).
+    /// The default selectivity is a conservative 0.1 (10% of entities).
+    /// Override with [`.with_selectivity()`](Self::with_selectivity) if
+    /// you know your data distribution.
     pub fn within<T: Component>(
-        x: f64,
-        y: f64,
+        center: impl Into<Vec<f64>>,
         radius: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
@@ -468,54 +457,54 @@ impl Predicate {
             radius >= 0.0 && radius.is_finite(),
             "Predicate::within: radius must be finite and non-negative, got {radius}"
         );
-        // Heuristic selectivity assuming a unit-square world. Override via
-        // .with_selectivity() for non-unit coordinate systems.
-        let selectivity =
-            sanitize_selectivity((std::f64::consts::PI * radius * radius).clamp(0.001, 1.0));
+        let center = center.into();
+        // Conservative default — override via .with_selectivity().
+        let selectivity = sanitize_selectivity(0.1);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Spatial(SpatialPredicate::Within { x, y, radius }),
+            kind: PredicateKind::Spatial(SpatialPredicate::Within { center, radius }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
         }
     }
 
-    /// Spatial AABB intersection predicate.
+    /// Spatial bounding-box intersection predicate.
     ///
     /// The component type `T` identifies which column holds the spatial data.
+    /// The planner makes no assumptions about dimensionality or coordinate
+    /// system — `min` and `max` are opaque coordinate vectors whose meaning
+    /// is defined by the [`SpatialIndex`] implementation.
+    ///
     /// If a `SpatialIndex` is registered for `T` and its
     /// [`supports`](SpatialIndex::supports) method returns `Some` for this
     /// expression, the planner emits a `SpatialLookup` node. Otherwise it
     /// falls back to a scan + post-filter using the provided closure.
     ///
-    /// The default selectivity heuristic uses the AABB area, assuming a
-    /// unit-square world. For real-world coordinate systems, override with
-    /// [`.with_selectivity()`](Self::with_selectivity).
+    /// The default selectivity is a conservative 0.1 (10% of entities).
+    /// Override with [`.with_selectivity()`](Self::with_selectivity) if
+    /// you know your data distribution.
     pub fn intersects<T: Component>(
-        min_x: f64,
-        min_y: f64,
-        max_x: f64,
-        max_y: f64,
+        min: impl Into<Vec<f64>>,
+        max: impl Into<Vec<f64>>,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
+        let min = min.into();
+        let max = max.into();
         debug_assert!(
-            min_x <= max_x && min_y <= max_y,
-            "Predicate::intersects: inverted AABB (min must be <= max), \
-             got ({min_x},{min_y})->({max_x},{max_y})"
+            min.len() == max.len(),
+            "Predicate::intersects: min and max must have the same dimensionality, \
+             got {} vs {}",
+            min.len(),
+            max.len()
         );
-        let area = (max_x - min_x) * (max_y - min_y);
-        let selectivity = sanitize_selectivity(area.clamp(0.001, 1.0));
+        // Conservative default — override via .with_selectivity().
+        let selectivity = sanitize_selectivity(0.1);
         Predicate {
             component_type: TypeId::of::<T>(),
             component_name: std::any::type_name::<T>(),
-            kind: PredicateKind::Spatial(SpatialPredicate::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            }),
+            kind: PredicateKind::Spatial(SpatialPredicate::Intersects { min, max }),
             selectivity,
             filter_fn: Some(Arc::new(filter)),
             lookup_value: None,
@@ -1563,15 +1552,33 @@ impl ScanBuilder<'_> {
         // driving access. Remaining predicates become post-filters.
         let mut node: PlanNode;
 
-        // Determine driving access: compare best spatial vs best BTree/Hash.
-        let best_spatial_cost = spatial_preds
-            .first()
-            .map(|(_, sc)| Cost::spatial_lookup(sc).total());
-        let best_index_cost = index_preds
-            .first()
-            .map(|(p, _)| Cost::index_lookup(p.selectivity, self.estimated_rows).total());
+        // Determine driving access: compare full candidate plan costs
+        // including downstream filters, not just the driving access alone.
+        // A spatial index with high estimated_rows but low CPU can still lose
+        // to a selective BTree if the BTree's post-filter cost is lower overall.
+        let spatial_plan_cost = spatial_preds.first().map(|(_, first_sc)| {
+            let mut cost = Cost::spatial_lookup(first_sc);
+            for (pred, _) in spatial_preds.iter().skip(1) {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            for (pred, _) in &index_preds {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            cost.total()
+        });
 
-        let use_spatial_driver = match (best_spatial_cost, best_index_cost) {
+        let index_plan_cost = index_preds.first().map(|(first_pred, _)| {
+            let mut cost = Cost::index_lookup(first_pred.selectivity, self.estimated_rows);
+            for (pred, _) in index_preds.iter().skip(1) {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            for (pred, _) in &spatial_preds {
+                cost = Cost::filter(cost, pred.selectivity);
+            }
+            cost.total()
+        });
+
+        let use_spatial_driver = match (spatial_plan_cost, index_plan_cost) {
             (Some(sc), Some(ic)) => sc <= ic,
             (Some(_), None) => true,
             _ => false,
@@ -5439,7 +5446,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         // The root of the logical plan should be a SpatialLookup.
@@ -5478,10 +5485,8 @@ mod tests {
         let plan = planner
             .scan::<(&Pos,)>()
             .filter(Predicate::intersects::<Pos>(
-                0.0,
-                0.0,
-                25.0,
-                25.0,
+                [0.0, 0.0],
+                [25.0, 25.0],
                 |_, _| true,
             ))
             .build();
@@ -5505,7 +5510,7 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         // Without a spatial index, should fall back to Scan + Filter.
@@ -5543,7 +5548,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         // Index exists but doesn't support Within — should fall back.
@@ -5585,7 +5590,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         match plan.vec_root() {
@@ -5614,7 +5619,7 @@ mod tests {
 
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 10.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 10.0, |_, _| true))
             .build();
 
         let explain = plan.explain();
@@ -5627,7 +5632,7 @@ mod tests {
 
     #[test]
     fn spatial_predicate_with_custom_selectivity() {
-        let pred = Predicate::within::<Pos>(0.0, 0.0, 1.0, |_, _| true).with_selectivity(0.05);
+        let pred = Predicate::within::<Pos>([0.0, 0.0], 1.0, |_, _| true).with_selectivity(0.05);
 
         // Selectivity override should work.
         match &pred.kind {
@@ -5641,12 +5646,12 @@ mod tests {
 
     #[test]
     fn spatial_predicate_debug_format() {
-        let pred = Predicate::within::<Pos>(1.0, 2.0, 3.0, |_, _| true);
+        let pred = Predicate::within::<Pos>([1.0, 2.0], 3.0, |_, _| true);
         let dbg = format!("{:?}", pred);
         assert!(dbg.contains("Spatial"));
         assert!(dbg.contains("ST_Within"));
 
-        let pred2 = Predicate::intersects::<Pos>(0.0, 0.0, 10.0, 10.0, |_, _| true);
+        let pred2 = Predicate::intersects::<Pos>([0.0, 0.0], [10.0, 10.0], |_, _| true);
         let dbg2 = format!("{:?}", pred2);
         assert!(dbg2.contains("ST_Intersects"));
     }
@@ -5677,7 +5682,7 @@ mod tests {
         // Spatial predicate with very low estimated cost should win.
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>(500.0, 500.0, 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
             .filter(Predicate::range::<Score, _>(Score(400)..Score(600)))
             .build();
 
@@ -5715,8 +5720,7 @@ mod tests {
         let mut plan = planner
             .scan::<(&Pos,)>()
             .filter(Predicate::within::<Pos>(
-                10.0,
-                10.0,
+                [10.0, 10.0],
                 100.0,
                 |world, entity| {
                     world.get::<Pos>(entity).is_some_and(|p| {
@@ -5734,56 +5738,45 @@ mod tests {
     #[test]
     fn spatial_predicate_display() {
         let sp = SpatialPredicate::Within {
-            x: 1.0,
-            y: 2.0,
+            center: vec![1.0, 2.0],
             radius: 3.0,
         };
-        assert_eq!(format!("{}", sp), "ST_Within((1, 2), 3)");
+        assert_eq!(format!("{}", sp), "ST_Within([1.0, 2.0], 3)");
 
         let sp2 = SpatialPredicate::Intersects {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 10.0,
-            max_y: 10.0,
+            min: vec![0.0, 0.0],
+            max: vec![10.0, 10.0],
         };
-        assert_eq!(format!("{}", sp2), "ST_Intersects((0, 0), (10, 10))");
+        assert_eq!(
+            format!("{}", sp2),
+            "ST_Intersects([0.0, 0.0], [10.0, 10.0])"
+        );
     }
 
     #[test]
     fn spatial_predicate_to_expr_round_trip() {
         let sp = SpatialPredicate::Within {
-            x: 1.0,
-            y: 2.0,
+            center: vec![1.0, 2.0],
             radius: 3.0,
         };
         let expr = crate::index::SpatialExpr::from(&sp);
-        match expr {
-            crate::index::SpatialExpr::Within { x, y, radius } => {
-                assert!((x - 1.0).abs() < f64::EPSILON);
-                assert!((y - 2.0).abs() < f64::EPSILON);
+        match &expr {
+            crate::index::SpatialExpr::Within { center, radius } => {
+                assert_eq!(center, &[1.0, 2.0]);
                 assert!((radius - 3.0).abs() < f64::EPSILON);
             }
             other => panic!("expected Within, got {:?}", other),
         }
 
         let sp2 = SpatialPredicate::Intersects {
-            min_x: 0.0,
-            min_y: 1.0,
-            max_x: 2.0,
-            max_y: 3.0,
+            min: vec![0.0, 1.0],
+            max: vec![2.0, 3.0],
         };
         let expr2 = crate::index::SpatialExpr::from(&sp2);
-        match expr2 {
-            crate::index::SpatialExpr::Intersects {
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-            } => {
-                assert!((min_x - 0.0).abs() < f64::EPSILON);
-                assert!((min_y - 1.0).abs() < f64::EPSILON);
-                assert!((max_x - 2.0).abs() < f64::EPSILON);
-                assert!((max_y - 3.0).abs() < f64::EPSILON);
+        match &expr2 {
+            crate::index::SpatialExpr::Intersects { min, max } => {
+                assert_eq!(min, &[0.0, 1.0]);
+                assert_eq!(max, &[2.0, 3.0]);
             }
             other => panic!("expected Intersects, got {:?}", other),
         }
@@ -5832,7 +5825,7 @@ mod tests {
         // Spatial index reports cpu=500. BTree should win.
         let plan = planner
             .scan::<(&Pos, &Score)>()
-            .filter(Predicate::within::<Pos>(500.0, 500.0, 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
             .filter(Predicate::eq::<Score>(Score(42)))
             .build();
 
@@ -5891,7 +5884,7 @@ mod tests {
         // Within should get a SpatialLookup.
         let within_plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(25.0, 25.0, 5.0, |_, _| true))
+            .filter(Predicate::within::<Pos>([25.0, 25.0], 5.0, |_, _| true))
             .build();
         assert!(
             matches!(within_plan.root(), PlanNode::SpatialLookup { .. }),
@@ -5904,10 +5897,8 @@ mod tests {
         let intersects_plan = planner
             .scan::<(&Pos,)>()
             .filter(Predicate::intersects::<Pos>(
-                0.0,
-                0.0,
-                10.0,
-                10.0,
+                [0.0, 0.0],
+                [10.0, 10.0],
                 |_, _| true,
             ))
             .build();
@@ -5946,10 +5937,12 @@ mod tests {
         // Two spatial predicates on the same component.
         let plan = planner
             .scan::<(&Pos,)>()
-            .filter(Predicate::within::<Pos>(50.0, 50.0, 5.0, |_, _| true))
-            .filter(Predicate::intersects::<Pos>(0.0, 0.0, 0.5, 0.5, |_, _| {
-                true
-            }))
+            .filter(Predicate::within::<Pos>([50.0, 50.0], 5.0, |_, _| true))
+            .filter(Predicate::intersects::<Pos>(
+                [0.0, 0.0],
+                [0.5, 0.5],
+                |_, _| true,
+            ))
             .build();
 
         // One should be the driver (SpatialLookup), the other a Filter.
@@ -5975,5 +5968,73 @@ mod tests {
             "expected at least one Filter wrapping the SpatialLookup"
         );
         assert!(plan.warnings().is_empty());
+    }
+
+    /// Spatial index with low CPU but high estimated_rows.
+    /// Used to test that full plan cost (including downstream filters)
+    /// determines the driver, not just the driving access cost alone.
+    struct HighRowsSpatialIndex;
+
+    impl SpatialIndex for HighRowsSpatialIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+
+        fn supports(&self, expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            match expr {
+                crate::index::SpatialExpr::Within { .. } => Some(crate::index::SpatialCost {
+                    // Low CPU but returns most of the dataset — downstream
+                    // filters over 900 rows are expensive.
+                    estimated_rows: 900.0,
+                    cpu: 3.0,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_low_cpu_high_rows_loses_to_selective_btree() {
+        // Regression: spatial index with cpu=3 but estimated_rows=900
+        // vs BTree with selectivity=0.01 (10 rows from 1000).
+        // Driving access costs alone: spatial=3, btree=5+10=15 → spatial wins.
+        // But full plan cost: spatial driver + btree-as-filter over 900 rows
+        // is more expensive than btree driver + spatial-as-filter over 10 rows.
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((
+                Pos {
+                    x: i as f32,
+                    y: i as f32,
+                },
+                Score(i),
+            ));
+        }
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(HighRowsSpatialIndex), &world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        let plan = planner
+            .scan::<(&Pos, &Score)>()
+            .filter(Predicate::within::<Pos>([500.0, 500.0], 5.0, |_, _| true))
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        // BTree should win as driver because the full plan cost is lower:
+        // btree(10 rows) + spatial-as-filter(10 * 0.5) < spatial(900 rows) + btree-as-filter(900 * 0.5)
+        fn has_index_lookup(node: &PlanNode) -> bool {
+            match node {
+                PlanNode::IndexLookup { .. } => true,
+                PlanNode::Filter { child, .. } => has_index_lookup(child),
+                _ => false,
+            }
+        }
+        assert!(
+            has_index_lookup(plan.root()),
+            "expected IndexLookup as driver when BTree full plan cost is lower, got {:?}",
+            plan.root()
+        );
     }
 }
