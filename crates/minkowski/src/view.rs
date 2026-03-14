@@ -213,7 +213,11 @@ impl MaterializedView {
         self.cached.is_empty()
     }
 
-    /// Returns `true` if the view has been refreshed at least once.
+    /// Returns `true` if the view has up-to-date data from a successful
+    /// refresh. Returns `false` before the first refresh and after
+    /// [`invalidate`](Self::invalidate). Note: `entities()` may still
+    /// return the previous snapshot after invalidation — the cache is
+    /// not cleared until the next `refresh()` call.
     #[inline]
     pub fn is_populated(&self) -> bool {
         self.populated
