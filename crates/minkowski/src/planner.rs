@@ -92,9 +92,10 @@ use std::ops::{Bound, RangeBounds};
 
 use fixedbitset::FixedBitSet;
 
-use crate::component::{Component, ComponentRegistry};
+use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::index::{BTreeIndex, HashIndex, SpatialCost, SpatialExpr, SpatialIndex};
+use crate::storage::archetype::Archetype;
 use crate::tick::Tick;
 // Use std Arc directly — the planner has no concurrent code, so it does not
 // need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
@@ -308,6 +309,92 @@ impl fmt::Display for AggregateOp {
 /// the entity does not have the component.
 type ValueExtractor = Arc<dyn Fn(&World, Entity) -> Option<f64> + Send + Sync>;
 
+// ── Batch aggregate infrastructure ──────────────────────────────────
+//
+// Chunk-at-a-time processing for aggregates. Instead of calling
+// `world.get::<T>(entity)` per row (which resolves location → archetype
+// → column on every call), we resolve the column pointer once per
+// archetype and process all rows as a typed slice.
+
+/// Chunk-at-a-time aggregate processor. The vtable dispatch happens at the
+/// archetype boundary (once per archetype), not per row. The inner
+/// `process_all` / `process_rows` loops are monomorphized and
+/// auto-vectorizable.
+pub(crate) trait BatchExtractor: Send {
+    /// Resolve column pointer for this archetype. Returns `false` if the
+    /// component is absent.
+    fn bind_archetype(&mut self, archetype: &Archetype) -> bool;
+
+    /// Process all rows in the currently-bound archetype as a contiguous
+    /// `&[T]` slice. Caller guarantees `bind_archetype` returned `true`
+    /// and `count == archetype.len()`.
+    fn process_all(&mut self, count: usize, accum: &mut AggregateAccum);
+
+    /// Process specific rows (for index-gather paths where entities may
+    /// not be contiguous within the archetype).
+    fn process_rows(&mut self, rows: &[usize], accum: &mut AggregateAccum);
+}
+
+/// Concrete batch extractor for component type `T` with extraction
+/// function `F`. The inner loop over `&[T]` is fully monomorphized —
+/// LLVM can inline `F` and auto-vectorize.
+struct TypedBatch<T, F> {
+    extract: F,
+    comp_id: ComponentId,
+    /// Base pointer to the column data, set by `bind_archetype`.
+    col_ptr: *const T,
+}
+
+// SAFETY: TypedBatch is Send because:
+// - `F` is Send (required by BatchExtractor: Send)
+// - `comp_id` is Copy
+// - `col_ptr` is derived from BlobVec data in archetypes whose components
+//   are Send+Sync (Component: Send+Sync). The pointer is only valid during
+//   process_all/process_rows which execute within a &World borrow scope.
+unsafe impl<T: Send, F: Send> Send for TypedBatch<T, F> {}
+
+impl<T: Component, F: Fn(&T) -> f64 + Send> BatchExtractor for TypedBatch<T, F> {
+    fn bind_archetype(&mut self, archetype: &Archetype) -> bool {
+        let Some(col_idx) = archetype.column_index(self.comp_id) else {
+            return false;
+        };
+        // SAFETY: BlobVec stores T-layout data at 64-byte-aligned base.
+        // column_index guarantees comp_id matches this column. The archetype
+        // is borrowed for the duration of the aggregate scan (&World).
+        self.col_ptr = unsafe { archetype.columns[col_idx].get_ptr(0) as *const T };
+        true
+    }
+
+    fn process_all(&mut self, count: usize, accum: &mut AggregateAccum) {
+        // SAFETY: bind_archetype set col_ptr; count == archetype.len().
+        // BlobVec guarantees contiguous layout for `count` elements.
+        let slice = unsafe { std::slice::from_raw_parts(self.col_ptr, count) };
+        for item in slice {
+            accum.feed((self.extract)(item));
+        }
+    }
+
+    fn process_rows(&mut self, rows: &[usize], accum: &mut AggregateAccum) {
+        for &row in rows {
+            // SAFETY: row is a valid index within the bound archetype
+            // (validated by gather_index_batched before calling).
+            let item = unsafe { &*self.col_ptr.add(row) };
+            accum.feed((self.extract)(item));
+        }
+    }
+}
+
+/// Factory that produces fresh `Box<dyn BatchExtractor>` instances.
+/// Created at `ScanBuilder::build()` time when `ComponentId` is resolved.
+/// Called once per `execute_aggregates` invocation.
+type BatchFactory = Box<dyn Fn() -> Box<dyn BatchExtractor> + Send + Sync>;
+
+/// Builder that captures the typed closure and produces a `BatchFactory`
+/// once the `ComponentId` is known. Stored on `AggregateExpr` between
+/// construction and `build()`.
+type BatchFactoryBuilder =
+    Box<dyn FnOnce(&ComponentRegistry) -> Option<BatchFactory> + Send + Sync>;
+
 /// A single aggregate expression: an operation applied to values extracted
 /// from matched entities.
 ///
@@ -334,7 +421,16 @@ pub struct AggregateExpr {
     /// `"MAX(name)"`, `"AVG(name)"` where `name` is the user-supplied label.
     label: String,
     /// Extracts a `f64` value from an entity. `None` for `Count`.
+    /// Kept as fallback for join plans where batch extraction isn't possible.
     extractor: Option<ValueExtractor>,
+    /// Deferred factory builder: captures the typed closure + TypeId, produces
+    /// a `BatchFactory` once `ComponentId` is resolved at `build()` time.
+    /// `None` for `Count` (no component access needed).
+    batch_factory_builder: Option<BatchFactoryBuilder>,
+    /// Finalized batch factory, set by `ScanBuilder::build()`. Each call
+    /// produces a fresh `Box<dyn BatchExtractor>` with its own column pointer
+    /// binding.
+    batch_factory: Option<BatchFactory>,
 }
 
 impl AggregateExpr {
@@ -344,6 +440,8 @@ impl AggregateExpr {
             op: AggregateOp::Count,
             label: "COUNT(*)".to_string(),
             extractor: None,
+            batch_factory_builder: None,
+            batch_factory: None,
         }
     }
 
@@ -356,10 +454,13 @@ impl AggregateExpr {
         extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
     ) -> Self {
         let label = format!("SUM({name})");
+        let (extractor, builder) = make_extractor::<T>(extract);
         Self {
             op: AggregateOp::Sum,
             label,
-            extractor: Some(make_extractor::<T>(extract)),
+            extractor: Some(extractor),
+            batch_factory_builder: Some(builder),
+            batch_factory: None,
         }
     }
 
@@ -369,10 +470,13 @@ impl AggregateExpr {
         extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
     ) -> Self {
         let label = format!("MIN({name})");
+        let (extractor, builder) = make_extractor::<T>(extract);
         Self {
             op: AggregateOp::Min,
             label,
-            extractor: Some(make_extractor::<T>(extract)),
+            extractor: Some(extractor),
+            batch_factory_builder: Some(builder),
+            batch_factory: None,
         }
     }
 
@@ -382,10 +486,13 @@ impl AggregateExpr {
         extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
     ) -> Self {
         let label = format!("MAX({name})");
+        let (extractor, builder) = make_extractor::<T>(extract);
         Self {
             op: AggregateOp::Max,
             label,
-            extractor: Some(make_extractor::<T>(extract)),
+            extractor: Some(extractor),
+            batch_factory_builder: Some(builder),
+            batch_factory: None,
         }
     }
 
@@ -395,10 +502,13 @@ impl AggregateExpr {
         extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
     ) -> Self {
         let label = format!("AVG({name})");
+        let (extractor, builder) = make_extractor::<T>(extract);
         Self {
             op: AggregateOp::Avg,
             label,
-            extractor: Some(make_extractor::<T>(extract)),
+            extractor: Some(extractor),
+            batch_factory_builder: Some(builder),
+            batch_factory: None,
         }
     }
 
@@ -422,11 +532,37 @@ impl fmt::Debug for AggregateExpr {
     }
 }
 
-/// Build a type-erased value extractor from a typed extraction closure.
+/// Build a type-erased value extractor and a deferred batch factory builder.
+///
+/// The `ValueExtractor` is the per-entity fallback (used for join plans).
+/// The `BatchFactoryBuilder` captures the typed closure and defers
+/// `ComponentId` resolution to `ScanBuilder::build()`.
 fn make_extractor<T: Component>(
     extract: impl Fn(&T) -> f64 + Send + Sync + 'static,
-) -> ValueExtractor {
-    Arc::new(move |world: &World, entity: Entity| world.get::<T>(entity).map(&extract))
+) -> (ValueExtractor, BatchFactoryBuilder) {
+    // Wrap in Arc so the factory can clone it without requiring Clone on
+    // the user's closure (preserves the existing public API bounds).
+    let extract = Arc::new(extract);
+
+    let value_extractor: ValueExtractor = {
+        let extract = Arc::clone(&extract);
+        Arc::new(move |world: &World, entity: Entity| world.get::<T>(entity).map(|v| extract(v)))
+    };
+
+    let builder: BatchFactoryBuilder = Box::new(move |registry: &ComponentRegistry| {
+        let comp_id = registry.id::<T>()?;
+        let extract = Arc::clone(&extract);
+        Some(Box::new(move || -> Box<dyn BatchExtractor> {
+            let extract = Arc::clone(&extract);
+            Box::new(TypedBatch {
+                extract: move |item: &T| extract(item),
+                comp_id,
+                col_ptr: std::ptr::null(),
+            })
+        }))
+    });
+
+    (value_extractor, builder)
 }
 
 /// Accumulator state for computing aggregates during plan execution.
@@ -1234,6 +1370,10 @@ pub struct QueryPlanResult {
     world_id: WorldId,
     /// Aggregate expressions for `execute_aggregates()`. Empty if no aggregates.
     aggregate_exprs: Vec<AggregateExpr>,
+    /// Compiled batch aggregate scan (for `execute_aggregates`).
+    compiled_agg_scan: Option<CompiledAggScan>,
+    /// Compiled batch aggregate scan for raw path (for `execute_aggregates_raw`).
+    compiled_agg_scan_raw: Option<CompiledAggScan>,
 }
 
 impl QueryPlanResult {
@@ -1455,17 +1595,24 @@ impl QueryPlanResult {
             .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
             .collect();
 
-        // Clone extractors for use in the closure (Arc clone = ref-count bump).
-        let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
-            .aggregate_exprs
-            .iter()
-            .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
-            .collect();
-
         let tick = self.last_read_tick;
 
-        // Use the compiled scan path (handles all driver types: spatial, index, archetype).
-        if let Some(compiled) = &mut self.compiled_for_each {
+        // Fast path: batch aggregate scan (chunk-at-a-time, no per-entity world.get).
+        if let Some(compiled) = &mut self.compiled_agg_scan {
+            let mut extractors: Vec<Option<Box<dyn BatchExtractor>>> = self
+                .aggregate_exprs
+                .iter()
+                .map(|expr| expr.batch_factory.as_ref().map(|f| f()))
+                .collect();
+            compiled(&*world, tick, &mut extractors, &mut accums);
+        } else if let Some(compiled) = &mut self.compiled_for_each {
+            // Fallback: per-entity extraction (used for join plans or when
+            // batch factories are unavailable).
+            let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
+                .aggregate_exprs
+                .iter()
+                .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
+                .collect();
             compiled(&*world, tick, &mut |entity: Entity| {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
@@ -1478,7 +1625,12 @@ impl QueryPlanResult {
                 }
             });
         } else if let Some(join) = &mut self.join_exec {
-            // For join plans, collect entities first then aggregate.
+            // Join plans: collect entities first then aggregate per-entity.
+            let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
+                .aggregate_exprs
+                .iter()
+                .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
+                .collect();
             let scratch = self
                 .scratch
                 .as_mut()
@@ -1556,15 +1708,23 @@ impl QueryPlanResult {
             .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
             .collect();
 
-        let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
-            .aggregate_exprs
-            .iter()
-            .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
-            .collect();
-
         let tick = self.last_read_tick;
 
-        if let Some(compiled) = &mut self.compiled_for_each_raw {
+        // Fast path: batch aggregate scan.
+        if let Some(compiled) = &mut self.compiled_agg_scan_raw {
+            let mut extractors: Vec<Option<Box<dyn BatchExtractor>>> = self
+                .aggregate_exprs
+                .iter()
+                .map(|expr| expr.batch_factory.as_ref().map(|f| f()))
+                .collect();
+            compiled(world, tick, &mut extractors, &mut accums);
+        } else if let Some(compiled) = &mut self.compiled_for_each_raw {
+            // Fallback: per-entity extraction.
+            let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
+                .aggregate_exprs
+                .iter()
+                .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
+                .collect();
             compiled(world, tick, &mut |entity: Entity| {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
@@ -1577,7 +1737,12 @@ impl QueryPlanResult {
                 }
             });
         } else if let Some(join) = &mut self.join_exec {
-            // Join path: collect entities then aggregate (same as execute_aggregates).
+            // Join path: collect entities then aggregate per-entity.
+            let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
+                .aggregate_exprs
+                .iter()
+                .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
+                .collect();
             let scratch = self
                 .scratch
                 .as_mut()
@@ -1666,6 +1831,11 @@ impl fmt::Debug for QueryPlanResult {
             .field("last_read_tick", &self.last_read_tick)
             .field("world_id", &self.world_id)
             .field("aggregate_count", &self.aggregate_exprs.len())
+            .field("has_compiled_agg_scan", &self.compiled_agg_scan.is_some())
+            .field(
+                "has_compiled_agg_scan_raw",
+                &self.compiled_agg_scan_raw.is_some(),
+            )
             .finish()
     }
 }
@@ -1954,6 +2124,11 @@ type CompiledForEach = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 /// not advance it — repeated calls see the same change window.
 type CompiledForEachRaw = Box<dyn FnMut(&World, Tick, &mut dyn FnMut(Entity))>;
 
+/// Compiled aggregate scan: iterates matching archetypes/index results and
+/// calls batch extractors directly. Bypasses per-entity callbacks entirely.
+type CompiledAggScan =
+    Box<dyn FnMut(&World, Tick, &mut [Option<Box<dyn BatchExtractor>>], &mut [AggregateAccum])>;
+
 /// Type-erased index lookup function: return matching entities from the index.
 /// Returns `Arc<[Entity]>` to avoid cloning the entity list on every call —
 /// callers that need mutation (filter, sort) pay the allocation cost only when
@@ -2055,6 +2230,94 @@ fn gather_index_candidates(
         }
         if filters.is_empty() || filters.iter().all(|f| f(world, entity)) {
             emit(entity);
+        }
+    }
+}
+
+/// Batched index-gather for aggregate execution. Groups validated candidates
+/// by archetype and calls batch extractors per archetype run.
+///
+/// Uses the same 1-element archetype cache as `gather_index_candidates`.
+/// When the archetype changes (or at the end), the accumulated row buffer
+/// is flushed through `process_rows` on each extractor.
+#[inline]
+fn gather_index_batched(
+    world: &World,
+    candidates: &[Entity],
+    required: &FixedBitSet,
+    changed: &FixedBitSet,
+    tick: Tick,
+    filters: &[FilterFn],
+    extractors: &mut [Option<Box<dyn BatchExtractor>>],
+    accums: &mut [AggregateAccum],
+) {
+    let mut cached_arch: Option<(usize, bool)> = None;
+    let has_changed = !changed.is_clear();
+    // Row buffer for the current archetype run.
+    let mut row_buf: Vec<usize> = Vec::new();
+    let mut current_arch_idx: Option<usize> = None;
+
+    for &entity in candidates {
+        let Some(loc) = world.validate_entity(entity) else {
+            continue;
+        };
+        let arch_idx = loc.archetype_id.0;
+
+        let arch_ok = match cached_arch {
+            Some((cached_id, ok)) if cached_id == arch_idx => ok,
+            _ => {
+                let arch = &world.archetypes.archetypes[arch_idx];
+                let ok = required.is_subset(&arch.component_ids)
+                    && (!has_changed || passes_change_filter(arch, changed, tick));
+                cached_arch = Some((arch_idx, ok));
+                ok
+            }
+        };
+
+        if !arch_ok {
+            continue;
+        }
+        if !filters.is_empty() && !filters.iter().all(|f| f(world, entity)) {
+            continue;
+        }
+
+        // Archetype changed — flush accumulated rows.
+        if current_arch_idx != Some(arch_idx) {
+            if !row_buf.is_empty() {
+                flush_row_batch(extractors, accums, &row_buf);
+                row_buf.clear();
+            }
+            current_arch_idx = Some(arch_idx);
+            let arch = &world.archetypes.archetypes[arch_idx];
+            for (ext, accum) in extractors.iter_mut().zip(accums.iter()) {
+                if accum.op != AggregateOp::Count
+                    && let Some(e) = ext
+                {
+                    e.bind_archetype(arch);
+                }
+            }
+        }
+        row_buf.push(loc.row);
+    }
+
+    // Flush final batch.
+    if !row_buf.is_empty() {
+        flush_row_batch(extractors, accums, &row_buf);
+    }
+}
+
+/// Flush a row buffer through batch extractors and accumulators.
+#[inline]
+fn flush_row_batch(
+    extractors: &mut [Option<Box<dyn BatchExtractor>>],
+    accums: &mut [AggregateAccum],
+    rows: &[usize],
+) {
+    for (accum, ext) in accums.iter_mut().zip(extractors.iter_mut()) {
+        if accum.op == AggregateOp::Count {
+            accum.count += rows.len() as u64;
+        } else if let Some(e) = ext {
+            e.process_rows(rows, accum);
         }
     }
 }
@@ -2632,17 +2895,27 @@ impl ScanBuilder<'_> {
         // Clone filter fns for the raw variant (Arc clone is a ref-count bump).
         let all_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
 
-        // Take the required and changed bitsets; clone for the raw variant and
-        // for the index-driver path (spatial and index branches each move their
-        // own copy into their closure, so we prepare four copies up front).
+        // Take the required and changed bitsets; clone for the raw variant,
+        // the index-driver path, and the aggregate batch path.
         let required_for_index = self.required_for_spatial.take().unwrap_or_default();
         let required_for_index_idx = required_for_index.clone();
         let required_for_index_raw = required_for_index.clone();
         let required_for_index_idx_raw = required_for_index.clone();
+        let required_for_agg = required_for_index.clone();
+        let required_for_agg_raw = required_for_index.clone();
         let changed_for_index = self.changed_for_spatial.take().unwrap_or_default();
         let changed_for_index_idx = changed_for_index.clone();
         let changed_for_index_raw = changed_for_index.clone();
         let changed_for_index_idx_raw = changed_for_index.clone();
+        let changed_for_agg = changed_for_index.clone();
+        let changed_for_agg_raw = changed_for_index.clone();
+        // Clone filter fns for aggregate batch paths.
+        let agg_filter_fns: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
+        let agg_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
+
+        // Stash flags before the factories are consumed by .map().
+        let has_scan_factory = self.compile_for_each.is_some();
+        let has_scan_factory_raw = self.compile_for_each_raw.is_some();
 
         let compiled_for_each = if self.joins.is_empty() {
             if let Some(ref driver) = spatial_driver {
@@ -2774,7 +3047,205 @@ impl ScanBuilder<'_> {
             None
         };
 
-        // Phase 9: Wrap with aggregate node if aggregates are present.
+        // Phase 8b: Compile batch aggregate scan closures.
+        //
+        // These bypass the entity-callback pattern entirely — they iterate
+        // archetypes or index results and call batch extractors directly.
+        let compiled_agg_scan: Option<CompiledAggScan> = if self.joins.is_empty() {
+            if let Some(ref driver) = spatial_driver {
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let required = required_for_agg;
+                let changed = changed_for_agg;
+                let filters = agg_filter_fns;
+                Some(Box::new(
+                    move |world: &World,
+                          tick: Tick,
+                          extractors: &mut [Option<Box<dyn BatchExtractor>>],
+                          accums: &mut [AggregateAccum]| {
+                        let candidates = lookup_fn(&expr);
+                        gather_index_batched(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &filters,
+                            extractors,
+                            accums,
+                        );
+                    },
+                ))
+            } else if let Some(ref driver) = index_driver {
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let required = required_for_agg;
+                let changed = changed_for_agg;
+                let filters = agg_filter_fns;
+                Some(Box::new(
+                    move |world: &World,
+                          tick: Tick,
+                          extractors: &mut [Option<Box<dyn BatchExtractor>>],
+                          accums: &mut [AggregateAccum]| {
+                        let candidates = lookup_fn();
+                        gather_index_batched(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &filters,
+                            extractors,
+                            accums,
+                        );
+                    },
+                ))
+            } else {
+                // Archetype scan: use batch path only when no post-filters.
+                // When filters exist, fall through to compiled_for_each per-entity
+                // path (filters require per-entity evaluation which defeats batching).
+                if has_scan_factory && agg_filter_fns.is_empty() {
+                    let required = required_for_agg;
+                    let changed = changed_for_agg;
+                    Some(Box::new(
+                        move |world: &World,
+                              tick: Tick,
+                              extractors: &mut [Option<Box<dyn BatchExtractor>>],
+                              accums: &mut [AggregateAccum]| {
+                            for arch in &world.archetypes.archetypes {
+                                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                                    continue;
+                                }
+                                if !passes_change_filter(arch, &changed, tick) {
+                                    continue;
+                                }
+                                // Bind all extractors to this archetype.
+                                for (ext, accum) in extractors.iter_mut().zip(accums.iter()) {
+                                    if accum.op != AggregateOp::Count
+                                        && let Some(e) = ext
+                                    {
+                                        e.bind_archetype(arch);
+                                    }
+                                }
+                                let count = arch.len();
+                                for (accum, ext) in accums.iter_mut().zip(extractors.iter_mut()) {
+                                    if accum.op == AggregateOp::Count {
+                                        accum.count += count as u64;
+                                    } else if let Some(e) = ext {
+                                        e.process_all(count, accum);
+                                    }
+                                }
+                            }
+                        },
+                    ) as CompiledAggScan)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let compiled_agg_scan_raw: Option<CompiledAggScan> = if self.joins.is_empty() {
+            if let Some(ref driver) = spatial_driver {
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let required = required_for_agg_raw;
+                let changed = changed_for_agg_raw;
+                let filters = agg_filter_fns_raw;
+                Some(Box::new(
+                    move |world: &World,
+                          tick: Tick,
+                          extractors: &mut [Option<Box<dyn BatchExtractor>>],
+                          accums: &mut [AggregateAccum]| {
+                        let candidates = lookup_fn(&expr);
+                        gather_index_batched(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &filters,
+                            extractors,
+                            accums,
+                        );
+                    },
+                ))
+            } else if let Some(ref driver) = index_driver {
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let required = required_for_agg_raw;
+                let changed = changed_for_agg_raw;
+                let filters = agg_filter_fns_raw;
+                Some(Box::new(
+                    move |world: &World,
+                          tick: Tick,
+                          extractors: &mut [Option<Box<dyn BatchExtractor>>],
+                          accums: &mut [AggregateAccum]| {
+                        let candidates = lookup_fn();
+                        gather_index_batched(
+                            world,
+                            &candidates,
+                            &required,
+                            &changed,
+                            tick,
+                            &filters,
+                            extractors,
+                            accums,
+                        );
+                    },
+                ))
+            } else {
+                // Archetype scan for raw path: batch only without filters.
+                if has_scan_factory_raw && agg_filter_fns_raw.is_empty() {
+                    let required = required_for_agg_raw;
+                    let changed = changed_for_agg_raw;
+                    Some(Box::new(
+                        move |world: &World,
+                              tick: Tick,
+                              extractors: &mut [Option<Box<dyn BatchExtractor>>],
+                              accums: &mut [AggregateAccum]| {
+                            for arch in &world.archetypes.archetypes {
+                                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                                    continue;
+                                }
+                                if !passes_change_filter(arch, &changed, tick) {
+                                    continue;
+                                }
+                                for (ext, accum) in extractors.iter_mut().zip(accums.iter()) {
+                                    if accum.op != AggregateOp::Count
+                                        && let Some(e) = ext
+                                    {
+                                        e.bind_archetype(arch);
+                                    }
+                                }
+                                let count = arch.len();
+                                for (accum, ext) in accums.iter_mut().zip(extractors.iter_mut()) {
+                                    if accum.op == AggregateOp::Count {
+                                        accum.count += count as u64;
+                                    } else if let Some(e) = ext {
+                                        e.process_all(count, accum);
+                                    }
+                                }
+                            }
+                        },
+                    ) as CompiledAggScan)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Phase 9a: Resolve batch factory builders → batch factories.
+        // This is the deferred ComponentId resolution: AggregateExpr constructors
+        // capture TypeId, and here we resolve to ComponentId via the registry.
+        for expr in &mut self.aggregates {
+            if let Some(builder) = expr.batch_factory_builder.take() {
+                expr.batch_factory = builder(self.planner.components);
+            }
+        }
+
+        // Phase 9b: Wrap with aggregate node if aggregates are present.
         let aggregate_exprs = self.aggregates;
         // Capture pre-aggregate cardinality for scratch sizing — aggregate
         // nodes reduce rows to 1, but the scratch buffer stores full entity
@@ -2825,6 +3296,8 @@ impl ScanBuilder<'_> {
             last_read_tick: Tick::default(),
             world_id: self.world_id,
             aggregate_exprs,
+            compiled_agg_scan,
+            compiled_agg_scan_raw,
         }
     }
 }
