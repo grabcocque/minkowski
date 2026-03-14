@@ -578,9 +578,12 @@ fn main() {
                 Ok(()) => {
                     println!("    attack: HVT {} second hit succeeded", high_value_target);
                 }
-                Err(e) => {
+                Err(minkowski::TransactError::Conflict(conflict)) => {
                     total_conflicts += 1;
-                    println!("    CONFLICT on HVT: {e}");
+                    println!("    CONFLICT on HVT: {}", conflict.display_with(&world));
+                }
+                Err(e) => {
+                    println!("    ERROR on HVT: {e}");
                 }
             }
         }
@@ -622,9 +625,12 @@ fn main() {
                                 attacker, target_unit, ATTACK_DAMAGE, hp_val
                             );
                         }
-                        Err(e) => {
+                        Err(minkowski::TransactError::Conflict(conflict)) => {
                             total_conflicts += 1;
-                            println!("    CONFLICT: {e}");
+                            println!("    CONFLICT: {}", conflict.display_with(&world));
+                        }
+                        Err(e) => {
+                            println!("    ERROR: {e}");
                         }
                     }
                 }

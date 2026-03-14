@@ -946,7 +946,7 @@ impl QueryPlanResult {
     /// built via [`ScanBuilder::build`]).
     pub fn execute(&mut self, world: &mut World) -> Result<&[Entity], WorldMismatch> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
         }
         let scratch = self
             .scratch
@@ -1014,7 +1014,7 @@ impl QueryPlanResult {
         mut callback: impl FnMut(Entity),
     ) -> Result<(), WorldMismatch> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
         }
         let compiled = self.compiled_for_each.as_mut().expect(
             "for_each() is only available for scan-only plans (no joins). \
@@ -1043,7 +1043,7 @@ impl QueryPlanResult {
         mut callback: impl FnMut(Entity),
     ) -> Result<(), WorldMismatch> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
         }
         let compiled = self.compiled_for_each_raw.as_mut().expect(
             "for_each_raw() is only available for scan-only plans (no joins). \
@@ -7269,5 +7269,44 @@ mod tests {
         let result = plan.execute(&mut world);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_btree_index_returns_err_on_unregistered_component() {
+        let mut world1 = World::new();
+        world1.spawn((Score(1),)); // registers Score in world1
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world1);
+
+        let world2 = World::new(); // Score NOT registered here
+        let mut planner = QueryPlanner::new(&world2);
+        let result = planner.add_btree_index(&Arc::new(btree), &world2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn predicate_within_rejects_negative_radius() {
+        let result = Predicate::within::<Pos>([0.0, 0.0], -1.0, |_, _| true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn predicate_within_rejects_nan_radius() {
+        let result = Predicate::within::<Pos>([0.0, 0.0], f64::NAN, |_, _| true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn predicate_intersects_rejects_mismatched_dimensions() {
+        let result = Predicate::intersects::<Pos>(vec![0.0, 0.0], vec![1.0], |_, _| true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn predicate_intersects_rejects_empty_coordinates() {
+        let result =
+            Predicate::intersects::<Pos>(Vec::<f64>::new(), Vec::<f64>::new(), |_, _| true);
+        assert!(result.is_err());
     }
 }

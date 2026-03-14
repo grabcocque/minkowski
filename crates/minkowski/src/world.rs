@@ -70,10 +70,10 @@ impl From<PoolExhausted> for InsertError {
 }
 
 /// Unique identity for a World instance. Strategies capture this at
-/// construction and assert it matches in begin/commit to prevent
-/// cross-world corruption.
+/// construction and validate it matches in begin/commit, returning
+/// `Err(WorldMismatch)` on mismatch to prevent cross-world corruption.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct WorldId(u64);
+pub(crate) struct WorldId(pub(crate) u64);
 
 #[cfg(not(loom))]
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
@@ -279,7 +279,8 @@ impl World {
     }
 
     /// Return this World's unique identity. Strategies capture this at
-    /// construction and assert it matches in begin/commit.
+    /// construction and validate it matches in begin/commit, returning
+    /// `Err(WorldMismatch)` on mismatch.
     pub(crate) fn world_id(&self) -> WorldId {
         self.id
     }
@@ -821,6 +822,10 @@ impl World {
                 }
                 if seen.contains(idx as usize) {
                     // Duplicate — skip to prevent aliased &mut T.
+                    debug_assert!(
+                        false,
+                        "get_batch_mut: duplicate entity {entity:?} in batch — second occurrence returns None"
+                    );
                     continue;
                 }
                 seen.insert(idx as usize);
@@ -852,11 +857,16 @@ impl World {
         // Same row in same archetype = same entity (each row holds exactly one entity).
         // Only the first occurrence of each entity gets a mutable reference.
         for rows in by_arch.values_mut() {
-            rows.sort_unstable_by_key(|&(_, row)| row);
+            rows.sort_by_key(|&(_, row)| row);
             let mut prev_row = usize::MAX;
             for entry in rows.iter_mut() {
                 if entry.1 == prev_row {
                     // Mark as duplicate — will be skipped during fetch.
+                    debug_assert!(
+                        false,
+                        "get_batch_mut: duplicate entity in batch at result index {} — second occurrence returns None",
+                        entry.0
+                    );
                     entry.1 = usize::MAX;
                 } else {
                     prev_row = entry.1;
@@ -1229,9 +1239,10 @@ impl World {
         Ok(())
     }
 
-    /// Like [`insert`] but returns `Err(InsertError)` instead of panicking
-    /// when the pool cannot allocate storage for the new archetype's columns
-    /// or when the entity is not alive.
+    /// Like [`insert`](Self::insert) but additionally handles pool exhaustion
+    /// as an error instead of panicking. Returns
+    /// `Err(InsertError::PoolExhausted(_))` when the slab pool cannot allocate,
+    /// and `Err(InsertError::DeadEntity(_))` when the entity is not alive.
     ///
     /// If this method returns `Err`, the world state is unchanged — no partial
     /// migration occurs and the entity remains in its original archetype.
@@ -2799,6 +2810,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "get_batch_mut: duplicate entity")
+    )]
     fn get_batch_mut_duplicate_returns_none() {
         let mut world = World::new();
         let e = world.spawn((Health(42),));
@@ -2842,6 +2857,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "get_batch_mut: duplicate entity")
+    )]
     fn get_batch_mut_sparse_duplicate_returns_none() {
         let mut world = World::new();
         world.components.register_sparse::<Health>();
@@ -3560,6 +3579,26 @@ mod tests {
         let mut count = 0;
         world.query::<(&u32,)>().for_each(|_| count += 1);
         assert_eq!(count, entities.len());
+    }
+
+    // ── insert / try_insert dead entity tests ──────────────────────
+
+    #[test]
+    fn insert_returns_err_on_dead_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.despawn(e);
+        let result = world.insert(e, (Vel { dx: 1.0, dy: 1.0 },));
+        assert!(matches!(result, Err(DeadEntity { entity }) if entity == e));
+    }
+
+    #[test]
+    fn try_insert_returns_err_on_dead_entity() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.despawn(e);
+        let result = world.try_insert(e, (Vel { dx: 1.0, dy: 1.0 },));
+        assert!(matches!(result, Err(InsertError::DeadEntity(_))));
     }
 }
 

@@ -272,7 +272,7 @@ RAM is fast, expensive, and limited. Minkowski provides three complementary feat
 
 ### Pre-allocated Memory Pool
 
-`WorldBuilder` creates a World backed by a single [mmap][mmap] region — all memory is allocated upfront at startup, [TigerBeetle][tigerbeetle]-style. After initialization, `try_spawn` and `try_insert` return `Err(InsertError)` instead of crashing the process on exhaustion. No dynamic allocation on the data path.
+`WorldBuilder` creates a World backed by a single [mmap][mmap] region — all memory is allocated upfront at startup, [TigerBeetle][tigerbeetle]-style. After initialization, `try_spawn` returns `Err(PoolExhausted)` and `try_insert` returns `Err(InsertError)` instead of crashing the process. No dynamic allocation on the data path.
 
 ```rust
 use minkowski::{World, HugePages, PoolExhausted};

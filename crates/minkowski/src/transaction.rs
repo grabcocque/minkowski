@@ -51,9 +51,10 @@
 //! ## World identity
 //!
 //! Each World gets a unique `WorldId` at construction. Strategies capture it
-//! and assert it matches in `begin()` and `commit()`. This prevents a strategy
-//! created from world A being used with world B, which would push aborted
-//! entity IDs into the wrong orphan queue and corrupt unrelated live entities.
+//! and validate it matches in `begin()` and `commit()`, returning
+//! `Err(WorldMismatch)` on mismatch. This prevents a strategy created from
+//! world A being used with world B, which would push aborted entity IDs into
+//! the wrong orphan queue and corrupt unrelated live entities.
 
 use crate::sync::{AtomicU64, Mutex};
 
@@ -126,12 +127,16 @@ impl std::error::Error for Conflict {}
 /// it gracefully — use `.unwrap()` if you prefer to panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldMismatch {
-    _private: (),
+    expected: u64,
+    actual: u64,
 }
 
 impl WorldMismatch {
-    pub(crate) fn new() -> Self {
-        Self { _private: () }
+    pub(crate) fn new(expected: crate::world::WorldId, actual: crate::world::WorldId) -> Self {
+        Self {
+            expected: expected.0,
+            actual: actual.0,
+        }
     }
 }
 
@@ -139,7 +144,8 @@ impl std::fmt::Display for WorldMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "strategy or plan used with a different World than it was created from"
+            "strategy or plan was created for World({}) but used with World({})",
+            self.expected, self.actual
         )
     }
 }
@@ -371,7 +377,7 @@ impl<'a> Tx<'a> {
         self.allocated.push(entity);
         self.changeset
             .spawn_bundle(world, entity, bundle)
-            .expect("spawn_bundle on entity from alloc_entity");
+            .expect("BUG: alloc_entity returned an already-placed entity");
         entity
     }
 
@@ -765,7 +771,7 @@ pub trait Transact {
 impl Transact for Optimistic {
     fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
         }
         let mut accessed = access.reads().clone();
         accessed.union_with(access.writes());
@@ -780,13 +786,17 @@ impl Transact for Optimistic {
         ))
     }
 
+    // try_commit returns Result (not assert) intentionally: begin() already catches
+    // mismatches before any state damage. If someone uses the building-block API and
+    // passes a different world to try_commit than they passed to begin, returning Err
+    // is safer than panicking because it lets the Tx's Drop cleanup run normally.
     fn try_commit(
         &self,
         tx: &mut Tx<'_>,
         world: &mut World,
     ) -> Result<EnumChangeSet, TransactError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new().into());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
         let read_ticks = tx
             .cleanup
@@ -851,7 +861,7 @@ impl Transact for Pessimistic {
 
     fn begin(&self, world: &mut World, access: &Access) -> Result<Tx<'_>, WorldMismatch> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()));
         }
         let lock_result = self.lock_table.lock().acquire(
             &world.archetypes.archetypes,
@@ -870,13 +880,17 @@ impl Transact for Pessimistic {
         ))
     }
 
+    // try_commit returns Result (not assert) intentionally: begin() already catches
+    // mismatches before any state damage. If someone uses the building-block API and
+    // passes a different world to try_commit than they passed to begin, returning Err
+    // is safer than panicking because it lets the Tx's Drop cleanup run normally.
     fn try_commit(
         &self,
         tx: &mut Tx<'_>,
         world: &mut World,
     ) -> Result<EnumChangeSet, TransactError> {
         if self.world_id != world.world_id() {
-            return Err(WorldMismatch::new().into());
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
         let locks = tx.cleanup.take_locks();
         if let Some(locks) = locks {
@@ -1489,5 +1503,44 @@ mod tests {
         });
         assert!(result.is_ok());
         assert_eq!(world.get::<Health>(e), None);
+    }
+
+    // ── Pessimistic cross-world tests ────────────────────────────────
+
+    #[test]
+    fn pessimistic_commit_returns_err_on_wrong_world() {
+        let mut world1 = World::new();
+        world1.spawn((Pos(1.0),));
+        let mut world2 = World::new();
+        world2.spawn((Pos(2.0),));
+        let strategy = Pessimistic::new(&world1);
+        let access = Access::of::<(&mut Pos,)>(&mut world1);
+        let mut tx = Transact::begin(&strategy, &mut world1, &access).unwrap();
+        let result = strategy.try_commit(&mut tx, &mut world2);
+        assert!(matches!(result, Err(TransactError::WorldMismatch(_))));
+    }
+
+    #[test]
+    fn pessimistic_transact_returns_err_on_wrong_world() {
+        let mut world1 = World::new();
+        world1.spawn((Pos(1.0),));
+        let mut world2 = World::new();
+        world2.spawn((Pos(2.0),));
+        let strategy = Pessimistic::new(&world1);
+        let access = Access::of::<(&Pos,)>(&mut world1);
+        let result = strategy.transact(&mut world2, &access, |_tx, _world| {});
+        assert!(matches!(result, Err(TransactError::WorldMismatch(_))));
+    }
+
+    #[test]
+    fn world_mismatch_display_contains_world_ids() {
+        let world1 = World::new();
+        let world2 = World::new();
+        let err = WorldMismatch::new(world1.world_id(), world2.world_id());
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("World("),
+            "message should contain World IDs: {msg}"
+        );
     }
 }

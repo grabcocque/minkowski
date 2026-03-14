@@ -77,6 +77,8 @@ fuzz_target!(|data: &[u8]| {
                 match op {
                     WalOp::SpawnA(a) => {
                         let e = world.alloc_entity();
+                        // alloc_entity() guarantees unplaced entity — spawn_bundle can only fail
+                        // on AlreadyPlaced, which is structurally unreachable here.
                         let _ = cs.spawn_bundle(&mut world, e, (*a,));
                         wal.append(&cs, &codecs).unwrap();
                         cs.apply(&mut world).unwrap();
@@ -84,6 +86,8 @@ fuzz_target!(|data: &[u8]| {
                     }
                     WalOp::SpawnAB(a, b) => {
                         let e = world.alloc_entity();
+                        // alloc_entity() guarantees unplaced entity — spawn_bundle can only fail
+                        // on AlreadyPlaced, which is structurally unreachable here.
                         let _ = cs.spawn_bundle(&mut world, e, (*a, *b));
                         wal.append(&cs, &codecs).unwrap();
                         cs.apply(&mut world).unwrap();

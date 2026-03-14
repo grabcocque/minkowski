@@ -4083,7 +4083,10 @@ mod tests {
 
     #[test]
     fn reducer_error_from_transact_error_world_mismatch() {
-        let transact_err = TransactError::WorldMismatch(WorldMismatch::new());
+        let world1 = crate::World::new();
+        let world2 = crate::World::new();
+        let transact_err =
+            TransactError::WorldMismatch(WorldMismatch::new(world1.world_id(), world2.world_id()));
         let err: ReducerError = transact_err.into();
         assert!(matches!(err, ReducerError::WorldMismatch(_)));
     }
