@@ -396,6 +396,15 @@ const SIZE_CLASSES: [usize; NUM_SIZE_CLASSES] = [64, 256, 1024, 4096, 65_536, 1_
 /// - Class 5 (1 MB):  33% — bulk column pre-allocation
 const PROPORTIONS: [usize; NUM_SIZE_CLASSES] = [1, 2, 4, 20, 40, 33];
 
+/// Sentinel value for unallocated side table entries.
+const SIDE_TABLE_UNALLOCATED: u8 = 0xFF;
+
+/// Mask for the class index in a side table entry (bits 0..3).
+const SIDE_TABLE_CLASS_MASK: u8 = 0x0F;
+
+/// Bit flag indicating this allocation overflowed from a smaller class.
+const SIDE_TABLE_OVERFLOW_BIT: u8 = 0x80;
+
 /// Return the size-class index for a given layout, or `None` if too large.
 fn size_class_for(layout: Layout) -> Option<usize> {
     // The effective allocation size must satisfy both size and alignment.
@@ -406,11 +415,13 @@ fn size_class_for(layout: Layout) -> Option<usize> {
 /// TigerBeetle-style slab allocator backed by a single mmap'd region.
 ///
 /// Memory is partitioned into fixed-size blocks across six size classes.
-/// Allocation and deallocation are serialized per size class via `Mutex`.
+/// Allocation and deallocation use a lock-free intrusive stack per class
+/// via `AtomicHead` (128-bit tagged pointer CAS).
 ///
-// PERF: Mutex is a single atomic CAS on uncontended paths.
-// If profiling shows contention, consider upgrading to a lock-free
-// structure with ABA protection (tagged pointers or epoch-based reclamation).
+// PERF: Lock-free intrusive stack via AtomicHead (Atomic<u128> tagged pointer).
+// ABA prevention via 64-bit monotonic tag. Side table routes deallocation to
+// the correct class regardless of the caller's Layout. Single-step overflow
+// from exhausted class to the next larger class.
 pub(crate) struct SlabPool {
     /// Keeps the mmap alive. Never re-borrowed after construction —
     /// use `base` and `total` instead to avoid Tree Borrows invalidation.
@@ -421,14 +432,34 @@ pub(crate) struct SlabPool {
     /// under Tree Borrows.
     base: *mut u8,
     total: usize,
-    free_lists: [Mutex<Vec<*mut u8>>; NUM_SIZE_CLASSES],
+    heads: [AtomicHead; NUM_SIZE_CLASSES],
+    /// Deallocation class routing table. One byte per MIN_BLOCK_SIZE slot.
+    /// Owned raw pointer — written after successful CAS (single-owner),
+    /// read before CAS on dealloc (single-owner). No concurrent access.
+    side_table: *mut u8,
+    side_table_len: usize,
     used_bytes: AtomicUsize,
+    overflow_active: [AtomicUsize; NUM_SIZE_CLASSES],
+    overflow_total: [AtomicUsize; NUM_SIZE_CLASSES],
 }
 
-// SAFETY: `*mut u8` inside the Mutex Vecs points into the mmap region which
-// is owned by SlabPool and outlives all allocations. The Mutex provides
-// exclusive access to the free list vectors. The raw pointers are never
-// dereferenced outside the lock — they are just addresses returned to callers.
+impl Drop for SlabPool {
+    fn drop(&mut self) {
+        if self.side_table_len > 0 {
+            // SAFETY: side_table was allocated via Vec in new(), then
+            // ownership was transferred to the raw pointer via mem::forget.
+            unsafe {
+                let _ = Vec::from_raw_parts(self.side_table, self.side_table_len, self.side_table_len);
+            }
+        }
+    }
+}
+
+// SAFETY: Pointers into the mmap region are only accessed through atomic CAS
+// operations (or Mutex under loom). The mmap region is owned by SlabPool and
+// outlives all allocations. The side table raw pointer is written only by
+// the thread that owns the block (after successful CAS) and read before
+// the CAS that returns it — single-owner access, no concurrent mutation.
 unsafe impl Send for SlabPool {}
 unsafe impl Sync for SlabPool {}
 
@@ -615,6 +646,30 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("1024"));
         assert!(msg.contains("64"));
+    }
+
+    // ── Side table tests ─────────────────────────────────────────────
+
+    #[test]
+    fn side_table_index_computation() {
+        let base = 0x1000_usize as *mut u8;
+        let min_block = SIZE_CLASSES[0]; // 64
+        // Block at base+0 -> index 0
+        assert_eq!((0x1000 - base as usize) / min_block, 0);
+        // Block at base+64 -> index 1
+        assert_eq!((0x1040 - base as usize) / min_block, 1);
+        // Block at base+128 -> index 2
+        assert_eq!((0x1080 - base as usize) / min_block, 2);
+    }
+
+    #[test]
+    fn side_table_overflow_flag() {
+        let entry_normal: u8 = 3; // class 3, no overflow
+        let entry_overflow: u8 = 3 | SIDE_TABLE_OVERFLOW_BIT;
+        assert_eq!(entry_normal & SIDE_TABLE_CLASS_MASK, 3);
+        assert_eq!(entry_overflow & SIDE_TABLE_CLASS_MASK, 3);
+        assert_eq!(entry_normal & SIDE_TABLE_OVERFLOW_BIT, 0);
+        assert_ne!(entry_overflow & SIDE_TABLE_OVERFLOW_BIT, 0);
     }
 
     // ── TaggedPtr tests ──────────────────────────────────────────────
