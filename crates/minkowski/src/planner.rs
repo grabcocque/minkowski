@@ -6984,4 +6984,110 @@ mod tests {
         assert!(results.contains(&e1));
         assert!(results.contains(&e2));
     }
+
+    #[test]
+    fn index_for_each_uses_hash_lookup() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let e2 = world.spawn((Score(42),));
+        let _e3 = world.spawn((Score(99),));
+
+        let mut hash = HashIndex::<Score>::new();
+        hash.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index(&Arc::new(hash), &world);
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn index_range_lookup_execution() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(10),));
+        let e2 = world.spawn((Score(20),));
+        let e3 = world.spawn((Score(30),));
+        let _e4 = world.spawn((Score(100),));
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(5)..Score(35)))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 3);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+        assert!(results.contains(&e3));
+    }
+
+    #[test]
+    fn index_lookup_filters_stale_entities() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42),));
+        let e2 = world.spawn((Score(42),));
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        // Despawn e2 after plan is built — index is stale.
+        world.despawn(e2);
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn index_lookup_filters_missing_required() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(42), Pos { x: 1.0, y: 1.0 })); // has both
+        let _e2 = world.spawn((Score(42),)); // only Score
+
+        let mut btree = BTreeIndex::<Score>::new();
+        btree.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&Arc::new(btree), &world);
+
+        // Query requires BOTH Score and Pos.
+        let mut plan = planner
+            .scan::<(&Score, &Pos)>()
+            .filter(Predicate::eq::<Score>(Score(42)))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 1, "entity missing Pos should be filtered");
+        assert_eq!(results[0], e1);
+    }
 }
