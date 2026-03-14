@@ -171,46 +171,54 @@ fn main() {
 
     // -- Planned queries via QueryPlanner (the recommended path) --
     //
+    // Sync indexes after the batch mutation above so the planner sees
+    // current state. Without this, the btree/hash still map old keys.
+    btree.update(&mut world);
+    hash.update(&mut world);
+
     // Wrap indexes in Arc so the planner can hold live references to them.
     // The planner calls the lookup closure at execution time — it reads the
     // live index, not a snapshot captured at registration.
     let btree = Arc::new(btree);
     let hash = Arc::new(hash);
 
-    // Build all plans before dropping the planner — planner holds &world,
-    // so it must be released before for_each takes &mut world.
-    let (mut range_plan, mut eq_plan) = {
+    // Range query via BTree — build plan, drop planner, then execute.
+    // The planner borrows &world, so it must be released before for_each
+    // takes &mut world.
+    let mut range_plan = {
         let mut planner = QueryPlanner::new(&world);
         planner.add_btree_index::<Score>(&btree, &world).unwrap();
-        planner.add_hash_index::<Score>(&hash, &world).unwrap();
-
-        // Range query — planner selects IndexGather(BTree) as the driving access.
-        let range_plan = planner
+        planner
             .scan::<(&Score,)>()
-            .filter(Predicate::range::<Score, _>(Score(110)..Score(120)))
-            .build();
-
-        // Exact lookup — planner selects IndexGather(Hash) for O(1) eq lookup.
-        let eq_plan = planner
-            .scan::<(&Score,)>()
-            .filter(Predicate::eq(Score(42)))
-            .build();
-
-        (range_plan, eq_plan)
-    }; // planner dropped here, releasing &world
+            .filter(Predicate::range::<Score, _>(Score(150)..Score(160)))
+            .build()
+    };
 
     println!(
-        "Planned range [110..120) explain:\n{}",
+        "Planned range [150..160) explain:\n{}",
         range_plan.explain()
     );
     let mut planned_range_count = 0;
     range_plan
         .for_each(&mut world, |_| planned_range_count += 1)
         .unwrap();
-    println!("Planned range [110..120): {planned_range_count} entities (expected 10)");
+    println!("Planned range [150..160): {planned_range_count} entities (expected 10)");
     assert_eq!(planned_range_count, 10);
     println!();
 
+    // Exact lookup via Hash — separate planner so the Hash index is
+    // actually selected (BTree would shadow it if both were registered
+    // for the same component, since add_hash_index uses or_insert).
+    let mut eq_plan = {
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_hash_index::<Score>(&hash, &world).unwrap();
+        planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build()
+    };
+
+    println!("Planned eq explain:\n{}", eq_plan.explain());
     let mut planned_eq_count = 0;
     eq_plan
         .for_each(&mut world, |_| planned_eq_count += 1)
