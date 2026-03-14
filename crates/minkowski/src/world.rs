@@ -619,6 +619,27 @@ impl World {
         self.entities.is_alive(entity)
     }
 
+    /// Fused generation check + location lookup for the index-gather hot path.
+    ///
+    /// Returns `Some(&EntityLocation)` if the entity is alive and placed,
+    /// `None` otherwise. Combines `is_alive` + location lookup into a single
+    /// method to avoid repeating the index computation.
+    #[inline]
+    pub(crate) fn validate_entity(&self, entity: Entity) -> Option<&EntityLocation> {
+        let idx = entity.index() as usize;
+        if idx >= self.entities.generations.len() {
+            return None;
+        }
+        if self.entities.generations[idx] != entity.generation() {
+            return None;
+        }
+        // Guard against entity_locations being shorter than generations.
+        // This can happen when materialize_reserved() (called by drain_orphans)
+        // grows generations for reserved-but-orphaned entity slots without
+        // resizing entity_locations.
+        self.entity_locations.get(idx)?.as_ref()
+    }
+
     /// Returns true if the entity is alive and currently carries component `T`.
     ///
     /// For archetype components, this is a bitset check. For sparse components,
