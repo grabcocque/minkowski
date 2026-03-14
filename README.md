@@ -45,7 +45,7 @@ registry.run(&mut world, move_id, ());
 ### Building & testing
 
 ```
-cargo test -p minkowski                # 644+ tests
+cargo test -p minkowski                # 730+ tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
@@ -73,7 +73,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | Layer | What it catches | When it runs |
 |---|---|---|
 | **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
-| **644 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries | Every PR (CI) |
+| **730 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries, query planner execution | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
 | **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |

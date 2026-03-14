@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.2.0
+
+### Query Planner (`minkowski`)
+
+- **Volcano-model query planner** — `QueryPlanner` compiles queries into cost-optimized execution plans with automatic index selection. Logical plan nodes (`Scan`, `IndexLookup`, `Filter`, `HashJoin`, `NestedLoopJoin`, `Aggregate`) are lowered to vectorized execution nodes (`ChunkedScan`, `IndexGather`, `SIMDFilter`, `PartitionedHashJoin`, `StreamAggregate`) via `lower_to_vectorized()`. Cost model tracks `rows` (estimated cardinality) and `cpu` (dimensionless relative units).
+- **Allocation-free query execution** — `for_each(&mut World, callback)` iterates scan-only plans with zero intermediate allocation. `for_each_raw(&World, callback)` provides a transactional read-only path with no tick advancement. `execute(&mut World)` collects entities into a plan-owned scratch buffer (supports joins).
+- **BTree and Hash index-driven access** — `add_btree_index` / `add_hash_index` register live `Arc<BTreeIndex<T>>` / `Arc<HashIndex<T>>` with the planner. Type-erased lookup closures are pre-bound at plan-build time and invoked at execution time. `IndexGather` nodes bypass full archetype scans — O(log n + k) for BTree range, O(1) for Hash eq.
+- **Spatial predicates** — `Predicate::within_radius`, `Predicate::within_aabb`, `Predicate::intersects` with dimension-agnostic coordinate vectors. `SpatialIndex::supports()` for capability discovery. `add_spatial_index_with_lookup` registers execution-time spatial query closures.
+- **`Changed<T>` filtering** — plans with `Changed<T>` in the query type skip entire archetypes whose column tick is older than the plan's `last_read_tick`. Tick advancement follows the same pattern as `World::query()`.
+- **Subscription queries** — `SubscriptionBuilder` wraps `ScanBuilder` with compile-time index enforcement via `Indexed<T>` witnesses. `where_eq(witness, predicate)` and `where_range(witness, predicate)` require proof that an index exists for the predicate's component. Plans use `IndexDriver` for index-gather execution.
+- **`SubscriptionDebounce<T>` trait** — false-positive filter for archetype-granular `Changed<T>`. `HashDebounce<T>` provides in-memory per-entity value tracking.
+- **Aggregate queries** — `AggregateExpr` with five operations (`Count`, `Sum`, `Min`, `Max`, `Avg`) using type-erased `f64` value extractors. `execute_aggregates(&mut World)` and `execute_aggregates_raw(&World)` compute results in a single pass. NaN propagates consistently through all operations. `StreamAggregate` vectorized node.
+- **`TablePlanner<T>`** — wraps `QueryPlanner` with compile-time index enforcement via `HasBTreeIndex` / `HasHashIndex` trait bounds from `#[derive(Table)]` field annotations.
+- **`PlanExecError`** — unified error type for all plan execution methods. `WorldMismatch` and `JoinNotSupported` variants. `From<WorldMismatch>` impl for transparent migration. Replaces `.expect()` panics on user-triggerable conditions.
+
+### Materialized Views (`minkowski`)
+
+- **`MaterializedView`** — cached, debounced wrapper around `QueryPlanResult`. Owns its plan, caches the matching entity list, re-executes only when the debounce threshold is met. External to World (same composition pattern as `SpatialIndex`, `BTreeIndex`, `ReducerRegistry`).
+- **`DebouncePolicy`** — `Immediate` (default) or `EveryNTicks(NonZeroU64)`. Two-layer filtering: the plan's `Changed<T>` filter provides archetype-granular change detection, the debounce policy limits re-materialization frequency.
+- **World identity validation** — `refresh()` checks `WorldId` on every call including debounce-suppressed ones. Returns `Result<bool, PlanExecError>`.
+
+### Performance (`minkowski`)
+
+- **Identity hasher system-wide** — `FixedBitSet` component ID sets and internal `HashMap`s use an identity hasher for integer keys. Eliminates hashing overhead in archetype lookup and query cache.
+- **EnumChangeSet inlining** — 34% `QueryWriter` speedup via `#[inline]` on hot mutation paths and pre-allocated arena capacity.
+- **DynamicCtx optimization** — 40% speedup via identity hasher on `DynamicResolved` maps and `#[inline]` on access validation.
+- **Bulk spawn optimization** — `drain_orphans` skip when orphan queue is empty, avoiding mutex acquisition on the common path.
+
+### Documentation
+
+- **README** — new Query Planner section with code examples, Subscription Queries section, Materialized Views section. Example count updated to 20.
+- **CLAUDE.md** — Query Planner architecture section, Materialized Views section, `PlanExecError` in error philosophy, aggregate execution docs.
+
+### Examples
+
+- **`planner`** — Volcano query planner demo: cost-based plans, index selection, joins, `for_each`/`for_each_raw`, subscription queries, aggregates, `explain()` output.
+- **`materialized_view`** — Materialized views: cached debounced subscription queries, change detection, invalidation, multi-index subscriptions, dynamic policy switching.
+- **`index`** — Updated with planned query section demonstrating `QueryPlanner` + `IndexDriver` execution for BTree range and Hash eq queries.
+- **`profile_changeset`** — Profiling harness comparing `QueryWriter` vs `QueryMut` throughput (10K entities, 1K iterations).
+
+### Verification
+
+- 730 unit tests (up from 480).
+- Full Miri + Tree Borrows, ThreadSanitizer, and Loom passes.
+- 4 fuzz targets (world ops, reducers, snapshot load, WAL replay).
+
 ## 1.1.0
 
 ### Memory Management (`minkowski`)
