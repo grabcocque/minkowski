@@ -3106,6 +3106,27 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
         self.planner.add_hash_index::<C>(index, self.world);
     }
 
+    /// Register a spatial index with cost discovery and execution-time lookup.
+    ///
+    /// Delegates to [`QueryPlanner::add_spatial_index_with_lookup`].
+    /// No compile-time index enforcement — spatial indexes are orthogonal to
+    /// table schemas.
+    pub fn add_spatial_index_with_lookup<C: Component>(
+        &mut self,
+        index: Arc<dyn SpatialIndex + Send + Sync>,
+        lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
+    ) {
+        self.planner
+            .add_spatial_index_with_lookup::<C>(index, self.world, lookup);
+    }
+
+    /// Register a spatial index for cost discovery only (no execution-time lookup).
+    ///
+    /// Delegates to [`QueryPlanner::add_spatial_index`].
+    pub fn add_spatial_index<C: Component>(&mut self, index: Arc<dyn SpatialIndex + Send + Sync>) {
+        self.planner.add_spatial_index::<C>(index, self.world);
+    }
+
     /// Get the `Indexed<C>` witness for a btree-indexed field, suitable for
     /// use with `SubscriptionBuilder`.
     ///
