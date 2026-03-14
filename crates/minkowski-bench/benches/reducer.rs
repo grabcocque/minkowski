@@ -30,10 +30,12 @@ fn bench_query_mut(c: &mut Criterion) {
             &mut world,
             "integrate",
             |mut query: QueryMut<'_, (&mut Position, &Velocity)>, (): ()| {
-                query.for_each(|(pos, vel)| {
-                    pos.x += vel.dx;
-                    pos.y += vel.dy;
-                    pos.z += vel.dz;
+                query.for_each(|(positions, velocities)| {
+                    for i in 0..positions.len() {
+                        positions[i].x += velocities[i].dx;
+                        positions[i].y += velocities[i].dy;
+                        positions[i].z += velocities[i].dz;
+                    }
                 });
             },
         )
@@ -56,7 +58,7 @@ fn bench_query_mut_chunk(c: &mut Criterion) {
             &mut world,
             "integrate_chunk",
             |mut query: QueryMut<'_, (&mut Position, &Velocity)>, (): ()| {
-                query.for_each_chunk(|(positions, velocities)| {
+                query.for_each(|(positions, velocities)| {
                     for i in 0..positions.len() {
                         positions[i].x += velocities[i].dx;
                         positions[i].y += velocities[i].dy;
@@ -113,16 +115,20 @@ fn bench_dynamic_for_each(c: &mut Criterion) {
         .can_write::<Position>()
         .build(|ctx: &mut DynamicCtx, _args: &()| {
             let mut updates = Vec::new();
-            ctx.for_each::<(minkowski::Entity, &Position, &Velocity)>(|(entity, pos, vel)| {
-                updates.push((
-                    entity,
-                    Position {
-                        x: pos.x + vel.dx,
-                        y: pos.y + vel.dy,
-                        z: pos.z + vel.dz,
-                    },
-                ));
-            });
+            ctx.for_each::<(minkowski::Entity, &Position, &Velocity)>(
+                |(entities, positions, velocities)| {
+                    for i in 0..entities.len() {
+                        updates.push((
+                            entities[i],
+                            Position {
+                                x: positions[i].x + velocities[i].dx,
+                                y: positions[i].y + velocities[i].dy,
+                                z: positions[i].z + velocities[i].dz,
+                            },
+                        ));
+                    }
+                },
+            );
             for (entity, pos) in updates {
                 ctx.write(entity, pos);
             }
@@ -149,7 +155,7 @@ fn bench_dynamic_for_each_chunk(c: &mut Criterion) {
         .can_write::<Position>()
         .build(|ctx: &mut DynamicCtx, _args: &()| {
             let mut updates = Vec::new();
-            ctx.for_each_chunk::<(minkowski::Entity, &Position, &Velocity)>(
+            ctx.for_each::<(minkowski::Entity, &Position, &Velocity)>(
                 |(entities, positions, velocities)| {
                     for i in 0..entities.len() {
                         updates.push((
