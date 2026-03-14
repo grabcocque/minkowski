@@ -2025,8 +2025,9 @@ fn gather_index_candidates(
     filters: &[FilterFn],
     mut emit: impl FnMut(Entity),
 ) {
-    // Archetype cache: (archetype_id, passed_required, passed_changed).
+    // Archetype cache: (archetype_id, passed_archetype_checks).
     // Avoids re-checking the same archetype when consecutive entities share one.
+    // Safe to cache: &World guarantees no column ticks advance during this call.
     let mut cached_arch: Option<(usize, bool)> = None;
     let has_changed = !changed.is_clear();
 
@@ -2038,22 +2039,15 @@ fn gather_index_candidates(
 
         // Check archetype cache: if we've already validated this archetype,
         // skip the bitset subset and change-filter checks entirely.
-        let arch_ok = if let Some((cached_id, cached_ok)) = cached_arch {
-            if cached_id == arch_idx {
-                cached_ok
-            } else {
+        let arch_ok = match cached_arch {
+            Some((cached_id, ok)) if cached_id == arch_idx => ok,
+            _ => {
                 let arch = &world.archetypes.archetypes[arch_idx];
                 let ok = required.is_subset(&arch.component_ids)
                     && (!has_changed || passes_change_filter(arch, changed, tick));
                 cached_arch = Some((arch_idx, ok));
                 ok
             }
-        } else {
-            let arch = &world.archetypes.archetypes[arch_idx];
-            let ok = required.is_subset(&arch.component_ids)
-                && (!has_changed || passes_change_filter(arch, changed, tick));
-            cached_arch = Some((arch_idx, ok));
-            ok
         };
 
         if !arch_ok {
