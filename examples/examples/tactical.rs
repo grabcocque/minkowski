@@ -737,7 +737,7 @@ fn main() {
             frame_changeset.record_despawn(*target);
             total_kills += 1;
         }
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         // Recon scan: spot enemies using spatial grid
         {

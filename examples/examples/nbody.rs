@@ -553,7 +553,7 @@ fn main() {
                 let idx = fastrand::usize(..count);
                 cmds.despawn(entities[idx]);
             }
-            cmds.apply(&mut world);
+            cmds.apply(&mut world).unwrap();
 
             // Demonstrate generational validation: count stale entities
             // from the pre-churn snapshot that are no longer alive.
