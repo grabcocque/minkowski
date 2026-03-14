@@ -8,6 +8,7 @@
 use std::alloc::Layout;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicU64 as StdAtomicU64;
 
 #[cfg(loom)]
 use crate::sync::Mutex;
@@ -555,6 +556,22 @@ impl SlabPool {
     pub(crate) fn overflow_total(&self, class: usize) -> u64 {
         self.overflow_total[class].load(Ordering::Relaxed) as u64
     }
+
+    /// Derive a valid pointer into the mmap region from a raw address.
+    ///
+    /// `TaggedPtr` stores addresses as `u64` inside a `u128` atomic — this
+    /// round-trip strips pointer provenance. Under Tree Borrows, reading
+    /// or writing through a provenance-less pointer is UB. This method
+    /// restores provenance by computing the offset from `self.base` and
+    /// re-deriving the pointer.
+    #[inline]
+    fn block_ptr(&self, addr: u64) -> *mut u8 {
+        let offset = addr as usize - self.base as usize;
+        // SAFETY: `addr` was originally derived from `self.base + offset`
+        // during `new()` or a prior `deallocate`. The offset is within the
+        // mmap region (addr >= base && addr < base + total).
+        unsafe { self.base.add(offset) }
+    }
 }
 
 // SAFETY: SlabPool returns properly aligned, non-overlapping memory regions.
@@ -581,10 +598,17 @@ unsafe impl PoolAllocator for SlabPool {
                     break; // This class is exhausted, try next.
                 }
 
-                // SAFETY: head.ptr() is a valid block pointer within the mmap
-                // region. The block is >= 64 bytes and aligned to its class size,
-                // so reading 8 bytes at offset 0 is safe and aligned.
-                let next_raw = unsafe { std::ptr::read(head.ptr() as *const u64) };
+                // Restore provenance from self.base to read the next-pointer.
+                // SAFETY: head.ptr() is a valid block address within the mmap
+                // region. The block is >= 64 bytes and 8-byte aligned (min
+                // class is 64B), so an AtomicU64 read at offset 0 is safe.
+                // Atomic load is required because a concurrent deallocate
+                // may be writing a next-pointer into this block (CAS retry
+                // loop in deallocate).
+                let block = self.block_ptr(head.ptr() as u64);
+                let next_raw = unsafe {
+                    (*(block as *const StdAtomicU64)).load(std::sync::atomic::Ordering::Acquire)
+                };
                 let next_ptr = if next_raw == 0 {
                     std::ptr::null_mut()
                 } else {
@@ -612,13 +636,12 @@ unsafe impl PoolAllocator for SlabPool {
                     }
 
                     debug_assert!(
-                        (head.ptr() as usize).is_multiple_of(layout.align()),
-                        "SlabPool: block at {:p} is not aligned to {}",
-                        head.ptr(),
+                        (block as usize).is_multiple_of(layout.align()),
+                        "SlabPool: block at {block:p} is not aligned to {}",
                         layout.align()
                     );
 
-                    return Ok(NonNull::new(head.ptr()).expect("free list block is non-null"));
+                    return Ok(NonNull::new(block).expect("free list block is non-null"));
                 }
                 // CAS failed — another thread popped. Retry.
             }
@@ -640,15 +663,20 @@ unsafe impl PoolAllocator for SlabPool {
             return;
         }
 
+        let addr = ptr.as_ptr() as usize;
+
         debug_assert!(
-            ptr.as_ptr() >= self.base && (ptr.as_ptr() as usize) < self.base as usize + self.total,
+            addr >= self.base as usize && addr < self.base as usize + self.total,
             "SlabPool::deallocate: pointer {:p} is outside pool region",
             ptr.as_ptr()
         );
 
+        // Restore provenance from self.base for all block access.
+        let block = self.block_ptr(addr as u64);
+
         // Read actual class from side table (authoritative — ignores layout).
         // SAFETY: index is within bounds, block is owned by this thread.
-        let index = (ptr.as_ptr() as usize - self.base as usize) / SIZE_CLASSES[0];
+        let index = (addr - self.base as usize) / SIZE_CLASSES[0];
         let entry = unsafe { self.side_table.add(index).read() };
         let actual_class = (entry & SIDE_TABLE_CLASS_MASK) as usize;
         let was_overflow = (entry & SIDE_TABLE_OVERFLOW_BIT) != 0;
@@ -658,14 +686,26 @@ unsafe impl PoolAllocator for SlabPool {
             "SlabPool::deallocate: side table entry {entry:#x} has invalid class {actual_class}"
         );
 
+        // Mark side table entry as unallocated BEFORE pushing the block
+        // back. Once the CAS below succeeds, another thread can immediately
+        // pop the block and write its own side table entry — writing after
+        // the CAS would be a data race.
+        // SAFETY: block is owned by this thread (not yet pushed).
+        unsafe { self.side_table.add(index).write(SIDE_TABLE_UNALLOCATED) };
+
         // Push block back onto its actual class's free list.
         loop {
             let head = load_head(&self.heads[actual_class]);
             // Write current head pointer into block's first 8 bytes.
+            // Use provenance-valid pointer derived from self.base.
+            // Atomic store is required because a concurrent allocate may
+            // be reading the next-pointer from this block (CAS retry loop
+            // in allocate).
             unsafe {
-                (ptr.as_ptr() as *mut u64).write(head.ptr() as u64);
+                (*(block as *const StdAtomicU64))
+                    .store(head.ptr() as u64, std::sync::atomic::Ordering::Release);
             }
-            let new_head = head.with_next(ptr.as_ptr());
+            let new_head = head.with_next(block);
 
             if cas_head(&self.heads[actual_class], head, new_head) {
                 self.used_bytes
@@ -674,10 +714,6 @@ unsafe impl PoolAllocator for SlabPool {
                 if was_overflow {
                     self.overflow_active[actual_class].fetch_sub(1, Ordering::Relaxed);
                 }
-
-                // Mark side table entry as unallocated.
-                // SAFETY: block is being returned, this thread still owns it.
-                unsafe { self.side_table.add(index).write(SIDE_TABLE_UNALLOCATED) };
 
                 return;
             }
