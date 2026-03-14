@@ -1765,33 +1765,67 @@ impl ScanBuilder<'_> {
                 .expect("join plan requires left_required bitset");
             let left_changed = self.left_changed.clone().unwrap_or_default();
             let left_filters: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
-            let left_collector: EntityCollector = Box::new(
-                move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
-                    if left_filters.is_empty() {
-                        collect_matching_entities(
-                            world,
-                            &left_required,
-                            &left_changed,
-                            tick,
-                            scratch,
-                        );
-                    } else {
-                        for arch in &world.archetypes.archetypes {
-                            if arch.is_empty() || !left_required.is_subset(&arch.component_ids) {
+            let left_collector: EntityCollector = if let Some(ref driver) = spatial_driver {
+                // Index-gather path: use the spatial lookup function instead of
+                // archetype scanning. Mirrors the Phase 8 index-gather closure.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let left_changed_for_index = left_changed.clone();
+                Box::new(
+                    move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
+                        let candidates = lookup_fn(&expr);
+                        for entity in candidates {
+                            if !world.is_alive(entity) {
                                 continue;
                             }
-                            if !passes_change_filter(arch, &left_changed, tick) {
-                                continue;
+                            if !left_changed_for_index.is_clear() {
+                                let idx = entity.index() as usize;
+                                if idx < world.entity_locations.len()
+                                    && let Some(ref loc) = world.entity_locations[idx]
+                                {
+                                    let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                                    if !passes_change_filter(arch, &left_changed_for_index, tick) {
+                                        continue;
+                                    }
+                                }
                             }
-                            for &entity in &arch.entities {
-                                if left_filters.iter().all(|f| f(world, entity)) {
-                                    scratch.push(entity);
+                            if left_filters.iter().all(|f| f(world, entity)) {
+                                scratch.push(entity);
+                            }
+                        }
+                    },
+                )
+            } else {
+                // Archetype-scan path (unchanged).
+                Box::new(
+                    move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
+                        if left_filters.is_empty() {
+                            collect_matching_entities(
+                                world,
+                                &left_required,
+                                &left_changed,
+                                tick,
+                                scratch,
+                            );
+                        } else {
+                            for arch in &world.archetypes.archetypes {
+                                if arch.is_empty() || !left_required.is_subset(&arch.component_ids)
+                                {
+                                    continue;
+                                }
+                                if !passes_change_filter(arch, &left_changed, tick) {
+                                    continue;
+                                }
+                                for &entity in &arch.entities {
+                                    if left_filters.iter().all(|f| f(world, entity)) {
+                                        scratch.push(entity);
+                                    }
                                 }
                             }
                         }
-                    }
-                },
-            );
+                    },
+                )
+            };
 
             let steps: Vec<JoinStep> = self
                 .joins
@@ -6229,5 +6263,44 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
         assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_join_uses_lookup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 }, Score(10)));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 }, Score(20)));
+        let _e3 = world.spawn((Pos { x: 100.0, y: 100.0 }, Score(30)));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(
+            Arc::new(grid),
+            &world,
+            move |_expr: &crate::index::SpatialExpr| {
+                cc.fetch_add(1, Ordering::Relaxed);
+                vec![e1, e2]
+            },
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true))
+            .join::<(&Score,)>(JoinKind::Inner)
+            .build();
+
+        let results = plan.execute(&mut world);
+        assert!(
+            call_count.load(Ordering::Relaxed) > 0,
+            "lookup not called in join"
+        );
+        assert_eq!(results.len(), 2);
     }
 }
