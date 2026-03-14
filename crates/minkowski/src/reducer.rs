@@ -589,7 +589,6 @@ pub struct EntityRef<'a, C: ComponentSet> {
 }
 
 impl<'a, C: ComponentSet> EntityRef<'a, C> {
-    #[allow(dead_code)] // TODO: wire up via ReducerRegistry::register_entity_ref
     pub(crate) fn new(entity: Entity, resolved: &'a ResolvedComponents, world: &'a World) -> Self {
         Self {
             entity,
@@ -1355,6 +1354,7 @@ enum ReducerSlot {
 /// ## Registration
 ///
 /// - [`register_entity`](ReducerRegistry::register_entity) / [`register_entity_despawn`](ReducerRegistry::register_entity_despawn) — single-entity read-write via [`EntityMut`]
+/// - [`register_entity_ref`](ReducerRegistry::register_entity_ref) — single-entity read-only via [`EntityRef`]
 /// - [`register_spawner`](ReducerRegistry::register_spawner) — entity creation via [`Spawner`]
 /// - [`register_query_writer`](ReducerRegistry::register_query_writer) — buffered query iteration via [`QueryWriter`]
 /// - [`register_query`](ReducerRegistry::register_query) — direct mutable iteration via [`QueryMut`]
@@ -1468,6 +1468,55 @@ impl ReducerRegistry {
                     })
                     .clone();
                 let handle = EntityMut::<C>::new(entity, resolved, changeset, tw.as_ref(), true);
+                f(handle, args);
+            });
+
+        self.push_entry(
+            name,
+            access,
+            resolved,
+            ReducerKind::Transactional(adapter),
+            None,
+            None,
+        )
+    }
+
+    /// Register a read-only entity reducer: `f(EntityRef<C>, args)`.
+    /// At dispatch, call with `(entity, args)` as the args tuple.
+    ///
+    /// Unlike [`register_entity`](Self::register_entity), this provides
+    /// read-only access via [`EntityRef`] — no writes are buffered, and
+    /// the access metadata reflects reads only. Use this when the reducer
+    /// only needs to inspect component values without modifying them.
+    ///
+    /// Returns `Err(ReducerError::DuplicateName)` if the name is already registered.
+    pub fn register_entity_ref<C, Args, F>(
+        &mut self,
+        world: &mut World,
+        name: &'static str,
+        f: F,
+    ) -> Result<ReducerId, ReducerError>
+    where
+        C: ComponentSet,
+        Args: Clone + 'static,
+        F: Fn(EntityRef<'_, C>, Args) + Send + Sync + 'static,
+    {
+        let resolved = ResolvedComponents(C::resolve(&mut world.components));
+        // EntityRef is read-only — no write access needed.
+        let access = C::access(&mut world.components, true);
+
+        let adapter: TransactionalAdapter =
+            Box::new(move |_changeset, _allocated, tw, resolved, args_any| {
+                let (entity, args) = args_any
+                    .downcast_ref::<(Entity, Args)>()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reducer args type mismatch: expected (Entity, {})",
+                            std::any::type_name::<Args>()
+                        )
+                    })
+                    .clone();
+                let handle = EntityRef::<C>::new(entity, resolved, tw.as_ref());
                 f(handle, args);
             });
 
@@ -4117,6 +4166,72 @@ mod tests {
         let info = registry.reducer_info(id).unwrap();
         assert_eq!(info.name, "kill");
         assert!(info.can_despawn);
+    }
+
+    #[test]
+    fn reducer_info_entity_ref() {
+        let mut world = World::new();
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_entity_ref::<(Health,), (), _>(&mut world, "inspect", |_e, ()| {})
+            .unwrap();
+        let info = registry.reducer_info(id).unwrap();
+        assert_eq!(info.name, "inspect");
+        assert_eq!(info.kind, "transactional");
+        assert!(!info.can_despawn);
+    }
+
+    #[test]
+    fn entity_ref_reducer_reads_component() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let mut world = World::new();
+        let e = world.spawn((Health(42),));
+
+        let mut registry = ReducerRegistry::new();
+        let observed = Arc::new(AtomicU32::new(0));
+        let obs = Arc::clone(&observed);
+        let id = registry
+            .register_entity_ref::<(Health,), (), _>(&mut world, "read_hp", move |handle, ()| {
+                let hp = handle.get::<Health, 0>();
+                obs.store(hp.0, Ordering::Relaxed);
+            })
+            .unwrap();
+
+        let strategy = Optimistic::new(&world);
+        registry.call(&strategy, &mut world, id, (e, ())).unwrap();
+        assert_eq!(observed.load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn entity_ref_reducer_has_read_only_access() {
+        let mut world = World::new();
+        world.spawn((Health(1),));
+
+        let mut registry = ReducerRegistry::new();
+        registry
+            .register_entity_ref::<(Health,), (), _>(&mut world, "read_only", |_e, ()| {})
+            .unwrap();
+
+        registry
+            .register_entity::<(Health,), (), _>(&mut world, "read_write", |_e, ()| {})
+            .unwrap();
+
+        let ref_id = registry.reducer_id_by_name("read_only").unwrap();
+        let mut_id = registry.reducer_id_by_name("read_write").unwrap();
+
+        let ref_access = registry.reducer_access(ref_id);
+        let mut_access = registry.reducer_access(mut_id);
+
+        // EntityRef should NOT conflict with another EntityRef.
+        assert!(
+            !ref_access.conflicts_with(ref_access),
+            "two read-only reducers should not conflict"
+        );
+        // EntityRef SHOULD conflict with EntityMut (writes vs reads).
+        assert!(
+            ref_access.conflicts_with(mut_access),
+            "read-only reducer should conflict with read-write reducer"
+        );
     }
 
     #[test]
