@@ -2472,17 +2472,8 @@ impl ScanBuilder<'_> {
                     move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
                         let candidates = lookup_fn(&expr);
                         for entity in candidates {
-                            if !world.is_alive(entity) {
+                            let Some(loc) = world.validate_entity(entity) else {
                                 continue;
-                            }
-                            // Look up archetype — skip unplaced entities and check
-                            // required components.
-                            let idx = entity.index() as usize;
-                            let Some(loc) = (idx < world.entity_locations.len())
-                                .then(|| world.entity_locations[idx].as_ref())
-                                .flatten()
-                            else {
-                                continue; // alive but unplaced — no archetype
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
                             if !left_required_for_index.is_subset(&arch.component_ids) {
@@ -2512,14 +2503,7 @@ impl ScanBuilder<'_> {
                     move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
                         let candidates = lookup_fn();
                         for &entity in candidates.iter() {
-                            if !world.is_alive(entity) {
-                                continue;
-                            }
-                            let idx = entity.index() as usize;
-                            let Some(loc) = (idx < world.entity_locations.len())
-                                .then(|| world.entity_locations[idx].as_ref())
-                                .flatten()
-                            else {
+                            let Some(loc) = world.validate_entity(entity) else {
                                 continue;
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
@@ -2635,17 +2619,8 @@ impl ScanBuilder<'_> {
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn(&expr);
                         for entity in candidates {
-                            if !world.is_alive(entity) {
+                            let Some(loc) = world.validate_entity(entity) else {
                                 continue;
-                            }
-                            // Look up archetype — skip unplaced entities and check
-                            // required components.
-                            let idx = entity.index() as usize;
-                            let Some(loc) = (idx < world.entity_locations.len())
-                                .then(|| world.entity_locations[idx].as_ref())
-                                .flatten()
-                            else {
-                                continue; // alive but unplaced — no archetype
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
                             if !required.is_subset(&arch.component_ids) {
@@ -2670,14 +2645,7 @@ impl ScanBuilder<'_> {
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn();
                         for &entity in candidates.iter() {
-                            if !world.is_alive(entity) {
-                                continue;
-                            }
-                            let idx = entity.index() as usize;
-                            let Some(loc) = (idx < world.entity_locations.len())
-                                .then(|| world.entity_locations[idx].as_ref())
-                                .flatten()
-                            else {
+                            let Some(loc) = world.validate_entity(entity) else {
                                 continue;
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
@@ -2728,17 +2696,8 @@ impl ScanBuilder<'_> {
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn(&expr);
                         for entity in candidates {
-                            if !world.is_alive(entity) {
+                            let Some(loc) = world.validate_entity(entity) else {
                                 continue;
-                            }
-                            // Look up archetype — skip unplaced entities and check
-                            // required components.
-                            let idx = entity.index() as usize;
-                            let Some(loc) = (idx < world.entity_locations.len())
-                                .then(|| world.entity_locations[idx].as_ref())
-                                .flatten()
-                            else {
-                                continue; // alive but unplaced — no archetype
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];
                             if !required.is_subset(&arch.component_ids) {
@@ -2762,14 +2721,7 @@ impl ScanBuilder<'_> {
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
                         let candidates = lookup_fn();
                         for &entity in candidates.iter() {
-                            if !world.is_alive(entity) {
-                                continue;
-                            }
-                            let idx = entity.index() as usize;
-                            let Some(loc) = (idx < world.entity_locations.len())
-                                .then(|| world.entity_locations[idx].as_ref())
-                                .flatten()
-                            else {
+                            let Some(loc) = world.validate_entity(entity) else {
                                 continue;
                             };
                             let arch = &world.archetypes.archetypes[loc.archetype_id.0];

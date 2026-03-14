@@ -619,6 +619,28 @@ impl World {
         self.entities.is_alive(entity)
     }
 
+    /// Fused generation check + location lookup for the index-gather hot path.
+    ///
+    /// Returns `Some(&EntityLocation)` if the entity is alive and placed,
+    /// `None` otherwise. Avoids the redundant bounds check that happens when
+    /// `is_alive` and `entity_locations[idx]` are called separately — the
+    /// generation array and location array grow in lockstep, so a single
+    /// bounds check suffices.
+    #[inline]
+    pub(crate) fn validate_entity(&self, entity: Entity) -> Option<&EntityLocation> {
+        let idx = entity.index() as usize;
+        // Single bounds check: generations and entity_locations grow together
+        // (both resized in alloc_entity / spawn / place_entity), so if idx is
+        // in bounds for generations it is also in bounds for entity_locations.
+        if idx >= self.entities.generations.len() {
+            return None;
+        }
+        if self.entities.generations[idx] != entity.generation() {
+            return None;
+        }
+        self.entity_locations[idx].as_ref()
+    }
+
     /// Returns true if the entity is alive and currently carries component `T`.
     ///
     /// For archetype components, this is a bitset check. For sparse components,
