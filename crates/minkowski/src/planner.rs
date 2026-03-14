@@ -1392,9 +1392,7 @@ fn collect_matching_entities(
 /// Carries the spatial lookup function and expression from Phase 1
 /// (predicate classification) to Phase 8 (closure compilation).
 struct SpatialDriver {
-    #[expect(dead_code)]
     expr: SpatialExpr,
-    #[expect(dead_code)]
     lookup_fn: SpatialLookupFn,
 }
 
@@ -1415,12 +1413,11 @@ pub struct ScanBuilder<'w> {
     left_required: Option<FixedBitSet>,
     /// Changed component bitset for left-side change detection in join plans.
     left_changed: Option<FixedBitSet>,
-    /// Spatial index driver — set when a spatial predicate is chosen as the
-    /// driving access and the index has a registered lookup function.
+    /// Spatial index driver — reserved for future join-path integration; the
+    /// active driver is computed locally in `build()` from `spatial_preds`.
     #[expect(dead_code)]
     spatial_driver: Option<SpatialDriver>,
     /// Changed component bitset for spatial index-gather path.
-    #[expect(dead_code)]
     changed_for_spatial: Option<FixedBitSet>,
 }
 
@@ -1478,7 +1475,7 @@ impl ScanBuilder<'_> {
     }
 
     /// Compile the scan into an optimized execution plan.
-    pub fn build(self) -> QueryPlanResult {
+    pub fn build(mut self) -> QueryPlanResult {
         let mut warnings = Vec::new();
 
         // Phase 1: Classify predicates — index-driven vs spatial vs post-filter.
@@ -1601,7 +1598,7 @@ impl ScanBuilder<'_> {
         };
 
         // Task 2g: Compute spatial driver — carries lookup fn + expr to Phase 8.
-        let _spatial_driver = if use_spatial_driver && !spatial_preds.is_empty() {
+        let spatial_driver = if use_spatial_driver && !spatial_preds.is_empty() {
             let (first_pred, _, first_lookup) = &spatial_preds[0];
             if let Some(lookup_fn) = first_lookup {
                 let PredicateKind::Spatial(sp) = &first_pred.kind else {
@@ -1830,49 +1827,123 @@ impl ScanBuilder<'_> {
         // Phase 8: Compile zero-alloc for_each / for_each_raw for scan-only plans.
         // Enabled when there are no joins — predicates are fused as
         // per-entity filters into the scan closure.
+        //
+        // When a spatial driver is available, an index-gather path is compiled
+        // instead of the usual archetype scan: the lookup function is called to
+        // obtain candidate entities, which are then filtered for liveness,
+        // Changed<T> compliance, and any remaining post-filter predicates.
         // Clone filter fns for the raw variant (Arc clone is a ref-count bump).
         let all_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
 
-        let compiled_for_each = if self.joins.is_empty() {
-            self.compile_for_each.map(|factory| {
-                let mut scan_fn = factory();
+        // Take the changed bitset once; clone it for the raw variant.
+        let changed_for_index = self.changed_for_spatial.take().unwrap_or_default();
+        let changed_for_index_raw = changed_for_index.clone();
 
-                if all_filter_fns.is_empty() {
-                    scan_fn
-                } else {
-                    Box::new(
-                        move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
-                            scan_fn(world, tick, &mut |entity: Entity| {
-                                if all_filter_fns.iter().all(|f| f(world, entity)) {
-                                    callback(entity);
+        let compiled_for_each = if self.joins.is_empty() {
+            if let Some(ref driver) = spatial_driver {
+                // Index-gather path: call the lookup function instead of
+                // scanning archetypes.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let changed = changed_for_index;
+                Some(Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        let candidates = lookup_fn(&expr);
+                        for entity in candidates {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            if !changed.is_clear() {
+                                let idx = entity.index() as usize;
+                                if idx < world.entity_locations.len()
+                                    && let Some(ref loc) = world.entity_locations[idx]
+                                {
+                                    let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                                    if !passes_change_filter(arch, &changed, tick) {
+                                        continue;
+                                    }
                                 }
-                            });
-                        },
-                    )
-                }
-            })
+                            }
+                            if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        }
+                    },
+                ) as CompiledForEach)
+            } else {
+                // Existing archetype-scan path (unchanged).
+                self.compile_for_each.map(|factory| {
+                    let mut scan_fn = factory();
+
+                    if all_filter_fns.is_empty() {
+                        scan_fn
+                    } else {
+                        Box::new(
+                            move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                                scan_fn(world, tick, &mut |entity: Entity| {
+                                    if all_filter_fns.iter().all(|f| f(world, entity)) {
+                                        callback(entity);
+                                    }
+                                });
+                            },
+                        )
+                    }
+                })
+            }
         } else {
             None
         };
 
         let compiled_for_each_raw = if self.joins.is_empty() {
-            self.compile_for_each_raw.map(|factory| {
-                let mut scan_fn = factory();
-
-                if all_filter_fns_raw.is_empty() {
-                    scan_fn
-                } else {
-                    Box::new(
-                        move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
-                            scan_fn(world, tick, &mut |entity: Entity| {
-                                if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
-                                    callback(entity);
+            if let Some(ref driver) = spatial_driver {
+                // Index-gather path for the raw (transactional read) variant.
+                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let expr = driver.expr.clone();
+                let changed = changed_for_index_raw;
+                Some(Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        let candidates = lookup_fn(&expr);
+                        for entity in candidates {
+                            if !world.is_alive(entity) {
+                                continue;
+                            }
+                            if !changed.is_clear() {
+                                let idx = entity.index() as usize;
+                                if idx < world.entity_locations.len()
+                                    && let Some(ref loc) = world.entity_locations[idx]
+                                {
+                                    let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                                    if !passes_change_filter(arch, &changed, tick) {
+                                        continue;
+                                    }
                                 }
-                            });
-                        },
-                    )
-                }
-            })
+                            }
+                            if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
+                                callback(entity);
+                            }
+                        }
+                    },
+                ) as CompiledForEachRaw)
+            } else {
+                // Existing archetype-scan path for the raw variant (unchanged).
+                self.compile_for_each_raw.map(|factory| {
+                    let mut scan_fn = factory();
+
+                    if all_filter_fns_raw.is_empty() {
+                        scan_fn
+                    } else {
+                        Box::new(
+                            move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                                scan_fn(world, tick, &mut |entity: Entity| {
+                                    if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
+                                        callback(entity);
+                                    }
+                                });
+                            },
+                        )
+                    }
+                })
+            }
         } else {
             None
         };
@@ -6114,5 +6185,49 @@ mod tests {
             "expected IndexLookup as driver when BTree full plan cost is lower, got {:?}",
             plan.root()
         );
+    }
+
+    #[test]
+    fn spatial_index_for_each_uses_lookup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+        let _e3 = world.spawn((Pos { x: 100.0, y: 100.0 },));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(
+            Arc::new(grid),
+            &world,
+            move |_expr: &crate::index::SpatialExpr| {
+                call_count_clone.fetch_add(1, Ordering::Relaxed);
+                vec![e1, e2]
+            },
+        );
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 10.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| {
+            results.push(entity);
+        });
+
+        assert!(
+            call_count.load(Ordering::Relaxed) > 0,
+            "lookup function was never called"
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
     }
 }
