@@ -6303,4 +6303,168 @@ mod tests {
         );
         assert_eq!(results.len(), 2);
     }
+
+    #[test]
+    fn spatial_index_execute_returns_correct_entities() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+        let _far = world.spawn((Pos { x: 999.0, y: 999.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true))
+            .build();
+
+        let results = plan.execute(&mut world);
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+    }
+
+    #[test]
+    fn spatial_index_stale_entities_filtered() {
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2]
+        });
+
+        // Build the plan while the planner still borrows world, then drop planner.
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 5.0, |_, _| true))
+            .build();
+
+        // Now we can mutate world — despawn e2 after the plan is built.
+        world.despawn(e2);
+
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_for_each_raw_works() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            cc.fetch_add(1, Ordering::Relaxed);
+            vec![e1]
+        });
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([1.0, 1.0], 5.0, |_, _| true))
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each_raw(&world, |entity| results.push(entity));
+
+        assert!(call_count.load(Ordering::Relaxed) > 0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], e1);
+    }
+
+    #[test]
+    fn spatial_index_without_lookup_falls_back() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: i as f32,
+            },));
+        }
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index::<Pos>(Arc::new(grid), &world);
+
+        let mut plan = planner
+            .scan::<(&Pos,)>()
+            .filter(Predicate::within::<Pos>([5.0, 5.0], 100.0, |_, _| true))
+            .build();
+
+        let mut count = 0;
+        plan.for_each(&mut world, |_| count += 1);
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn spatial_index_with_changed_filter() {
+        // Changed<T> is column-granular (per archetype), not per-entity.
+        // If any entity's column is mutated, the whole archetype passes
+        // Changed<T> on the next scan. This test verifies that behavior
+        // in the spatial index-gather path.
+        let mut world = World::new();
+        let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
+        let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
+
+        // Spawn an entity in a SEPARATE archetype (with Score) so we can verify
+        // the column-level filter skips the unmodified archetype on the second scan.
+        let e3 = world.spawn((Pos { x: 3.0, y: 3.0 }, Score(99)));
+
+        let mut grid = TestGridIndex::new();
+        grid.rebuild(&mut world);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
+            vec![e1, e2, e3]
+        });
+
+        let mut plan = planner
+            .scan::<(Changed<Pos>, &Pos)>()
+            .filter(Predicate::within::<Pos>([1.5, 1.5], 10.0, |_, _| true))
+            .build();
+
+        // First scan — all entities "changed" (never read before by this plan).
+        let mut results = Vec::new();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(results.len(), 3, "all entities pass on first scan");
+
+        // Mutate only e1's Pos — this marks the (Pos) archetype column as changed
+        // but NOT the (Pos, Score) archetype.
+        world.get_mut::<Pos>(e1).unwrap().x = 99.0;
+
+        // Second scan — only the archetype containing e1/e2 (which was mutated) passes
+        // Changed<Pos>. e3's (Pos, Score) archetype was not touched, so it is filtered out.
+        results.clear();
+        plan.for_each(&mut world, |entity| results.push(entity));
+        assert_eq!(
+            results.len(),
+            2,
+            "only entities in the mutated archetype pass Changed<Pos>"
+        );
+        assert!(results.contains(&e1));
+        assert!(results.contains(&e2));
+        assert!(!results.contains(&e3));
+    }
 }
