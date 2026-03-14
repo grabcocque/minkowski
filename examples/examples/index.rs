@@ -1,4 +1,4 @@
-//! Column indexes — B-tree range queries and hash exact lookups.
+//! Column indexes — B-tree range queries, hash exact lookups, and planned queries.
 //!
 //! Run: cargo run -p minkowski-examples --example index --release
 //!
@@ -8,8 +8,11 @@
 //! - Exact lookup
 //! - Incremental update after mutations via per-index ChangeTick
 //! - Stale entry detection after despawn
+//! - Planned queries via QueryPlanner with IndexDriver execution
 
-use minkowski::{BTreeIndex, HashIndex, SpatialIndex, World};
+use std::sync::Arc;
+
+use minkowski::{BTreeIndex, HashIndex, Predicate, QueryPlanner, SpatialIndex, World};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Score(u32);
@@ -166,5 +169,55 @@ fn main() {
     );
     println!();
 
+    // -- Planned queries via QueryPlanner (the recommended path) --
+    //
+    // Wrap indexes in Arc so the planner can hold live references to them.
+    // The planner calls the lookup closure at execution time — it reads the
+    // live index, not a snapshot captured at registration.
+    let btree = Arc::new(btree);
+    let hash = Arc::new(hash);
+
+    // Build all plans before dropping the planner — planner holds &world,
+    // so it must be released before for_each takes &mut world.
+    let (mut range_plan, mut eq_plan) = {
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index::<Score>(&btree, &world).unwrap();
+        planner.add_hash_index::<Score>(&hash, &world).unwrap();
+
+        // Range query — planner selects IndexGather(BTree) as the driving access.
+        let range_plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::range::<Score, _>(Score(110)..Score(120)))
+            .build();
+
+        // Exact lookup — planner selects IndexGather(Hash) for O(1) eq lookup.
+        let eq_plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::eq(Score(42)))
+            .build();
+
+        (range_plan, eq_plan)
+    }; // planner dropped here, releasing &world
+
+    println!(
+        "Planned range [110..120) explain:\n{}",
+        range_plan.explain()
+    );
+    let mut planned_range_count = 0;
+    range_plan
+        .for_each(&mut world, |_| planned_range_count += 1)
+        .unwrap();
+    println!("Planned range [110..120): {planned_range_count} entities (expected 10)");
+    assert_eq!(planned_range_count, 10);
+    println!();
+
+    let mut planned_eq_count = 0;
+    eq_plan
+        .for_each(&mut world, |_| planned_eq_count += 1)
+        .unwrap();
+    println!("Planned eq Score(42): {planned_eq_count} entities (expected 1)");
+    assert_eq!(planned_eq_count, 1);
+
+    println!();
     println!("Done.");
 }
