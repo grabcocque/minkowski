@@ -127,8 +127,7 @@ pub fn add_spatial_index_with_lookup<T: Component>(
 )
 ```
 
-`add_spatial_index` delegates to `add_spatial_index_with_lookup` with
-`lookup_fn: None` internally.
+`add_spatial_index` constructs a `SpatialIndexDescriptor` with `lookup_fn: None` directly (same pattern, independent implementation).
 
 Updated descriptor:
 
@@ -207,7 +206,7 @@ move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
         }
         // Changed<T> filtering: look up entity's archetype and check
         // column ticks, same as the scan path does per-archetype.
-        if !changed.is_empty() {
+        if !changed.is_clear() {
             if let Some(loc) = world.entity_location(entity) {
                 let arch = &world.archetypes.archetypes[loc.archetype_id];
                 if !passes_change_filter(arch, &changed, tick) {
@@ -228,7 +227,7 @@ move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
 2. `Changed<T>` is handled explicitly via per-entity archetype lookup. The
    scan path checks `passes_change_filter` once per archetype. The
    index-gather path checks it per entity because candidates may span
-   multiple archetypes. The `changed.is_empty()` fast-path skips this
+   multiple archetypes. The `changed.is_clear()` fast-path skips this
    entirely when no `Changed<T>` filter is in the query.
 3. All `filter_fns` run — both the spatial predicate's own closure (which
    typically calls `world.get::<T>(entity)`, implicitly validating
@@ -257,7 +256,7 @@ Join left-side collection:
   if spatial_driver.lookup_fn is Some:
       for entity in lookup_fn(&expr):
           if !world.is_alive(entity): continue
-          if !changed.is_empty(): check passes_change_filter via entity_location
+          if !changed.is_clear(): check passes_change_filter via entity_location
           if filter_fns.all(ok):
               scratch.push(entity)
   else:
@@ -458,7 +457,7 @@ not World data — same as BTree/Hash today. Access bitset is accurate.
   index-gather pattern: lookup → `is_alive` → `Changed<T>` via
   `entity_location` + `passes_change_filter` → `filter_fns`.
 - The `changed` bitset must be captured into the index-gather closure for
-  `Changed<T>` filtering. Use `changed.is_empty()` fast-path to skip the
+  `Changed<T>` filtering. Use `changed.is_clear()` fast-path to skip the
   archetype lookup when no change filter is active.
 - Existing archetype-scan path unchanged (else branch).
 

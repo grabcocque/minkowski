@@ -3,7 +3,7 @@
 //!
 //! The planner is designed for an in-memory ECS where data already lives in L1/L2
 //! cache. Planning overhead is kept to O(indexes + predicates). Plans are
-//! executable against live world data: scan-only plans use zero-alloc `for_each`
+//! executable against live world data: scan-only plans without a spatial driver use zero-alloc `for_each`
 //! with fused filter closures; join plans use a scratch-buffer intersection model.
 //!
 //! # Volcano Model
@@ -152,20 +152,28 @@ impl Cost {
     }
 
     fn spatial_lookup(spatial_cost: &SpatialCost) -> Self {
-        debug_assert!(
-            spatial_cost.estimated_rows.is_finite() && spatial_cost.estimated_rows >= 0.0,
-            "SpatialCost::estimated_rows must be finite and non-negative, got {}",
+        let rows = if spatial_cost.estimated_rows.is_finite() && spatial_cost.estimated_rows >= 0.0
+        {
             spatial_cost.estimated_rows
-        );
-        debug_assert!(
-            spatial_cost.cpu.is_finite() && spatial_cost.cpu >= 0.0,
-            "SpatialCost::cpu must be finite and non-negative, got {}",
+        } else {
+            debug_assert!(
+                false,
+                "SpatialCost::estimated_rows must be finite and non-negative, got {}",
+                spatial_cost.estimated_rows
+            );
+            1.0
+        };
+        let cpu = if spatial_cost.cpu.is_finite() && spatial_cost.cpu >= 0.0 {
             spatial_cost.cpu
-        );
-        Cost {
-            rows: spatial_cost.estimated_rows,
-            cpu: spatial_cost.cpu,
-        }
+        } else {
+            debug_assert!(
+                false,
+                "SpatialCost::cpu must be finite and non-negative, got {}",
+                spatial_cost.cpu
+            );
+            10.0
+        };
+        Cost { rows, cpu }
     }
 
     fn filter(input: Cost, selectivity: f64) -> Self {
@@ -453,11 +461,15 @@ impl Predicate {
         radius: f64,
         filter: impl Fn(&World, Entity) -> bool + Send + Sync + 'static,
     ) -> Self {
-        debug_assert!(
+        assert!(
             radius >= 0.0 && radius.is_finite(),
             "Predicate::within: radius must be finite and non-negative, got {radius}"
         );
         let center = center.into();
+        assert!(
+            !center.is_empty(),
+            "Predicate::within: center must have at least one coordinate"
+        );
         // Conservative default — override via .with_selectivity().
         let selectivity = sanitize_selectivity(0.1);
         Predicate {
@@ -492,12 +504,20 @@ impl Predicate {
     ) -> Self {
         let min = min.into();
         let max = max.into();
-        debug_assert!(
+        assert!(
             min.len() == max.len(),
             "Predicate::intersects: min and max must have the same dimensionality, \
              got {} vs {}",
             min.len(),
             max.len()
+        );
+        assert!(
+            !min.is_empty(),
+            "Predicate::intersects: coordinates must have at least one dimension"
+        );
+        assert!(
+            min.iter().zip(max.iter()).all(|(lo, hi)| lo <= hi),
+            "Predicate::intersects: min must be <= max in all dimensions"
         );
         // Conservative default — override via .with_selectivity().
         let selectivity = sanitize_selectivity(0.1);
@@ -939,8 +959,10 @@ impl QueryPlanResult {
 
     /// Execute the compiled scan, calling `callback` for each matching entity.
     ///
-    /// For scan-only plans (no joins), this compiles to archetype iteration
-    /// with no intermediate allocation. Zero-alloc during execution.
+    /// For scan-only plans (no joins) without a spatial index driver, this
+    /// compiles to archetype iteration with no intermediate allocation.
+    /// When a spatial driver is present, the lookup function allocates
+    /// a candidate list per call.
     ///
     /// # Panics
     /// Panics if the plan was not compiled with scan support.
@@ -1349,8 +1371,10 @@ struct JoinExec {
 
 /// Returns true if every component in `changed` has a column in the archetype
 /// whose tick is newer than `tick`. When `changed` is empty (no `Changed<T>`
-/// terms), returns true immediately. For well-formed queries the column will
-/// always be present because `required` is checked before this function.
+/// terms), returns true immediately. For archetype-scan paths the column will
+/// always be present because `required` is checked first. For index-gather
+/// paths, the column may be absent if the entity's archetype does not contain
+/// the component; `is_some_and` handles this by returning false.
 #[inline]
 fn passes_change_filter(
     arch: &crate::storage::archetype::Archetype,
@@ -1389,8 +1413,8 @@ fn collect_matching_entities(
 
 // ── Scan builder ─────────────────────────────────────────────────────
 
-/// Carries the spatial lookup function and expression from Phase 1
-/// (predicate classification) to Phase 8 (closure compilation).
+/// Carries the spatial lookup function and expression resolved during Phase 3
+/// (driver selection) to Phase 7 (join collectors) and Phase 8 (closure compilation).
 struct SpatialDriver {
     expr: SpatialExpr,
     lookup_fn: SpatialLookupFn,
@@ -1413,10 +1437,8 @@ pub struct ScanBuilder<'w> {
     left_required: Option<FixedBitSet>,
     /// Changed component bitset for left-side change detection in join plans.
     left_changed: Option<FixedBitSet>,
-    /// Spatial index driver — reserved for future join-path integration; the
-    /// active driver is computed locally in `build()` from `spatial_preds`.
-    #[expect(dead_code)]
-    spatial_driver: Option<SpatialDriver>,
+    /// Required component bitset for spatial index-gather path.
+    required_for_spatial: Option<FixedBitSet>,
     /// Changed component bitset for spatial index-gather path.
     changed_for_spatial: Option<FixedBitSet>,
 }
@@ -1597,7 +1619,7 @@ impl ScanBuilder<'_> {
             _ => false,
         };
 
-        // Task 2g: Compute spatial driver — carries lookup fn + expr to Phase 8.
+        // Compute spatial driver if spatial is the best driving access.
         let spatial_driver = if use_spatial_driver && !spatial_preds.is_empty() {
             let (first_pred, _, first_lookup) = &spatial_preds[0];
             if let Some(lookup_fn) = first_lookup {
@@ -1770,6 +1792,7 @@ impl ScanBuilder<'_> {
                 // archetype scanning. Mirrors the Phase 8 index-gather closure.
                 let lookup_fn = Arc::clone(&driver.lookup_fn);
                 let expr = driver.expr.clone();
+                let left_required_for_index = left_required.clone();
                 let left_changed_for_index = left_changed.clone();
                 Box::new(
                     move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
@@ -1778,16 +1801,23 @@ impl ScanBuilder<'_> {
                             if !world.is_alive(entity) {
                                 continue;
                             }
-                            if !left_changed_for_index.is_clear() {
-                                let idx = entity.index() as usize;
-                                if idx < world.entity_locations.len()
-                                    && let Some(ref loc) = world.entity_locations[idx]
-                                {
-                                    let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                                    if !passes_change_filter(arch, &left_changed_for_index, tick) {
-                                        continue;
-                                    }
-                                }
+                            // Look up archetype — skip unplaced entities and check
+                            // required components.
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !left_required_for_index.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !left_changed_for_index.is_clear()
+                                && !passes_change_filter(arch, &left_changed_for_index, tick)
+                            {
+                                continue;
                             }
                             if left_filters.iter().all(|f| f(world, entity)) {
                                 scratch.push(entity);
@@ -1858,7 +1888,7 @@ impl ScanBuilder<'_> {
             None
         };
 
-        // Phase 8: Compile zero-alloc for_each / for_each_raw for scan-only plans.
+        // Phase 8: Compile for_each / for_each_raw closures for scan-only plans.
         // Enabled when there are no joins — predicates are fused as
         // per-entity filters into the scan closure.
         //
@@ -1869,7 +1899,9 @@ impl ScanBuilder<'_> {
         // Clone filter fns for the raw variant (Arc clone is a ref-count bump).
         let all_filter_fns_raw: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
 
-        // Take the changed bitset once; clone it for the raw variant.
+        // Take the required and changed bitsets; clone for the raw variant.
+        let required_for_index = self.required_for_spatial.take().unwrap_or_default();
+        let required_for_index_raw = required_for_index.clone();
         let changed_for_index = self.changed_for_spatial.take().unwrap_or_default();
         let changed_for_index_raw = changed_for_index.clone();
 
@@ -1879,6 +1911,7 @@ impl ScanBuilder<'_> {
                 // scanning archetypes.
                 let lookup_fn = Arc::clone(&driver.lookup_fn);
                 let expr = driver.expr.clone();
+                let required = required_for_index;
                 let changed = changed_for_index;
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
@@ -1887,16 +1920,21 @@ impl ScanBuilder<'_> {
                             if !world.is_alive(entity) {
                                 continue;
                             }
-                            if !changed.is_clear() {
-                                let idx = entity.index() as usize;
-                                if idx < world.entity_locations.len()
-                                    && let Some(ref loc) = world.entity_locations[idx]
-                                {
-                                    let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                                    if !passes_change_filter(arch, &changed, tick) {
-                                        continue;
-                                    }
-                                }
+                            // Look up archetype — skip unplaced entities and check
+                            // required components.
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
+                                continue;
                             }
                             if all_filter_fns.iter().all(|f| f(world, entity)) {
                                 callback(entity);
@@ -1933,6 +1971,7 @@ impl ScanBuilder<'_> {
                 // Index-gather path for the raw (transactional read) variant.
                 let lookup_fn = Arc::clone(&driver.lookup_fn);
                 let expr = driver.expr.clone();
+                let required = required_for_index_raw;
                 let changed = changed_for_index_raw;
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
@@ -1941,16 +1980,21 @@ impl ScanBuilder<'_> {
                             if !world.is_alive(entity) {
                                 continue;
                             }
-                            if !changed.is_clear() {
-                                let idx = entity.index() as usize;
-                                if idx < world.entity_locations.len()
-                                    && let Some(ref loc) = world.entity_locations[idx]
-                                {
-                                    let arch = &world.archetypes.archetypes[loc.archetype_id.0];
-                                    if !passes_change_filter(arch, &changed, tick) {
-                                        continue;
-                                    }
-                                }
+                            // Look up archetype — skip unplaced entities and check
+                            // required components.
+                            let idx = entity.index() as usize;
+                            let Some(loc) = (idx < world.entity_locations.len())
+                                .then(|| world.entity_locations[idx].as_ref())
+                                .flatten()
+                            else {
+                                continue; // alive but unplaced — no archetype
+                            };
+                            let arch = &world.archetypes.archetypes[loc.archetype_id.0];
+                            if !required.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !changed.is_clear() && !passes_change_filter(arch, &changed, tick) {
+                                continue;
                             }
                             if all_filter_fns_raw.iter().all(|f| f(world, entity)) {
                                 callback(entity);
@@ -2225,6 +2269,9 @@ impl<'w> QueryPlanner<'w> {
     /// protocol and the index's concrete query API. The planner makes no
     /// assumptions about how the index answers queries — the closure is the
     /// adapter.
+    ///
+    /// # Panics
+    /// Panics if `T` has not been registered as a component in `world`.
     pub fn add_spatial_index_with_lookup<T: Component>(
         &mut self,
         index: Arc<dyn SpatialIndex + Send + Sync>,
@@ -2250,6 +2297,7 @@ impl<'w> QueryPlanner<'w> {
     pub fn scan<Q: crate::query::fetch::WorldQuery + 'static>(&'w self) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let changed = Q::changed_ids(self.components);
+        let required_for_spatial = required.clone();
         let changed_for_spatial = changed.clone();
         let required_for_each = required.clone();
         let changed_for_each = changed.clone();
@@ -2303,7 +2351,7 @@ impl<'w> QueryPlanner<'w> {
             })),
             left_required: Some(left_required),
             left_changed: Some(left_changed),
-            spatial_driver: None,
+            required_for_spatial: Some(required_for_spatial),
             changed_for_spatial: Some(changed_for_spatial),
         }
     }
@@ -2318,6 +2366,7 @@ impl<'w> QueryPlanner<'w> {
     ) -> ScanBuilder<'w> {
         let required = Q::required_ids(self.components);
         let changed = Q::changed_ids(self.components);
+        let required_for_spatial = required.clone();
         let changed_for_spatial = changed.clone();
         let required_for_each = required.clone();
         let changed_for_each = changed.clone();
@@ -2371,7 +2420,7 @@ impl<'w> QueryPlanner<'w> {
             })),
             left_required: Some(left_required),
             left_changed: Some(left_changed),
-            spatial_driver: None,
+            required_for_spatial: Some(required_for_spatial),
             changed_for_spatial: Some(changed_for_spatial),
         }
     }
