@@ -1074,40 +1074,8 @@ mod loom_tests {
     use loom::thread;
     use std::alloc::Layout;
 
-    /// Two threads concurrently allocate and deallocate from the same pool.
-    /// Verifies: (1) no double-allocation (all pointers unique), (2) `used_bytes`
-    /// returns to zero after all deallocations.
     #[test]
-    fn loom_concurrent_allocate_deallocate() {
-        loom::model(|| {
-            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
-            let layout = Layout::from_size_align(64, 64).unwrap();
-
-            let p1 = pool.clone();
-            let t1 = thread::spawn(move || {
-                let ptr = p1.allocate(layout).unwrap();
-                // SAFETY: ptr from allocate, deallocated once.
-                unsafe { p1.deallocate(ptr, layout) };
-            });
-
-            let p2 = pool.clone();
-            let t2 = thread::spawn(move || {
-                let ptr = p2.allocate(layout).unwrap();
-                // SAFETY: ptr from allocate, deallocated once.
-                unsafe { p2.deallocate(ptr, layout) };
-            });
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-
-            assert_eq!(pool.used(), Some(0));
-        });
-    }
-
-    /// Two threads allocate from the same size class. Verifies no duplicate
-    /// pointers are returned (the Mutex serializes access correctly).
-    #[test]
-    fn loom_no_duplicate_allocations() {
+    fn loom_concurrent_pop_no_duplicates() {
         loom::model(|| {
             let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
             let layout = Layout::from_size_align(64, 64).unwrap();
@@ -1120,12 +1088,62 @@ mod loom_tests {
 
             let ptr1 = t1.join().unwrap();
             let ptr2 = t2.join().unwrap();
-
             assert_ne!(
                 ptr1.as_ptr(),
                 ptr2.as_ptr(),
                 "two threads got the same block"
             );
+        });
+    }
+
+    #[test]
+    fn loom_concurrent_push_no_lost_blocks() {
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            // Allocate two blocks.
+            let ptr1 = pool.allocate(layout).unwrap();
+            let ptr2 = pool.allocate(layout).unwrap();
+
+            // Deallocate concurrently.
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || unsafe { p1.deallocate(ptr1, layout) });
+
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || unsafe { p2.deallocate(ptr2, layout) });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(
+                pool.used(),
+                Some(0),
+                "blocks were lost during concurrent push"
+            );
+        });
+    }
+
+    #[test]
+    fn loom_push_pop_concurrent() {
+        loom::model(|| {
+            let pool = Arc::new(SlabPool::new(4 * 1024 * 1024, HugePages::Off).unwrap());
+            let layout = Layout::from_size_align(64, 64).unwrap();
+
+            let ptr = pool.allocate(layout).unwrap();
+
+            let p1 = pool.clone();
+            let t1 = thread::spawn(move || unsafe { p1.deallocate(ptr, layout) });
+
+            let p2 = pool.clone();
+            let t2 = thread::spawn(move || p2.allocate(layout));
+
+            t1.join().unwrap();
+            let _ = t2.join().unwrap(); // may or may not succeed
+
+            // Final state: either 0 or 1 block allocated.
+            let used = pool.used().unwrap();
+            assert!(used == 0 || used == SIZE_CLASSES[0]);
         });
     }
 }
