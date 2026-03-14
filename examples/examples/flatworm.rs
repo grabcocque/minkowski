@@ -420,7 +420,7 @@ fn main() {
                     }
                 }
             }
-            eaten.apply(&mut world);
+            eaten.apply(&mut world).unwrap();
         }
 
         // Step 6: Fission — worms that exceed the energy threshold split in two
@@ -460,7 +460,7 @@ fn main() {
                 ));
                 total_fissions += 1;
             }
-            cmds.apply(&mut world);
+            cmds.apply(&mut world).unwrap();
         }
 
         // Step 7: Starvation — despawn worms below minimum energy
@@ -476,7 +476,7 @@ fn main() {
                 cmds.despawn(entity);
             }
             total_deaths += starved.len();
-            cmds.apply(&mut world);
+            cmds.apply(&mut world).unwrap();
         }
 
         // Step 8: Replenish food

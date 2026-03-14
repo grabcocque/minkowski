@@ -578,9 +578,12 @@ fn main() {
                 Ok(()) => {
                     println!("    attack: HVT {} second hit succeeded", high_value_target);
                 }
-                Err(conflict) => {
+                Err(minkowski::TransactError::Conflict(conflict)) => {
                     total_conflicts += 1;
                     println!("    CONFLICT on HVT: {}", conflict.display_with(&world));
+                }
+                Err(e) => {
+                    println!("    ERROR on HVT: {e}");
                 }
             }
         }
@@ -622,9 +625,12 @@ fn main() {
                                 attacker, target_unit, ATTACK_DAMAGE, hp_val
                             );
                         }
-                        Err(conflict) => {
+                        Err(minkowski::TransactError::Conflict(conflict)) => {
                             total_conflicts += 1;
                             println!("    CONFLICT: {}", conflict.display_with(&world));
+                        }
+                        Err(e) => {
+                            println!("    ERROR: {e}");
                         }
                     }
                 }
@@ -737,7 +743,7 @@ fn main() {
             frame_changeset.record_despawn(*target);
             total_kills += 1;
         }
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         // Recon scan: spot enemies using spatial grid
         {

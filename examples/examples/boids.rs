@@ -409,7 +409,7 @@ fn main() {
                 let idx = fastrand::usize(..count);
                 cmds.despawn(entities[idx]);
             }
-            cmds.apply(&mut world);
+            cmds.apply(&mut world).unwrap();
 
             let current = world.query::<&Position>().count();
             let deficit = ENTITY_COUNT.saturating_sub(current);

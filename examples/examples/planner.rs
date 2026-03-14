@@ -84,8 +84,8 @@ fn main() {
 
     // Create planner and register indexes
     let mut planner = QueryPlanner::new(&world);
-    planner.add_btree_index(&score_btree, &world);
-    planner.add_hash_index(&team_hash, &world);
+    planner.add_btree_index(&score_btree, &world).unwrap();
+    planner.add_hash_index(&team_hash, &world).unwrap();
 
     // Range query on Score — should use BTree index
     let plan = planner
@@ -132,6 +132,7 @@ fn main() {
         .scan_with_estimate::<(&Score,)>(10)
         .join::<(&Team,)>(JoinKind::Inner)
         .with_right_estimate(5)
+        .unwrap()
         .build();
     println!("Small join (10x5):");
     println!("{}", plan.explain());
@@ -223,7 +224,7 @@ fn main() {
     {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner.scan::<(&Score, &Pos)>().build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!(
             "Scan(&Score, &Pos): {} entities (expected {})",
             entities.len(),
@@ -238,7 +239,7 @@ fn main() {
             .scan::<(&Score,)>()
             .filter(Predicate::range::<Score, _>(Score(100)..Score(200)))
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!(
             "Score in [100..200): {} entities (expected 100)",
             entities.len()
@@ -253,12 +254,12 @@ fn main() {
     // Index-driven: Team == 2 via hash index
     {
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&team_hash, &world);
+        planner.add_hash_index(&team_hash, &world).unwrap();
         let mut plan = planner
             .scan::<(&Score, &Team)>()
             .filter(Predicate::eq(Team(2)))
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!("Team == 2: {} entities (expected 200)", entities.len());
         for e in entities {
             assert_eq!(*world.get::<Team>(*e).unwrap(), Team(2));
@@ -272,7 +273,7 @@ fn main() {
             .scan::<(&Score, &Pos)>()
             .join::<(&Team,)>(JoinKind::Inner)
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!("(&Score, &Pos) JOIN (&Team,): {} entities", entities.len());
         // All entities have both Score+Pos and Team, so all 1000 match
         assert_eq!(entities.len(), 1000);
@@ -287,7 +288,7 @@ fn main() {
                 w.get::<Score>(e).is_some_and(|s| s.0 % 2 == 0)
             }))
             .build();
-        let entities = plan.execute(&mut world);
+        let entities = plan.execute(&mut world).unwrap();
         println!("Even scores: {} entities (expected 500)", entities.len());
         assert_eq!(entities.len(), 500);
     }
@@ -302,7 +303,8 @@ fn main() {
         let mut count = 0;
         plan.for_each(&mut world, |_entity| {
             count += 1;
-        });
+        })
+        .unwrap();
         println!(
             "for_each scan: {count} entities (expected {})",
             world.entity_count()
@@ -320,7 +322,8 @@ fn main() {
         let mut count = 0;
         plan.for_each(&mut world, |_entity| {
             count += 1;
-        });
+        })
+        .unwrap();
         println!("for_each filtered [900..1000): {count} entities (expected 100)");
         assert_eq!(count, 100);
     }
@@ -336,7 +339,8 @@ fn main() {
         let mut count = 0;
         plan.for_each_raw(&world, |_entity| {
             count += 1;
-        });
+        })
+        .unwrap();
         println!("Read-only scan found {count} entities (no &mut World needed)");
         assert_eq!(count, world.entity_count());
     }
@@ -351,7 +355,8 @@ fn main() {
         let mut found = Vec::new();
         plan.for_each_raw(&world, |entity| {
             found.push(entity);
-        });
+        })
+        .unwrap();
         println!(
             "Read-only filtered: {} entity with Score(42) (expected 1)",
             found.len()
@@ -382,7 +387,7 @@ fn main() {
         // First call: both archetypes were written at spawn time, so
         // Changed<Score> matches both. Every entity is visible.
         let mut first_count = 0;
-        plan.for_each(&mut cworld, |_| first_count += 1);
+        plan.for_each(&mut cworld, |_| first_count += 1).unwrap();
         println!("First for_each (all new): {first_count} entities (expected 10, both archetypes)");
         assert_eq!(first_count, 10);
 
@@ -393,7 +398,7 @@ fn main() {
         // Second call: only the Score-only archetype column was touched.
         // Score+Team archetype is stale — skipped entirely.
         let mut second_count = 0;
-        plan.for_each(&mut cworld, |_| second_count += 1);
+        plan.for_each(&mut cworld, |_| second_count += 1).unwrap();
         println!(
             "Second for_each (one archetype mutated): {second_count} entities (expected 5, Score-only archetype)"
         );
@@ -401,7 +406,7 @@ fn main() {
 
         // Third call: nothing changed since the last read tick.
         let mut third_count = 0;
-        plan.for_each(&mut cworld, |_| third_count += 1);
+        plan.for_each(&mut cworld, |_| third_count += 1).unwrap();
         println!(
             "Third for_each (no new changes): {third_count} entities (expected 0, nothing changed)"
         );
@@ -490,27 +495,25 @@ fn main() {
     // index's concrete query API.
     let spatial_arc_lookup = std::sync::Arc::clone(&spatial_arc);
     let mut planner = QueryPlanner::new(&world);
-    planner.add_spatial_index_with_lookup::<Pos>(
-        std::sync::Arc::clone(&spatial_arc) as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
-        &world,
-        move |expr| match expr {
-            SpatialExpr::Within { center, radius } => {
-                assert!(center.len() >= 2, "expected at least 2D coordinates");
-                let qx = center[0] as f32;
-                let qy = center[1] as f32;
-                spatial_arc_lookup.query_within(qx, qy, *radius as f32)
-            }
-            _ => Vec::new(),
-        },
-    );
+    planner
+        .add_spatial_index_with_lookup::<Pos>(
+            std::sync::Arc::clone(&spatial_arc) as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+            &world,
+            move |expr| match expr {
+                SpatialExpr::Within { center, radius } => {
+                    assert!(center.len() >= 2, "expected at least 2D coordinates");
+                    let qx = center[0] as f32;
+                    let qy = center[1] as f32;
+                    spatial_arc_lookup.query_within(qx, qy, *radius as f32)
+                }
+                _ => Vec::new(),
+            },
+        )
+        .unwrap();
 
     let plan = planner
         .scan::<(&Pos, &Score)>()
-        .filter(Predicate::within::<Pos>(
-            vec![cx as f64, 0.0],
-            radius as f64,
-            scan_filter,
-        ))
+        .filter(Predicate::within::<Pos>(vec![cx as f64, 0.0], radius as f64, scan_filter).unwrap())
         .build();
 
     // EXPLAIN shows SpatialGather as the driving access.
@@ -519,7 +522,7 @@ fn main() {
 
     // Execute: collect entities near (50, 0) within radius 10.
     let mut plan = plan;
-    let spatial_results = plan.execute(&mut world);
+    let spatial_results = plan.execute(&mut world).unwrap();
     println!(
         "Spatial within ({cx}, 0) r={radius}: {} entities",
         spatial_results.len()
@@ -545,18 +548,20 @@ fn main() {
     let arc2c = std::sync::Arc::clone(&arc2);
 
     let mut planner2 = QueryPlanner::new(&world);
-    planner2.add_spatial_index_with_lookup::<Pos>(
-        arc2 as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
-        &world,
-        move |expr| match expr {
-            SpatialExpr::Within { center, radius } => {
-                let qx = center.first().copied().unwrap_or(0.0) as f32;
-                let qy = center.get(1).copied().unwrap_or(0.0) as f32;
-                arc2c.query_within(qx, qy, *radius as f32)
-            }
-            _ => Vec::new(),
-        },
-    );
+    planner2
+        .add_spatial_index_with_lookup::<Pos>(
+            arc2 as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+            &world,
+            move |expr| match expr {
+                SpatialExpr::Within { center, radius } => {
+                    let qx = center.first().copied().unwrap_or(0.0) as f32;
+                    let qy = center.get(1).copied().unwrap_or(0.0) as f32;
+                    arc2c.query_within(qx, qy, *radius as f32)
+                }
+                _ => Vec::new(),
+            },
+        )
+        .unwrap();
 
     let scan_filter2 = move |world: &World, e: Entity| {
         world.get::<Pos>(e).is_some_and(|p| {
@@ -567,14 +572,12 @@ fn main() {
     };
     let mut plan2 = planner2
         .scan::<(&Pos, &Score)>()
-        .filter(Predicate::within::<Pos>(
-            vec![cx as f64, 0.0],
-            radius as f64,
-            scan_filter2,
-        ))
+        .filter(
+            Predicate::within::<Pos>(vec![cx as f64, 0.0], radius as f64, scan_filter2).unwrap(),
+        )
         .build();
     let mut spatial_count = 0;
-    plan2.for_each(&mut world, |_e| spatial_count += 1);
+    plan2.for_each(&mut world, |_e| spatial_count += 1).unwrap();
     println!("for_each spatial: {spatial_count} entities (matches execute result)");
     assert_eq!(spatial_count, spatial_results.len());
 
@@ -591,7 +594,9 @@ fn main() {
         btree_exec.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree_exec), &world);
+        planner
+            .add_btree_index(&Arc::new(btree_exec), &world)
+            .unwrap();
 
         let plan = planner
             .scan::<(&Score,)>()
@@ -603,7 +608,7 @@ fn main() {
 
         let mut plan = plan;
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1);
+        plan.for_each(&mut world, |_| count += 1).unwrap();
         println!("Index eq lookup Score(42): {count} entities");
         // Score(42) was spawned once in the range 0..500.
         assert_eq!(count, 1);
@@ -612,7 +617,7 @@ fn main() {
     // Hash eq lookup: find entities with Team(2).
     {
         let mut planner = QueryPlanner::new(&world);
-        planner.add_hash_index(&team_hash, &world);
+        planner.add_hash_index(&team_hash, &world).unwrap();
 
         let plan = planner
             .scan::<(&Team,)>()
@@ -624,7 +629,7 @@ fn main() {
 
         let mut plan = plan;
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1);
+        plan.for_each(&mut world, |_| count += 1).unwrap();
         println!("Hash eq lookup Team(2): {count} entities (expected 200)");
         assert_eq!(count, 200);
     }
@@ -635,7 +640,9 @@ fn main() {
         btree_range.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
-        planner.add_btree_index(&Arc::new(btree_range), &world);
+        planner
+            .add_btree_index(&Arc::new(btree_range), &world)
+            .unwrap();
 
         let mut plan = planner
             .scan::<(&Score,)>()
@@ -643,7 +650,7 @@ fn main() {
             .build();
 
         let mut count = 0;
-        plan.for_each(&mut world, |_| count += 1);
+        plan.for_each(&mut world, |_| count += 1).unwrap();
         println!("BTree range lookup Score(100..200): {count} entities (expected 100)");
         assert_eq!(count, 100);
     }

@@ -1,7 +1,7 @@
 use crate::bundle::Bundle;
 use crate::component::Component;
 use crate::entity::Entity;
-use crate::world::World;
+use crate::world::{DeadEntity, World};
 
 /// Deferred structural mutation buffer for use during query iteration.
 ///
@@ -14,7 +14,7 @@ use crate::world::World;
 /// serialization, see [`EnumChangeSet`](crate::EnumChangeSet).
 pub struct CommandBuffer {
     #[allow(clippy::type_complexity)]
-    commands: Vec<Box<dyn FnOnce(&mut World) + Send>>,
+    commands: Vec<Box<dyn FnOnce(&mut World) -> Result<(), DeadEntity> + Send>>,
 }
 
 impl CommandBuffer {
@@ -27,31 +27,41 @@ impl CommandBuffer {
     pub fn spawn<B: Bundle>(&mut self, bundle: B) {
         self.commands.push(Box::new(move |world| {
             world.spawn(bundle);
+            Ok(())
         }));
     }
 
     pub fn despawn(&mut self, entity: Entity) {
         self.commands.push(Box::new(move |world| {
             world.despawn(entity);
+            Ok(())
         }));
     }
 
     pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         self.commands.push(Box::new(move |world| {
-            world.insert(entity, bundle);
+            world.insert(entity, bundle)?;
+            Ok(())
         }));
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) {
         self.commands.push(Box::new(move |world| {
             world.remove::<T>(entity);
+            Ok(())
         }));
     }
 
-    pub fn apply(self, world: &mut World) {
+    /// Executes all buffered commands against the world in order.
+    ///
+    /// Returns `Err(DeadEntity)` on the first command that targets a
+    /// despawned entity. Commands prior to the failure have already been
+    /// applied; commands after it are not executed.
+    pub fn apply(self, world: &mut World) -> Result<(), DeadEntity> {
         for command in self.commands {
-            command(world);
+            command(world)?;
         }
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -87,7 +97,7 @@ mod tests {
         let mut cmds = CommandBuffer::new();
         cmds.spawn((Pos { x: 1.0, y: 2.0 },));
         cmds.spawn((Pos { x: 3.0, y: 4.0 },));
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         let count = world.query::<&Pos>().count();
         assert_eq!(count, 2);
@@ -99,7 +109,7 @@ mod tests {
         let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let mut cmds = CommandBuffer::new();
         cmds.despawn(e);
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         assert!(!world.is_alive(e));
     }
@@ -110,7 +120,7 @@ mod tests {
         let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let mut cmds = CommandBuffer::new();
         cmds.insert(e, (Vel { dx: 5.0, dy: 0.0 },));
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         assert_eq!(world.get::<Vel>(e), Some(&Vel { dx: 5.0, dy: 0.0 }));
     }
@@ -121,7 +131,7 @@ mod tests {
         let e = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { dx: 5.0, dy: 0.0 }));
         let mut cmds = CommandBuffer::new();
         cmds.remove::<Vel>(e);
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         assert_eq!(world.get::<Vel>(e), None);
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 0.0 }));
@@ -143,9 +153,22 @@ mod tests {
                 cmds.despawn(entity);
             }
         }
-        cmds.apply(&mut world);
+        cmds.apply(&mut world).unwrap();
 
         let count = world.query::<&Pos>().count();
         assert_eq!(count, 3); // 0.0, 1.0, 2.0 remain
+    }
+
+    #[test]
+    fn apply_returns_error_on_dead_entity_insert() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        world.despawn(e);
+
+        let mut cmds = CommandBuffer::new();
+        cmds.insert(e, (Vel { dx: 1.0, dy: 1.0 },));
+        let result = cmds.apply(&mut world);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().entity, e);
     }
 }
