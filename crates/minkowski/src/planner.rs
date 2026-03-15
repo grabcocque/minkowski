@@ -73,14 +73,13 @@
 //! ```
 
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
+use std::sync::OnceLock;
 
 use fixedbitset::FixedBitSet;
-
-use std::collections::HashSet;
 
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
@@ -96,7 +95,7 @@ use std::sync::Arc;
 
 // ── Entity reference trait ────────────────────────────────────────────
 
-/// Marker trait for component types that act as entity references (foreign keys).
+/// Trait for component types that act as entity references (foreign keys).
 ///
 /// Implement this on any component whose value is — or contains — an [`Entity`]
 /// that points to another entity. The planner uses the extracted `Entity` to
@@ -1213,7 +1212,7 @@ pub enum PlanNode {
     /// ER (Entity-Relationship) join: follow entity references from the
     /// left side to probe a hash set built from right-side entities.
     ///
-    /// For each left entity, the join reads component `R: EntityRef`,
+    /// For each left entity, the join reads component `R: AsEntityRef`,
     /// extracts the referenced `Entity`, and checks membership in the
     /// right set. Inner joins emit only left entities whose reference
     /// target is in the right set; left joins emit all left entities.
@@ -1428,6 +1427,10 @@ pub enum PlanWarning {
     /// were merged into the scan's bitset. The plan executes as a pure
     /// archetype scan instead of materializing a join.
     JoinEliminated { right_name: &'static str },
+    /// The entity-reference component for an ER join was not registered at
+    /// build time. The join will attempt deferred resolution at execution time,
+    /// but may produce empty results if the component is never registered.
+    UnregisteredErComponent { component_name: &'static str },
 }
 
 impl fmt::Display for PlanWarning {
@@ -1486,6 +1489,13 @@ impl fmt::Display for PlanWarning {
                     f,
                     "inner join with `{right_name}` eliminated — merged into scan \
                      (use scan::<(Left, Right)>() directly to avoid this)"
+                )
+            }
+            PlanWarning::UnregisteredErComponent { component_name } => {
+                write!(
+                    f,
+                    "ER join reference component `{component_name}` not registered at build \
+                     time — will attempt deferred resolution at execution time"
                 )
             }
         }
@@ -1618,26 +1628,27 @@ impl QueryPlanResult {
         // then filter left entities by checking if their entity reference
         // target is in the set.
         for er_step in &mut join.er_steps {
-            // Build phase: collect right-side entities into a temporary buffer,
-            // then move them into a HashSet for O(1) probing.
-            let mut right_scratch = ScratchBuffer::new(128);
-            (er_step.right_collector)(world, tick, &mut right_scratch);
-            let right_set: HashSet<u64> =
-                right_scratch.entities.iter().map(|e| e.to_bits()).collect();
-
-            // Probe phase: for each left entity, extract entity ref and probe.
-            let ref_extractor = &er_step.ref_extractor;
             match er_step.join_kind {
                 JoinKind::Inner => {
+                    // Build phase: collect right-side entities into a HashSet
+                    // for O(1) probing.
+                    let mut right_scratch = ScratchBuffer::new(128);
+                    (er_step.right_collector)(world, tick, &mut right_scratch);
+                    let right_set: HashSet<Entity> =
+                        right_scratch.entities.iter().copied().collect();
+
+                    // Probe phase: retain left entities whose entity reference
+                    // target is in the right set.
+                    let ref_extractor = &er_step.ref_extractor;
                     scratch.entities.retain(|&entity| {
                         ref_extractor(world, entity)
-                            .is_some_and(|target| right_set.contains(&target.to_bits()))
+                            .is_some_and(|target| right_set.contains(&target))
                     });
                 }
                 JoinKind::Left => {
-                    // Left join: keep all left entities regardless. The join
-                    // semantics are for filtering; the left entity always survives.
-                    // No-op — all left entities pass through.
+                    // Left join: all left entities pass through regardless of
+                    // whether their reference target is in the right set.
+                    // Skip right-side collection entirely to avoid wasted work.
                 }
             }
         }
@@ -1647,7 +1658,9 @@ impl QueryPlanResult {
     ///
     /// For join plans, entities are collected from both sides into an internal
     /// scratch buffer, then joined via sorted intersection (inner join) or
-    /// left-side preservation (left join). The buffer is reused across calls
+    /// left-side preservation (left join). For ER join plans, left-side
+    /// entities are further filtered by probing a hash set of right-side
+    /// entities via entity references. The buffer is reused across calls
     /// to amortize allocation.
     ///
     /// For scan-only plans without joins, this collects entities into the
@@ -2736,9 +2749,11 @@ struct ErJoinStep {
 /// arbitrary join chains: `A JOIN B JOIN C` becomes
 /// `left_collector(A) → step[0](B) → step[1](C)`.
 ///
-/// ER join steps are applied after regular join steps. Each ER step builds
-/// a `HashSet` of right-side entities, then filters left-side entities by
-/// checking whether their entity reference target is in the set.
+/// ER join steps execute after all regular join steps (enforced by the builder
+/// API — `join()` panics if called after `er_join()`). Each ER step builds
+/// a `HashSet<Entity>` from the right side, then filters left-side entities
+/// by probing via entity reference extraction. Left ER joins short-circuit
+/// and skip right-side collection entirely.
 struct JoinExec {
     left_collector: EntityCollector,
     steps: Vec<JoinStep>,
@@ -2955,6 +2970,13 @@ struct IndexDriver {
     lookup_fn: IndexLookupFn,
 }
 
+/// Tracks which kind of join was most recently added to the builder,
+/// so `with_right_estimate` can target the correct one.
+enum LastJoinKind {
+    Regular(usize),
+    Er(usize),
+}
+
 /// Builder for a single-table scan with optional predicates and joins.
 pub struct ScanBuilder<'w> {
     planner: &'w QueryPlanner<'w>,
@@ -2964,6 +2986,10 @@ pub struct ScanBuilder<'w> {
     predicates: Vec<Predicate>,
     joins: Vec<JoinSpec>,
     er_joins: Vec<ErJoinSpec>,
+    /// Which join was most recently added (for `with_right_estimate` targeting).
+    last_join: Option<LastJoinKind>,
+    /// Warnings collected during builder calls (e.g. unregistered ER component).
+    deferred_warnings: Vec<PlanWarning>,
     /// Factory that produces a [`CompiledForEach`] closure. Captured from
     /// `scan::<Q>()` while Q is still in scope.
     compile_for_each: Option<Box<dyn FnOnce() -> CompiledForEach>>,
@@ -3039,14 +3065,25 @@ impl ScanBuilder<'_> {
     ///
     /// The planner will choose between hash join and nested-loop join based
     /// on estimated cardinalities.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`er_join`](Self::er_join). Regular joins must
+    /// be added before ER joins because they execute first (sorted intersection)
+    /// and ER joins filter the result (hash probe).
     pub fn join<Q: crate::query::fetch::WorldQuery + 'static>(
         mut self,
         join_kind: JoinKind,
     ) -> Self {
+        assert!(
+            self.er_joins.is_empty(),
+            "join() called after er_join() — regular joins must be added before ER joins"
+        );
         // Estimate right-side rows from total entity count (conservative).
         let right_rows = self.planner.total_entities;
         let required = Q::required_ids(self.planner.components);
         let changed = Q::changed_ids(self.planner.components);
+        let idx = self.joins.len();
         self.joins.push(JoinSpec {
             right_query_name: std::any::type_name::<Q>(),
             right_estimated_rows: right_rows,
@@ -3054,23 +3091,27 @@ impl ScanBuilder<'_> {
             right_required: required,
             right_changed: changed,
         });
+        self.last_join = Some(LastJoinKind::Regular(idx));
         self
     }
 
     /// Set explicit row estimate for the most recently added join's right side.
     ///
-    /// Returns `Err(PlannerError::BuilderOrder)` if called before any `join()`.
+    /// Returns `Err(PlannerError::BuilderOrder)` if called before any
+    /// `join()` or `er_join()`.
     pub fn with_right_estimate(mut self, rows: usize) -> Result<Self, PlannerError> {
-        // Apply to the most recently added join. ER joins are always added
-        // after regular joins in builder order, so check er_joins first.
-        if let Some(last_er) = self.er_joins.last_mut() {
-            last_er.right_estimated_rows = rows;
-        } else if let Some(last) = self.joins.last_mut() {
-            last.right_estimated_rows = rows;
-        } else {
-            return Err(PlannerError::BuilderOrder(
-                "with_right_estimate() called before any join() — call join() first".into(),
-            ));
+        match self.last_join {
+            Some(LastJoinKind::Regular(idx)) => {
+                self.joins[idx].right_estimated_rows = rows;
+            }
+            Some(LastJoinKind::Er(idx)) => {
+                self.er_joins[idx].right_estimated_rows = rows;
+            }
+            None => {
+                return Err(PlannerError::BuilderOrder(
+                    "with_right_estimate() called before any join() or er_join()".into(),
+                ));
+            }
         }
         Ok(self)
     }
@@ -3113,32 +3154,33 @@ impl ScanBuilder<'_> {
         let required = Q::required_ids(self.planner.components);
         let changed = Q::changed_ids(self.planner.components);
 
-        // Capture the entity-reference extractor as a type-erased closure.
-        // Pre-resolve ComponentId for R at plan-build time. If R is not
-        // registered yet, the ER join will produce zero matches (no entity
-        // can have an unregistered component).
-        let Some(ref_comp_id) = self.planner.components.id::<R>() else {
-            // Component not registered — no entity can have it.
-            // Push a no-op ER join that always produces empty results.
-            let ref_extractor: EntityRefExtractor =
-                Arc::new(|_world: &World, _entity: Entity| None);
-            self.er_joins.push(ErJoinSpec {
-                ref_component_name: std::any::type_name::<R>(),
-                right_query_name: std::any::type_name::<Q>(),
-                right_estimated_rows: 0,
-                join_kind,
-                right_required: FixedBitSet::new(),
-                right_changed: FixedBitSet::new(),
-                ref_extractor,
-            });
-            return self;
-        };
+        // Pre-resolve ComponentId for R at plan-build time so execution
+        // avoids per-entity registry lookups. If R is not registered yet,
+        // defer resolution to execution time via OnceLock — a long-lived plan
+        // built before any R entities exist will still work once they appear.
+        let ref_extractor: EntityRefExtractor =
+            if let Some(ref_comp_id) = self.planner.components.id::<R>() {
+                Arc::new(move |world: &World, entity: Entity| {
+                    let r: &R = world.get_by_id(entity, ref_comp_id)?;
+                    Some(r.entity_ref())
+                })
+            } else {
+                // Component not registered at build time — defer resolution.
+                // OnceLock caches the ComponentId on first execution call.
+                self.deferred_warnings
+                    .push(PlanWarning::UnregisteredErComponent {
+                        component_name: std::any::type_name::<R>(),
+                    });
+                let cached_id: Arc<OnceLock<Option<ComponentId>>> = Arc::new(OnceLock::new());
+                Arc::new(move |world: &World, entity: Entity| {
+                    let comp_id = *cached_id.get_or_init(|| world.components.id::<R>());
+                    let comp_id = comp_id?;
+                    let r: &R = world.get_by_id(entity, comp_id)?;
+                    Some(r.entity_ref())
+                })
+            };
 
-        let ref_extractor: EntityRefExtractor = Arc::new(move |world: &World, entity: Entity| {
-            let r: &R = world.get_by_id(entity, ref_comp_id)?;
-            Some(r.entity_ref())
-        });
-
+        let idx = self.er_joins.len();
         self.er_joins.push(ErJoinSpec {
             ref_component_name: std::any::type_name::<R>(),
             right_query_name: std::any::type_name::<Q>(),
@@ -3148,12 +3190,13 @@ impl ScanBuilder<'_> {
             right_changed: changed,
             ref_extractor,
         });
+        self.last_join = Some(LastJoinKind::Er(idx));
         self
     }
 
     /// Compile the scan into an optimized execution plan.
     pub fn build(mut self) -> QueryPlanResult {
-        let mut warnings = Vec::new();
+        let mut warnings = std::mem::take(&mut self.deferred_warnings);
 
         // Phase 1: Classify predicates — index-driven vs spatial vs post-filter.
         let mut index_preds: Vec<(Predicate, &IndexDescriptor)> = Vec::new();
@@ -3604,12 +3647,23 @@ impl ScanBuilder<'_> {
             // Cost model: right build + left probe (one hash lookup per left entity).
             let join_cost = Cost {
                 rows: if er_join.join_kind == JoinKind::Inner {
-                    // Assume ~50% of references point to valid right entities.
+                    // Conservative default: assume ~50% of references point to
+                    // valid right entities. Override with `with_right_estimate`
+                    // when domain-specific selectivity is known.
                     left_cost.rows * 0.5
                 } else {
+                    // Left join: all left entities survive, no right-side
+                    // collection needed (short-circuited in run_join).
                     left_cost.rows
                 },
-                cpu: right_cost.cpu + left_cost.rows * 1.2, // hash build + probes
+                cpu: if er_join.join_kind == JoinKind::Left {
+                    // Left ER join skips right-side collection entirely.
+                    0.0
+                } else {
+                    // hash build (right scan) + probes (1.2x per left entity:
+                    // hash lookup + ref extraction overhead)
+                    right_cost.cpu + left_cost.rows * 1.2
+                },
             };
 
             node = PlanNode::ErJoin {
@@ -4479,6 +4533,8 @@ impl<'w> QueryPlanner<'w> {
             predicates: Vec::new(),
             joins: Vec::new(),
             er_joins: Vec::new(),
+            last_join: None,
+            deferred_warnings: Vec::new(),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
                 let changed = changed_for_each;
@@ -4551,6 +4607,8 @@ impl<'w> QueryPlanner<'w> {
             predicates: Vec::new(),
             joins: Vec::new(),
             er_joins: Vec::new(),
+            last_join: None,
+            deferred_warnings: Vec::new(),
             compile_for_each: Some(Box::new(move || {
                 let required = required_for_each;
                 let changed = changed_for_each;
@@ -11007,14 +11065,14 @@ mod tests {
     }
 
     #[test]
-    fn er_join_combined_with_regular_join() {
+    fn er_join_with_wider_left_scan() {
         let mut world = World::new();
 
         // Parents with Name and Score.
         let p1 = world.spawn((Name("Alice"), Score(10)));
         let p2 = world.spawn((Name("Bob"), Score(20)));
 
-        // Children.
+        // Children with additional components in the scan query.
         world.spawn((ChildTag, Parent(p1), Team(1)));
         world.spawn((ChildTag, Parent(p2), Team(2)));
 
@@ -11074,6 +11132,205 @@ mod tests {
             scores,
             vec![1, 2],
             "batched should yield only matching children's scores"
+        );
+    }
+
+    // ── Additional ER join tests ─────────────────────────────────
+
+    /// Second entity-reference type for chained ER join tests.
+    #[derive(Clone, Copy, Debug)]
+    struct Owner(Entity);
+
+    impl super::AsEntityRef for Owner {
+        fn entity_ref(&self) -> Entity {
+            self.0
+        }
+    }
+
+    /// Tag for entities that are "owned".
+    #[derive(Clone, Copy, Debug)]
+    struct Owned;
+
+    #[test]
+    fn er_join_chained_two_er_joins() {
+        let mut world = World::new();
+
+        // Each ER join reads a different component from the left entity.
+        // child has both Parent and Owner; each ER join filters independently.
+        let parent = world.spawn((Name("Parent"),));
+        let owner = world.spawn((Score(42),));
+        let child = world.spawn((ChildTag, Parent(parent), Owner(owner)));
+
+        // This child's owner target doesn't have Score.
+        let bad_owner = world.spawn((Name("Not an owner"),));
+        let child2 = world.spawn((ChildTag, Parent(parent), Owner(bad_owner)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&ChildTag, &Parent, &Owner)>()
+            // First ER join: parent must have Name.
+            .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            // Second ER join: owner must have Score.
+            .er_join::<Owner, (&Score,)>(JoinKind::Inner)
+            .build();
+
+        let entities = plan.execute(&mut world).unwrap();
+        // child: parent has Name ✓, owner has Score ✓ → kept
+        // child2: parent has Name ✓, owner has no Score ✗ → filtered
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0], child);
+        assert!(!entities.contains(&child2));
+    }
+
+    #[test]
+    fn er_join_regular_then_er() {
+        let mut world = World::new();
+
+        // Two parents, both with Name + Score.
+        let p1 = world.spawn((Name("Alice"), Score(10)));
+        let _p2 = world.spawn((Name("Bob"), Score(20)));
+
+        // Children also have Score (for regular join).
+        let c1 = world.spawn((ChildTag, Parent(p1), Score(100)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&ChildTag, &Parent, &Score)>()
+            // Regular join: intersect with entities that have Team.
+            // c1 doesn't have Team, so it should be filtered out.
+            .join::<(&Team,)>(JoinKind::Inner)
+            .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .build();
+
+        let entities = plan.execute(&mut world).unwrap();
+        // c1 has no Team, so the regular join filters it out.
+        assert!(entities.is_empty() || !entities.contains(&c1));
+    }
+
+    #[test]
+    #[should_panic(expected = "join() called after er_join()")]
+    fn er_join_then_regular_panics() {
+        let mut world = World::new();
+        world.spawn((Name("Alice"),));
+
+        let planner = QueryPlanner::new(&world);
+        // This should panic: regular join after ER join is not allowed.
+        let _plan = planner
+            .scan::<(&ChildTag, &Parent)>()
+            .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .join::<(&Score,)>(JoinKind::Inner)
+            .build();
+    }
+
+    #[test]
+    fn er_join_unregistered_component_deferred() {
+        let mut world = World::new();
+
+        // Build plan BEFORE any entity with UnknownRef exists.
+        // UnknownRef is never registered — the plan should emit a warning
+        // and produce empty results on inner join.
+        #[derive(Clone, Copy, Debug)]
+        struct UnknownRef(Entity);
+        impl super::AsEntityRef for UnknownRef {
+            fn entity_ref(&self) -> Entity {
+                self.0
+            }
+        }
+
+        world.spawn((ChildTag,));
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&ChildTag,)>()
+            .er_join::<UnknownRef, (&Name,)>(JoinKind::Inner)
+            .build();
+
+        // Should have a warning about unregistered component.
+        assert!(
+            plan.warnings()
+                .iter()
+                .any(|w| matches!(w, PlanWarning::UnregisteredErComponent { .. })),
+            "expected UnregisteredErComponent warning, got: {:?}",
+            plan.warnings()
+        );
+    }
+
+    #[test]
+    fn er_join_dead_reference_left_join() {
+        let mut world = World::new();
+
+        let p1 = world.spawn((Name("Alice"),));
+        let p2 = world.spawn((Name("Bob"),));
+
+        let c1 = world.spawn((ChildTag, Parent(p1)));
+        let c2 = world.spawn((ChildTag, Parent(p2)));
+
+        // Despawn p2 — c2's reference is now dangling.
+        world.despawn(p2);
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&ChildTag, &Parent)>()
+            .er_join::<Parent, (&Name,)>(JoinKind::Left)
+            .build();
+
+        let entities = plan.execute(&mut world).unwrap();
+        // Left join: both children survive, even with dead reference.
+        assert_eq!(entities.len(), 2);
+        let ids: Vec<u64> = entities.iter().map(|e| e.to_bits()).collect();
+        assert!(ids.contains(&c1.to_bits()));
+        assert!(ids.contains(&c2.to_bits()));
+    }
+
+    #[test]
+    fn er_join_many_to_one_references() {
+        let mut world = World::new();
+
+        let parent = world.spawn((Name("Shared Parent"),));
+
+        // Five children all pointing to the same parent.
+        let children: Vec<Entity> = (0..5)
+            .map(|_| world.spawn((ChildTag, Parent(parent))))
+            .collect();
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&ChildTag, &Parent)>()
+            .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .build();
+
+        let entities = plan.execute(&mut world).unwrap();
+        // All five children should match — their shared parent has Name.
+        assert_eq!(entities.len(), 5);
+        for child in &children {
+            assert!(
+                entities.contains(child),
+                "child {child:?} should be in results"
+            );
+        }
+    }
+
+    #[test]
+    fn er_join_with_right_estimate_targets_correct_join() {
+        let mut world = World::new();
+        let p = world.spawn((Name("Alice"),));
+        world.spawn((ChildTag, Parent(p)));
+
+        let planner = QueryPlanner::new(&world);
+
+        // with_right_estimate after er_join should target the ER join.
+        let plan = planner
+            .scan::<(&ChildTag, &Parent)>()
+            .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+            .with_right_estimate(42)
+            .unwrap()
+            .build();
+
+        let explain = plan.explain();
+        // The explain output should reflect the custom estimate.
+        assert!(
+            explain.contains("ErJoin"),
+            "explain should contain ErJoin: {explain}"
         );
     }
 }

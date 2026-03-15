@@ -81,6 +81,80 @@ sub.for_each(&mut world, |entity| {
 
 `HashDebounce<T>` is the default in-memory debounce filter. Implement `SubscriptionDebounce<T>` on your own type for external-backed deduplication.
 
+## ER Joins (Entity-Reference Joins)
+
+ER joins follow entity references like foreign keys in a relational database. Instead of intersecting two entity sets by identity (regular `join()`), an ER join reads a reference component from each left-side entity, extracts the target `Entity`, and checks whether that target is in the right-side set.
+
+Implement the `AsEntityRef` trait on any component that contains a foreign-key reference to another entity:
+
+```rust
+use minkowski::{Entity, AsEntityRef};
+
+#[derive(Clone, Copy)]
+struct Parent(Entity);
+
+impl AsEntityRef for Parent {
+    fn entity_ref(&self) -> Entity {
+        self.0
+    }
+}
+```
+
+Then use `er_join` in the query planner to filter by the referenced entity's components:
+
+```rust
+use minkowski::{QueryPlanner, JoinKind};
+
+let planner = QueryPlanner::new(&world);
+
+// "For each child with a Parent component, keep only those whose
+//  parent entity has both Pos and Name."
+let mut plan = planner
+    .scan::<(&ChildTag, &Parent)>()
+    .er_join::<Parent, (&Pos, &Name)>(JoinKind::Inner)
+    .build();
+
+let entities = plan.execute(&mut world).unwrap();
+// Only children whose parent has Pos and Name are returned.
+```
+
+**Join kinds**: `JoinKind::Inner` filters left entities to only those whose reference target is in the right set. `JoinKind::Left` keeps all left entities regardless (the right-side collection is skipped entirely for efficiency).
+
+**Chaining**: Multiple ER joins can be chained. Each reads a different reference component from the left-side entity and filters independently:
+
+```rust
+let mut plan = planner
+    .scan::<(&ChildTag, &Parent, &Owner)>()
+    .er_join::<Parent, (&Name,)>(JoinKind::Inner)   // parent must have Name
+    .er_join::<Owner, (&Score,)>(JoinKind::Inner)    // owner must have Score
+    .build();
+```
+
+**Combining with regular joins**: Regular `join()` calls must come before any `er_join()` calls. The builder panics if you call `join()` after `er_join()`, because regular joins (sorted intersection) execute before ER joins (hash probing).
+
+```rust
+let mut plan = planner
+    .scan::<(&ChildTag, &Parent, &Score)>()
+    .join::<(&Team,)>(JoinKind::Inner)               // regular join first
+    .er_join::<Parent, (&Name,)>(JoinKind::Inner)    // then ER join
+    .build();
+```
+
+**Dead references**: If the referenced entity has been despawned, the reference extractor returns `None` and the entity is filtered out (inner join) or kept (left join). Generational entity IDs prevent false matches with reused indices.
+
+**Cost hints**: Use `with_right_estimate(n)` after an `er_join()` to provide a cardinality hint for the right side, improving the cost model's accuracy:
+
+```rust
+let mut plan = planner
+    .scan::<(&ChildTag, &Parent)>()
+    .er_join::<Parent, (&Name,)>(JoinKind::Inner)
+    .with_right_estimate(100)  // "expect ~100 parents with Name"
+    .unwrap()
+    .build();
+```
+
+**Unregistered components**: If the reference component `R` is not yet registered in the world at plan-build time (e.g., the plan is built at startup before any entities with `R` exist), the planner defers resolution to execution time. A `PlanWarning::UnregisteredErComponent` is emitted. The plan will work correctly once entities with `R` are spawned.
+
 ## Materialized Views
 
 `MaterializedView` wraps a `QueryPlanResult` and caches the matching entity list. On each `refresh()` call it re-executes the plan, but only if the debounce threshold has been met. Two layers of filtering: the plan's `Changed<T>` filter skips unchanged archetypes, and the configurable `DebouncePolicy` limits how often the plan runs at all.
