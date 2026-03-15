@@ -1777,6 +1777,15 @@ impl World {
         }
     }
 
+    /// Flush thread-local allocation caches back to the global pool.
+    ///
+    /// Call at the end of a level load or batch operation to release
+    /// blocks hoarded by Rayon worker threads. No-op for system-allocator
+    /// worlds.
+    pub fn flush_pool_caches(&mut self) {
+        self.pool.flush_caches();
+    }
+
     // ── Persistence accessors ────────────────────────────────────────
 
     /// Number of archetypes (for iteration bounds).
