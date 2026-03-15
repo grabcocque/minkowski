@@ -6,9 +6,30 @@ Minkowski is a storage engine for real-time interactive applications — games, 
 
 Most ECS engines give you fast iteration but no persistence, no rollback, no concurrency control. Most databases give you transactions but can't iterate 100,000 components per frame. Minkowski gives you both, and you only pay for the features you use.
 
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Design Principles](#design-principles)
+- [Deep Dive](#deep-dive)
+- [Soundness](#soundness)
+- [Storage](#storage)
+- [Queries](#queries)
+- [Typed Reducers](#typed-reducers)
+- [Transactions](#transactions)
+- [Persistence](#persistence)
+- [Schema & Mutation](#schema--mutation)
+- [Observability](#observability)
+- [Indexing](#indexing)
+- [Memory Management](#memory-management)
+- [Examples](#examples)
+- [Python / Jupyter Integration](#python--jupyter-integration)
+- [AI-Assisted Development](#ai-assisted-development)
+- [Glossary](#glossary)
+- [License](#license)
+
 ## Quick start
 
-> 💡 **Working with Claude Code?** custom commands provide on-demand ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for compile-time correctness checks. Nine domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
+> 💡 **Working with Claude Code?** custom commands provide on-demand ECS expertise in every session. Use `/design-doc` to plan a new feature, `/soundness-audit` to review concurrency invariants, or `/validate-api` and `/validate-macro` for correctness checks. Nine domain commands — `/minkowski:model`, `/minkowski:query`, `/minkowski:mutate`, `/minkowski:concurrency`, `/minkowski:reducer`, `/minkowski:index`, `/minkowski:persist`, `/minkowski:optimize`, `/minkowski:python` — explain the paradigm in depth. See [AI-Assisted Development](#ai-assisted-development) for the full list.
 
 ```rust
 use minkowski::{World, ReducerRegistry, QueryMut};
@@ -94,103 +115,11 @@ world.remove::<Health>(e);      // migrates it back
 
 ## Queries
 
-Queries are tuple-typed — `world.query::<(&mut Pos, &Vel)>()` iterates all entities with both components, giving mutable access to `Pos` and shared access to `Vel`. Results are cached per query type, so repeat calls are nearly free.
+Queries are tuple-typed and cached — `world.query::<(&mut Pos, &Vel)>()` iterates all matching entities with near-zero overhead on repeat calls. `Changed<T>` enables incremental processing, `par_for_each` distributes work across threads, and `for_each_chunk` yields typed slices for SIMD auto-vectorization.
 
-`Changed<T>` skips entities whose component hasn't been modified since your last read — useful for incremental processing. `par_for_each` distributes iteration across threads via [rayon][rayon], and `for_each_chunk` yields typed slices for [SIMD][simd] auto-vectorization. Table queries (`world.query_table::<Transform>()`) skip archetype matching entirely when you know the exact schema.
+The **query planner** compiles queries into cost-optimized Volcano-model execution plans with automatic index selection. **Subscription queries** guarantee at compile time that every predicate is index-backed. **Materialized views** cache query results with configurable debounce policies.
 
-```rust
-// Dynamic query -- cached, skips archetype scan on repeat calls
-for (pos, vel) in world.query::<(&mut Pos, &Vel)>() {
-    pos.x += vel.dx;
-}
-
-// Change detection -- skip archetypes untouched since last read
-for (pos, _) in world.query::<(&mut Pos, Changed<Vel>)>() {
-    // only entities whose Vel column was mutably accessed
-}
-
-// Chunk iteration -- yields typed slices for auto-vectorization
-world.query::<(&mut Pos, &Vel)>().for_each_chunk(|(positions, velocities)| {
-    for i in 0..positions.len() {
-        positions[i].x += velocities[i].dx;
-    }
-});
-```
-
-### Query Planner
-
-`QueryPlanner` compiles queries into cost-optimized execution plans using a [Volcano][volcano]-model optimizer with automatic index selection, then executes them against the live world. Plans are vectorized by default — each node processes data in morsel-sized batches mapped to `for_each_chunk`, enabling SIMD auto-vectorization. Three execution modes: `execute(&mut World) -> &[Entity]` (collects into plan-owned scratch buffer, supports joins), `for_each(&mut World, callback)` (zero-allocation scan iteration), and `for_each_raw(&World, callback)` (transactional read-only path).
-
-```rust
-use minkowski::{QueryPlanner, Predicate, JoinKind};
-
-let mut planner = QueryPlanner::new(&world);
-planner.add_btree_index::<Score>(&score_index, &world).unwrap();
-planner.add_hash_index::<Team>(&team_index, &world).unwrap();
-
-let mut plan = planner
-    .scan::<(&Pos, &Score)>()
-    .filter(Predicate::range::<Score, _>(Score(10)..Score(50)))
-    .build();
-
-// Inspect the plan
-println!("{}", plan.explain());  // shows vectorized execution plan
-
-// Execute: collect matching entities into plan-owned scratch buffer
-let entities = plan.execute(&mut world);  // returns &[Entity]
-for e in entities {
-    let score = world.get::<Score>(*e).unwrap();
-    // only entities with Score in [10..50) are returned
-}
-
-// Zero-alloc iteration for scan-only plans
-plan.for_each(&mut world, |entity| {
-    // process each matching entity directly — no intermediate buffer
-});
-```
-
-`TablePlanner<T>` adds compile-time enforcement: if a table field is annotated with `#[index(btree)]` or `#[index(hash)]`, the planner requires the corresponding index at the type level. Missing indexes are type errors, not runtime warnings. See [Schema & Mutation](#schema--mutation) for the annotation syntax.
-
-**Subscription queries** guarantee at compile time that every predicate is index-backed via `Indexed<T>` witnesses. Combined with `Changed<T>`, subscriptions skip archetypes whose indexed column has not been written since the last call — no delta tracking, caching, or event sourcing needed. (`Changed<T>` is archetype-granular: mutating one entity marks the entire column, so unchanged siblings in the same archetype may also pass.)
-
-```rust
-use minkowski::{Changed, HashDebounce, Indexed, Predicate, SubscriptionDebounce};
-
-let witness = Indexed::btree(&score_index);
-let mut sub = planner
-    .subscribe::<(Changed<Score>, &Score)>()
-    .where_eq(witness, Predicate::eq(Score(42)))
-    .build()?;
-
-// HashDebounce filters false positives from archetype-granular Changed<T>.
-let mut debounce = HashDebounce::<Score>::new();
-
-sub.for_each(&mut world, |entity| {
-    let score = world.get::<Score>(entity).unwrap();
-    if debounce.is_changed(entity, score) {
-        // genuinely changed — react
-    }
-})?;
-```
-
-`HashDebounce<T>` is the default in-memory debounce filter. Implement `SubscriptionDebounce<T>` on your own type for external-backed deduplication.
-
-### Materialized Views
-
-`MaterializedView` wraps a `QueryPlanResult` and caches the matching entity list. On each `refresh()` call it re-executes the plan, but only if the debounce threshold has been met. Two layers of filtering: the plan's `Changed<T>` filter skips unchanged archetypes, and the configurable `DebouncePolicy` limits how often the plan runs at all.
-
-```rust
-use minkowski::{MaterializedView, DebouncePolicy};
-
-let mut view = MaterializedView::new(plan)
-    .with_debounce(DebouncePolicy::EveryNTicks(NonZeroU64::new(10).unwrap()));
-
-// Per-frame: refresh and read
-view.refresh(&mut world).unwrap();
-for &entity in view.entities() {
-    // cached, debounced result — stale by at most N frames
-}
-```
+[Full documentation →](docs/queries.md)
 
 ## Typed Reducers
 
@@ -286,88 +215,21 @@ Entity churn tracking is exact — every spawn and despawn is counted. Per-arche
 
 ## Indexing
 
-Indexes are user-owned data structures that compose with the query system — World has no awareness of them. The `SpatialIndex` trait has two methods: `rebuild` (full reconstruction) and `update` (incremental via `Changed<T>`). Stale entity references are caught automatically by generational ID validation.
+Indexes are user-owned data structures that compose with the query system — World has no awareness of them. `BTreeIndex<T>` provides O(log n) range queries, `HashIndex<T>` provides O(1) exact match, and the `SpatialIndex` trait supports custom spatial structures (grids, quadtrees, BVH). All indexes support incremental updates via `Changed<T>` and generational validation for stale references.
 
-For column-value lookups, `BTreeIndex<T>` provides O(log n) range queries and `HashIndex<T>` provides O(1) exact match. Both support validated queries (`get_valid`, `range_valid`) that filter despawned entities and removed components at query time.
+Indexes whose key types support rkyv can be persisted to disk via `PersistentIndex`, with recovery time proportional to the WAL tail rather than world size.
 
-When using `#[derive(Table)]`, field-level `#[index(btree)]` / `#[index(hash)]` attributes generate marker traits (`HasBTreeIndex<T>`, `HasHashIndex<T>`) that let `TablePlanner` enforce index presence at compile time. See [Schema & Mutation](#schema--mutation) for usage.
-
-Indexes whose key types support [rkyv][rkyv] can be persisted to disk via `PersistentIndex`. On crash recovery, `load` + `update()` catches up from the saved tick — recovery time is proportional to the WAL tail, not world size. `AutoCheckpoint` can save registered indexes alongside snapshots automatically.
-
-```rust
-// Persistent index recovery
-let post_restore_tick = world.change_tick();
-wal.replay(&mut world, &codecs)?;
-
-let mut idx = match load_btree_index::<Score>(&idx_path, post_restore_tick) {
-    Ok(idx) => { idx.update(&mut world); idx }  // O(WAL tail)
-    Err(_) => { let mut idx = BTreeIndex::new(); idx.rebuild(&mut world); idx }
-};
-```
-
-Examples include a [uniform grid][uniform-grid] for neighbor search, a [Barnes-Hut][barnes-hut] quadtree for force approximation, and a persistent `BTreeIndex` in the [`persist`](examples/examples/persist.rs) example.
+[Full documentation →](docs/indexing.md)
 
 ## Memory Management
 
-RAM is fast, expensive, and limited. Minkowski provides three complementary features to help you do more with less:
+Three complementary features let a Minkowski deployment run indefinitely within a fixed memory envelope:
 
-### Pre-allocated Memory Pool
+- **Pre-allocated memory pool** — `WorldBuilder` creates a World backed by a single mmap region with a fixed budget. `try_spawn` returns `Err(PoolExhausted)` instead of crashing.
+- **Blob offloading** — `BlobRef` stores external keys (S3 paths, URLs) instead of large assets. `BlobStore` provides cleanup hooks for orphaned references.
+- **Retention** — `Expiry` is a countdown component that despawns entities after a configurable number of retention cycles.
 
-`WorldBuilder` creates a World backed by a single [mmap][mmap] region — all memory is allocated upfront at startup, [TigerBeetle][tigerbeetle]-style. After initialization, `try_spawn` returns `Err(PoolExhausted)` and `try_insert` returns `Err(InsertError)` instead of crashing the process. No dynamic allocation on the data path.
-
-```rust
-use minkowski::{World, HugePages, PoolExhausted};
-
-let mut world = World::builder()
-    .memory_budget(64 * 1024 * 1024)   // 64 MB fixed budget
-    .hugepages(HugePages::Try)          // 2 MiB pages if available
-    .lock_all_memory(true)              // mlockall — prevent swapping
-    .build()?;
-
-// Spawn until the pool is full — no OOM kill, just a Result
-match world.try_spawn((pos, vel)) {
-    Ok(entity) => { /* success */ }
-    Err(PoolExhausted { .. }) => { /* shed load, evict, or report */ }
-}
-```
-
-The pool uses size-classed slab allocation (64 B to 1 MB) with a three-tier pre-fault chain: `MAP_POPULATE` → `mlock` → manual page touch. `World::new()` still works — it uses the system allocator with no budget limit.
-
-### Blob Offloading
-
-Large per-entity assets (images, meshes, audio) shouldn't live in column storage. `BlobRef` is a lightweight component that stores an external key (S3 path, URL, content hash). The `BlobStore` trait provides a cleanup hook — after despawning entities, collect orphaned refs and let your store delete the external data.
-
-```rust
-use minkowski_persist::{BlobRef, BlobStore};
-
-// Entity holds a key, not the bytes
-world.spawn((metadata, BlobRef::new("s3://bucket/mesh-00af.bin")));
-
-// After despawn, clean up external storage
-store.on_orphaned(&orphaned_refs);
-```
-
-`BlobRef` lives in `minkowski-persist` for [rkyv][rkyv] serialization support — blob references survive snapshots and WAL replay. The engine stores only the reference; blob lifecycle is the user's responsibility (same external composition pattern as [indexes](#indexing)).
-
-### Retention
-
-`Expiry` is a countdown component — it counts retention dispatches, not ticks or wall-clock time. Each call to `registry.run()` decrements all counters by one and despawns entities that reach zero. You control how often retention runs; the engine never runs it automatically.
-
-```rust
-use minkowski::{World, Expiry, ReducerRegistry};
-
-let mut world = World::new();
-let mut registry = ReducerRegistry::new();
-let retention_id = registry.retention(&mut world);
-
-// This entity survives 5 retention dispatches
-world.spawn((data, Expiry::after(5)));
-
-// Each call is one "retention cycle" — counters decrement, zeros despawn
-registry.run(&mut world, retention_id, ());
-```
-
-Together, these three features let a Minkowski deployment run indefinitely within a fixed memory envelope: the pool caps total memory, blob offloading keeps large assets external, and retention prevents unbounded entity growth.
+[Full documentation →](docs/memory-management.md)
 
 ## Examples
 
@@ -428,26 +290,9 @@ The commands teach the paradigm, not just the API — they encode the design pri
 
 ## Glossary
 
-| Term | Definition |
-|---|---|
-| [Archetype][archetype] | A unique combination of component types. Entities with the same components share an archetype, enabling contiguous column storage. |
-| [Barnes-Hut][barnes-hut] | An O(N log N) approximation algorithm for N-body force computation using a quadtree to aggregate distant particles. |
-| [Bitset][bitset] | A compact array of bits used here for fast archetype matching — query matching is a bitwise subset check. |
-| [Column store][column-store] | A storage layout where each field is stored in its own contiguous array, enabling cache-friendly sequential access and SIMD vectorization. |
-| [Component][component] | A data type attached to an entity. Any `'static + Send + Sync` Rust type qualifies. Stored in BlobVec columns within archetypes. |
-| [ECS][ecs] | Entity-Component System — an architectural pattern where entities are IDs, components are data, and systems are logic. Decouples data layout from behavior. |
-| [Generational index][generational-index] | An ID scheme pairing an array index with a generation counter. Reusing an index bumps the generation, so stale handles are detected without a free-list scan. |
-| [Miri][miri] | An interpreter for Rust's Mid-level IR that detects undefined behavior (aliasing violations, use-after-free, data races) at runtime. |
-| [OCC][occ] | Optimistic concurrency control — transactions execute without locks, then validate at commit that no conflicting writes occurred. |
-| [PCC][pcc] | Pessimistic concurrency control — transactions acquire locks before accessing data, preventing conflicts at the cost of potential contention. |
-| [Query planner](#query-planner) | A Volcano-model optimizer that compiles queries into vectorized execution plans with automatic index selection. |
-| [Rayon][rayon] | A Rust library for data parallelism. Used here for `par_for_each` parallel query iteration. |
-| [Reducer](#typed-reducers) | A registered closure whose type signature declares its data access. The registry extracts conflict metadata at registration time. |
-| [SIMD][simd] | Single Instruction, Multiple Data — CPU instructions that process multiple values in parallel. Minkowski's 64-byte column alignment enables auto-vectorization. |
-| [SoA][soa] | Struct of Arrays — storing each field in a separate array rather than interleaving fields per record. The storage layout archetypes use. |
-| [Tree Borrows][tree-borrows] | An experimental Rust aliasing model (stricter than Stacked Borrows) that Miri can check. Minkowski passes under this model. |
-| [Uniform grid][uniform-grid] | A spatial index dividing space into fixed-size cells. O(1) cell lookup, O(k) neighbor iteration where k is the number of occupied neighbor cells. |
-| [WAL][wal] | Write-ahead log — an append-only file where every mutation is recorded before being applied. Enables crash recovery by replaying the log. |
+Key terms used throughout the documentation. See the [full glossary](docs/glossary.md) for detailed definitions.
+
+**[Archetype][archetype]** · **[Column store][column-store]** · **[Component][component]** · **[ECS][ecs]** · **[Generational index][generational-index]** · **[Miri][miri]** · **[OCC][occ]** · **[PCC][pcc]** · **[Rayon][rayon]** · **[SIMD][simd]** · **[SoA][soa]** · **[Tree Borrows][tree-borrows]** · **[WAL][wal]**
 
 ## License
 
