@@ -99,9 +99,7 @@ impl BlobVec {
         // Grow to at least the required capacity, doubling as needed.
         let mut new_capacity = if self.capacity == 0 { 4 } else { self.capacity };
         while new_capacity < required {
-            new_capacity = new_capacity
-                .checked_mul(2)
-                .expect("capacity overflow");
+            new_capacity = new_capacity.checked_mul(2).expect("capacity overflow");
         }
         let new_layout = Layout::from_size_align(
             size.checked_mul(new_capacity).expect("capacity overflow"),

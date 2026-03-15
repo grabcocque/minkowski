@@ -495,10 +495,7 @@ impl World {
     /// up front.
     ///
     /// Returns a `Vec` of the newly created entities.
-    pub fn spawn_batch<B: Bundle>(
-        &mut self,
-        bundles: impl IntoIterator<Item = B>,
-    ) -> Vec<Entity> {
+    pub fn spawn_batch<B: Bundle>(&mut self, bundles: impl IntoIterator<Item = B>) -> Vec<Entity> {
         self.drain_orphans();
         let iter = bundles.into_iter();
         let (lower, _) = iter.size_hint();
@@ -3713,9 +3710,15 @@ mod tests {
         let entities = world.spawn_batch(bundles);
         assert_eq!(entities.len(), 3);
         assert_eq!(world.get::<Pos>(entities[0]), Some(&Pos { x: 1.0, y: 2.0 }));
-        assert_eq!(world.get::<Vel>(entities[0]), Some(&Vel { dx: 3.0, dy: 4.0 }));
+        assert_eq!(
+            world.get::<Vel>(entities[0]),
+            Some(&Vel { dx: 3.0, dy: 4.0 })
+        );
         assert_eq!(world.get::<Pos>(entities[1]), Some(&Pos { x: 5.0, y: 6.0 }));
-        assert_eq!(world.get::<Pos>(entities[2]), Some(&Pos { x: 9.0, y: 10.0 }));
+        assert_eq!(
+            world.get::<Pos>(entities[2]),
+            Some(&Pos { x: 9.0, y: 10.0 })
+        );
     }
 
     #[test]
@@ -3730,25 +3733,28 @@ mod tests {
         let mut world = World::new();
         let entities = world.spawn_batch(vec![(Pos { x: 1.0, y: 2.0 },)]);
         assert_eq!(entities.len(), 1);
-        assert_eq!(
-            world.get::<Pos>(entities[0]),
-            Some(&Pos { x: 1.0, y: 2.0 })
-        );
+        assert_eq!(world.get::<Pos>(entities[0]), Some(&Pos { x: 1.0, y: 2.0 }));
     }
 
     #[test]
     fn spawn_batch_entities_alive() {
         let mut world = World::new();
-        let entities = world.spawn_batch(
-            (0..100).map(|i| (Pos { x: i as f32, y: 0.0 },)),
-        );
+        let entities = world.spawn_batch((0..100).map(|i| {
+            (Pos {
+                x: i as f32,
+                y: 0.0,
+            },)
+        }));
         assert_eq!(entities.len(), 100);
         for (i, &e) in entities.iter().enumerate() {
             assert!(world.is_alive(e));
             assert!(world.is_placed(e));
             assert_eq!(
                 world.get::<Pos>(e),
-                Some(&Pos { x: i as f32, y: 0.0 })
+                Some(&Pos {
+                    x: i as f32,
+                    y: 0.0
+                })
             );
         }
     }
@@ -3756,9 +3762,15 @@ mod tests {
     #[test]
     fn spawn_batch_query_visible() {
         let mut world = World::new();
-        world.spawn_batch(
-            (0..5).map(|i| (Pos { x: i as f32, y: 0.0 }, Vel { dx: 1.0, dy: 1.0 })),
-        );
+        world.spawn_batch((0..5).map(|i| {
+            (
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 1.0, dy: 1.0 },
+            )
+        }));
         let mut count = 0;
         world.query::<(&Pos, &Vel)>().for_each(|(p, v)| {
             assert!(p.x >= 0.0 && p.x < 5.0);
@@ -3772,9 +3784,15 @@ mod tests {
     fn spawn_batch_mixed_with_spawn() {
         let mut world = World::new();
         let e1 = world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
-        let batch = world.spawn_batch(
-            (1..4).map(|i| (Pos { x: i as f32, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 })),
-        );
+        let batch = world.spawn_batch((1..4).map(|i| {
+            (
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+                Vel { dx: 0.0, dy: 0.0 },
+            )
+        }));
         let e5 = world.spawn((Pos { x: 4.0, y: 0.0 }, Vel { dx: 0.0, dy: 0.0 }));
 
         assert!(world.is_alive(e1));
@@ -3791,9 +3809,12 @@ mod tests {
     #[test]
     fn spawn_batch_unique_entities() {
         let mut world = World::new();
-        let entities = world.spawn_batch(
-            (0..100).map(|i| (Pos { x: i as f32, y: 0.0 },)),
-        );
+        let entities = world.spawn_batch((0..100).map(|i| {
+            (Pos {
+                x: i as f32,
+                y: 0.0,
+            },)
+        }));
         let mut seen = std::collections::HashSet::new();
         for &e in &entities {
             assert!(seen.insert(e.index()), "duplicate entity index");
