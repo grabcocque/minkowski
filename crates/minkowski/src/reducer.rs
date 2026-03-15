@@ -4663,4 +4663,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn query_writer_column_slot_debug_assert() {
+        // Exercises the debug_assert_eq!(col_batch.comp_id, self.comp_id) in set().
+        // If column_slot assignment were incorrect, this would panic in debug builds.
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(3.0)));
+
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_query_writer::<(&mut Pos, &mut Vel), (), _>(
+                &mut world,
+                "slot_test",
+                |mut qw: QueryWriter<'_, (&mut Pos, &mut Vel)>, ()| {
+                    qw.for_each(|(mut pos, mut vel)| {
+                        pos.set(Pos(10.0));
+                        vel.set(Vel(30.0));
+                    });
+                },
+            )
+            .unwrap();
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+        // If we get here without a debug_assert panic, slots are correct.
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 10.0);
+        assert_eq!(world.get::<Vel>(e).unwrap().0, 30.0);
+    }
 }
