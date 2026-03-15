@@ -11149,6 +11149,7 @@ mod tests {
 
     /// Tag for entities that are "owned".
     #[derive(Clone, Copy, Debug)]
+    #[expect(dead_code)]
     struct Owned;
 
     #[test]
