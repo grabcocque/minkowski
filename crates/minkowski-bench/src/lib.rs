@@ -41,6 +41,21 @@ pub struct Velocity {
 #[repr(C)]
 pub struct Score(pub u32);
 
+/// Team identifier -- 4 bytes. Used for join benchmarks.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
+)]
+#[repr(C)]
+pub struct Team(pub u32);
+
+/// Fat component -- 256 bytes. Used to measure cache-miss amplification
+/// on large components in join benchmarks.
+#[derive(Clone, Copy, Debug, PartialEq, Archive, Serialize, Deserialize)]
+#[repr(C, align(64))]
+pub struct FatData {
+    pub data: [u8; 256],
+}
+
 /// Spawn a world with `n` entities, each with (Transform, Position, Rotation, Velocity).
 pub fn spawn_world(n: usize) -> minkowski::World {
     let mut world = minkowski::World::new();
