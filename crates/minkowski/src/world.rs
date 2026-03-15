@@ -1779,9 +1779,14 @@ impl World {
 
     /// Flush thread-local allocation caches back to the global pool.
     ///
+    /// The calling thread's cache is flushed eagerly (blocks returned
+    /// immediately). Other threads flush lazily on their next pool
+    /// operation. Idle Rayon workers retain cached blocks until they
+    /// next allocate or until thread exit.
+    ///
     /// Call at the end of a level load or batch operation to release
-    /// blocks hoarded by Rayon worker threads. No-op for system-allocator
-    /// worlds.
+    /// blocks and get an accurate `stats().pool_used` reading.
+    /// No-op for system-allocator worlds.
     pub fn flush_pool_caches(&mut self) {
         self.pool.flush_caches();
     }
