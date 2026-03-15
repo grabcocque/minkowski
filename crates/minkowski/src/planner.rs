@@ -1431,6 +1431,9 @@ pub struct QueryPlanResult {
     compiled_agg_scan: Option<CompiledAggScan>,
     /// Compiled batch aggregate scan for raw path (for `execute_aggregates_raw`).
     compiled_agg_scan_raw: Option<CompiledAggScan>,
+    /// Reusable buffer for row indices in batch execution methods.
+    /// Cleared and repopulated on each `for_each_join_chunk` call.
+    row_indices: Vec<usize>,
 }
 
 impl QueryPlanResult {
@@ -1913,6 +1916,7 @@ impl fmt::Debug for QueryPlanResult {
                 "has_compiled_agg_scan_raw",
                 &self.compiled_agg_scan_raw.is_some(),
             )
+            .field("row_indices_cap", &self.row_indices.capacity())
             .finish()
     }
 }
@@ -3433,6 +3437,7 @@ impl ScanBuilder<'_> {
             aggregate_exprs,
             compiled_agg_scan,
             compiled_agg_scan_raw,
+            row_indices: Vec::new(),
         }
     }
 }
