@@ -83,7 +83,7 @@ use fixedbitset::FixedBitSet;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::index::{BTreeIndex, HashIndex, SpatialCost, SpatialExpr, SpatialIndex};
-use crate::storage::archetype::Archetype;
+use crate::storage::archetype::{Archetype, ArchetypeId};
 use crate::tick::Tick;
 // Use std Arc directly — the planner has no concurrent code, so it does not
 // need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
@@ -136,6 +136,14 @@ pub enum PlanExecError {
         note = "join plans are now supported by all execution methods; this variant is never returned"
     )]
     JoinNotSupported,
+    /// Batch execution method called with a `Q: WorldQuery` whose required
+    /// components are not present in one of the matched archetypes.
+    ComponentMismatch {
+        /// `std::any::type_name::<T>()` of the missing component.
+        component: &'static str,
+        /// Archetype that was missing the component.
+        archetype_id: ArchetypeId,
+    },
 }
 
 impl fmt::Display for PlanExecError {
@@ -147,6 +155,14 @@ impl fmt::Display for PlanExecError {
                 f,
                 "for_each/for_each_raw do not support join plans — use execute() instead"
             ),
+            PlanExecError::ComponentMismatch {
+                component,
+                archetype_id,
+            } => write!(
+                f,
+                "batch query component `{component}` not found in archetype {arch}",
+                arch = archetype_id.0
+            ),
         }
     }
 }
@@ -156,7 +172,7 @@ impl std::error::Error for PlanExecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PlanExecError::WorldMismatch(e) => Some(e),
-            PlanExecError::JoinNotSupported => None,
+            PlanExecError::JoinNotSupported | PlanExecError::ComponentMismatch { .. } => None,
         }
     }
 }
