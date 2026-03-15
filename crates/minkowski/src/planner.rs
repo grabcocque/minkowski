@@ -140,9 +140,9 @@ pub enum PlanExecError {
     /// Batch execution method called with a `Q: WorldQuery` whose required
     /// components are not present in one of the matched archetypes.
     ComponentMismatch {
-        /// `std::any::type_name::<T>()` of the missing component.
-        component: &'static str,
-        /// Archetype that was missing the component.
+        /// `std::any::type_name::<Q>()` of the query tuple.
+        query: &'static str,
+        /// Archetype that was missing a required component.
         archetype_id: ArchetypeId,
     },
 }
@@ -157,11 +157,11 @@ impl fmt::Display for PlanExecError {
                 "for_each/for_each_raw do not support join plans — use execute() instead"
             ),
             PlanExecError::ComponentMismatch {
-                component,
+                query,
                 archetype_id,
             } => write!(
                 f,
-                "batch query component `{component}` not found in archetype {arch}",
+                "batch query `{query}` has components missing from archetype {arch}",
                 arch = archetype_id.0
             ),
         }
@@ -1728,6 +1728,23 @@ impl QueryPlanResult {
         Q: WorldQuery,
         F: FnMut(Entity, Q::Item<'_>),
     {
+        // Mark mutable columns changed before iteration (mirrors world.query()).
+        let mutable = Q::mutable_ids(&world.components);
+        if !mutable.is_empty() {
+            let tick = world.next_tick();
+            for arch in &mut world.archetypes.archetypes {
+                if arch.is_empty()
+                    || !Q::required_ids(&world.components).is_subset(&arch.component_ids)
+                {
+                    continue;
+                }
+                for comp_id in mutable.ones() {
+                    if let Some(col_idx) = arch.column_index(comp_id) {
+                        arch.columns[col_idx].mark_changed(tick);
+                    }
+                }
+            }
+        }
         self.for_each_batched_inner::<Q, F>(world, &mut callback)?;
         self.last_read_tick = world.next_tick();
         Ok(())
@@ -1776,9 +1793,9 @@ impl QueryPlanResult {
                 scratch.push(entity);
             });
         } else {
-            panic!(
-                "for_each_batched() called on a plan with no join executor and no compiled scan"
-            );
+            // Scan-only plan with no compiled closure — empty result.
+            // Tick advancement is the caller's responsibility.
+            return Ok(());
         }
 
         // Phase 2: Sort by (archetype_id, row).
@@ -1791,8 +1808,15 @@ impl QueryPlanResult {
         // Phase 3: Walk archetype runs with pre-resolved fetch.
         let entities = scratch.as_slice();
         if entities.is_empty() {
+            // Tick advancement is the caller's responsibility.
             return Ok(());
         }
+
+        // Guard against aliased &mut T from duplicate entities (would be UB).
+        debug_assert!(
+            entities.windows(2).all(|w| w[0] != w[1]),
+            "duplicate entity in batch buffer — would alias &mut T"
+        );
 
         let required = Q::required_ids(&world.components);
         let mut run_start = 0;
@@ -1806,7 +1830,7 @@ impl QueryPlanResult {
             // Validate Q's required components are present in this archetype.
             if !required.is_subset(&archetype.component_ids) {
                 return Err(PlanExecError::ComponentMismatch {
-                    component: std::any::type_name::<Q>(),
+                    query: std::any::type_name::<Q>(),
                     archetype_id: arch_id,
                 });
             }
@@ -1870,6 +1894,24 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
+        // Mark mutable columns changed before iteration (mirrors world.query()).
+        let mutable = Q::mutable_ids(&world.components);
+        if !mutable.is_empty() {
+            let tick = world.next_tick();
+            for arch in &mut world.archetypes.archetypes {
+                if arch.is_empty()
+                    || !Q::required_ids(&world.components).is_subset(&arch.component_ids)
+                {
+                    continue;
+                }
+                for comp_id in mutable.ones() {
+                    if let Some(col_idx) = arch.column_index(comp_id) {
+                        arch.columns[col_idx].mark_changed(tick);
+                    }
+                }
+            }
+        }
+
         // Phase 1: Populate scratch buffer.
         if self.join_exec.is_some() {
             self.run_join(&*world);
@@ -1884,9 +1926,9 @@ impl QueryPlanResult {
                 scratch.push(entity);
             });
         } else {
-            panic!(
-                "for_each_join_chunk() called on a plan with no join executor and no compiled scan"
-            );
+            // Scan-only plan with no compiled closure — empty result.
+            self.last_read_tick = world.next_tick();
+            return Ok(());
         }
 
         // Phase 2: Sort by (archetype_id, row).
@@ -1925,7 +1967,7 @@ impl QueryPlanResult {
             // Validate Q's required components.
             if !required.is_subset(&archetype.component_ids) {
                 return Err(PlanExecError::ComponentMismatch {
-                    component: std::any::type_name::<Q>(),
+                    query: std::any::type_name::<Q>(),
                     archetype_id: arch_id,
                 });
             }
@@ -4535,7 +4577,7 @@ impl ScratchBuffer {
     fn sort_by_archetype(&mut self, entity_locations: &[Option<EntityLocation>]) {
         self.entities.sort_unstable_by_key(|e| {
             let loc = entity_locations[e.index() as usize]
-                .expect("join produced dead entity in scratch buffer");
+                .expect("entity in scratch buffer has no location");
             ((loc.archetype_id.0 as u64) << 32) | (loc.row as u64)
         });
     }
@@ -9735,6 +9777,132 @@ mod tests {
         assert!(
             matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
             "expected ComponentMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn for_each_join_chunk_component_mismatch() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let result = plan.for_each_join_chunk::<(&Health,), _>(&mut world, |_, _, _| {});
+        assert!(
+            matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
+            "expected ComponentMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn for_each_join_chunk_world_mismatch() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        world_a.spawn((Score(1),));
+        world_b.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world_a);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.for_each_join_chunk::<(&Score,), _>(&mut world_b, |_, _, _| {});
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn for_each_join_chunk_empty_join() {
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut called = false;
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |_, _, _| {
+            called = true;
+        })
+        .unwrap();
+        assert!(!called);
+    }
+
+    #[test]
+    fn for_each_batched_scan_only_happy_path() {
+        let mut world = World::new();
+        world.spawn((Score(10),));
+        world.spawn((Score(20),));
+        world.spawn((Score(30),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut sum = 0u32;
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+            sum += score.0;
+        })
+        .unwrap();
+        assert_eq!(sum, 60);
+    }
+
+    #[test]
+    fn for_each_batched_multi_archetype_values() {
+        let mut world = World::new();
+        // Archetype A: Score + Team
+        world.spawn((Score(10), Team(1)));
+        world.spawn((Score(20), Team(2)));
+        // Archetype B: Score + Team + Health
+        world.spawn((Score(30), Team(3), Health(100)));
+        world.spawn((Score(40), Team(4), Health(200)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut scores = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+            scores.push(score.0);
+        })
+        .unwrap();
+        scores.sort_unstable();
+        assert_eq!(scores, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn for_each_batched_marks_mutable_changed() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1)));
+
+        let planner = QueryPlanner::new(&world);
+        // Use Changed<Score> to check change detection.
+        let mut changed_plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // First call: all entities are new, so Changed sees them.
+        let r1 = changed_plan.execute(&mut world).unwrap().len();
+        assert_eq!(r1, 1);
+
+        // Second call: nothing mutated, Changed skips.
+        let r2 = changed_plan.execute(&mut world).unwrap().len();
+        assert_eq!(r2, 0);
+
+        // Now mutate via for_each_batched with &mut Score.
+        let scan_planner = QueryPlanner::new(&world);
+        let mut scan_plan = scan_planner.scan::<(&Score,)>().build();
+        scan_plan
+            .for_each_batched::<(&mut Score,), _>(&mut world, |_, (score,)| {
+                score.0 += 1;
+            })
+            .unwrap();
+
+        // Changed<Score> should now see the mutation.
+        let r3 = changed_plan.execute(&mut world).unwrap().len();
+        assert_eq!(
+            r3, 1,
+            "Changed<Score> should detect mutation from for_each_batched"
         );
     }
 }
