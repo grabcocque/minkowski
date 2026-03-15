@@ -691,48 +691,55 @@ impl EnumChangeSet {
                 layout,
             } = mutation
             {
+                let index = entity.index() as usize;
+                let location = world.entity_locations[index];
+
+                // Fast path: batch continuation. If the current batch covers
+                // this (archetype, component), skip is_alive, contains, column
+                // lookup — all invariant within a batch run. The first entity
+                // in the batch was validated when the batch was created; subsequent
+                // entities in the same archetype are guaranteed alive (no mutations
+                // occur between QueryWriter::for_each collection and apply).
+                if let Some(loc) = location {
+                    let key_matches = batch.as_ref().is_some_and(|b| {
+                        b.arch_idx == loc.archetype_id.0 && b.comp_id == *component_id
+                    });
+                    if key_matches {
+                        let src = self.arena.get(*offset);
+                        batch.as_mut().unwrap().entries.push((loc.row, src));
+                        continue;
+                    }
+                }
+
+                // Slow path: validate entity, check archetype, maybe start new batch.
                 if !world.is_alive(*entity) {
                     flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                     return Err(map_err(ApplyError::DeadEntity(*entity)));
                 }
-                let index = entity.index() as usize;
-                let location = world.entity_locations[index].unwrap();
+                let location = location.unwrap();
                 let arch = &world.archetypes.archetypes[location.archetype_id.0];
 
                 if arch.component_ids.contains(*component_id) {
-                    // Overwrite path — eligible for batching.
-                    let batch_key = (location.archetype_id.0, *component_id);
-
-                    let key_matches = batch
-                        .as_ref()
-                        .is_some_and(|b| b.arch_idx == batch_key.0 && b.comp_id == batch_key.1);
-
-                    if key_matches {
-                        let src = self.arena.get(*offset);
-                        batch.as_mut().unwrap().entries.push((location.row, src));
-                    } else {
-                        // Resolve column/drop before flushing to avoid borrow conflict.
-                        let col_idx = arch.column_index(*component_id).unwrap();
-                        let info = world.components.info(*component_id);
-                        let new_batch = InsertBatch {
-                            arch_idx: location.archetype_id.0,
-                            comp_id: *component_id,
-                            col_idx,
-                            drop_fn: info.drop_fn,
-                            layout: *layout,
-                            entries: Vec::new(),
-                            first_mutation_idx: mutation_idx,
-                        };
-                        // Flush the old batch, start a new one.
-                        flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
-                        batch = Some(new_batch);
-                        let src = self.arena.get(*offset);
-                        batch.as_mut().unwrap().entries.push((location.row, src));
-                    }
+                    // New batch — archetype has component, resolve column once.
+                    let col_idx = arch.column_index(*component_id).unwrap();
+                    let info = world.components.info(*component_id);
+                    let new_batch = InsertBatch {
+                        arch_idx: location.archetype_id.0,
+                        comp_id: *component_id,
+                        col_idx,
+                        drop_fn: info.drop_fn,
+                        layout: *layout,
+                        entries: Vec::new(),
+                        first_mutation_idx: mutation_idx,
+                    };
+                    flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+                    batch = Some(new_batch);
+                    let src = self.arena.get(*offset);
+                    batch.as_mut().unwrap().entries.push((location.row, src));
                     continue;
                 }
-                // Component not in archetype — migration path.
-                // Flush batch, fall through to sequential.
+
+                // Component not in archetype — migration path (sequential).
                 flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                 let data_ptr = self.arena.get(*offset);
                 changeset_insert_raw(world, *entity, *component_id, data_ptr, *layout, tick)
