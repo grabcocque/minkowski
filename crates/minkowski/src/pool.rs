@@ -453,12 +453,11 @@ pub(crate) struct SlabPool {
 impl Drop for SlabPool {
     fn drop(&mut self) {
         if self.side_table_len > 0 {
-            // SAFETY: side_table was allocated via Vec::with_capacity(len)
-            // in new(), then ownership transferred via mem::forget.
-            // Layout matches: size = side_table_len, align = 1 (u8).
+            // SAFETY: side_table was allocated via Box::into_raw in new().
+            // Reconstruct the Box to let it deallocate.
             unsafe {
-                let layout = Layout::from_size_align_unchecked(self.side_table_len, 1);
-                std::alloc::dealloc(self.side_table, layout);
+                let slice = std::slice::from_raw_parts_mut(self.side_table, self.side_table_len);
+                let _ = Box::from_raw(slice);
             }
         }
     }
@@ -485,10 +484,10 @@ impl SlabPool {
         let total = region.len();
 
         // Allocate side table as raw pointer (see struct doc for rationale).
+        // Box::into_raw transfers ownership; Drop reconstructs via Box::from_raw.
         let side_table_len = total / SIZE_CLASSES[0];
-        let mut st_vec = vec![SIDE_TABLE_UNALLOCATED; side_table_len];
-        let side_table = st_vec.as_mut_ptr();
-        std::mem::forget(st_vec); // ownership transferred to raw pointer
+        let st_box = vec![SIDE_TABLE_UNALLOCATED; side_table_len].into_boxed_slice();
+        let side_table = Box::into_raw(st_box) as *mut u8;
 
         let proportion_sum: usize = PROPORTIONS.iter().sum();
 
@@ -519,8 +518,12 @@ impl SlabPool {
                 // for total bytes. Block is >= 64 bytes (MIN_BLOCK_SIZE invariant),
                 // so writing 8 bytes of next-pointer is within bounds.
                 let block_ptr = unsafe { base.add(block_offset) };
+                // Use atomic store for formal correctness: runtime reads
+                // are atomic (StdAtomicU64::load), so init writes must
+                // also be atomic to avoid mixed-access UB.
                 unsafe {
-                    (block_ptr as *mut u64).write(first_block as u64);
+                    (*(block_ptr as *const StdAtomicU64))
+                        .store(first_block as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 first_block = block_ptr;
             }
@@ -567,10 +570,15 @@ impl SlabPool {
     /// re-deriving the pointer.
     #[inline]
     fn block_ptr(&self, addr: u64) -> *mut u8 {
-        let offset = addr as usize - self.base as usize;
+        let addr_usize = addr as usize;
+        debug_assert!(
+            addr_usize >= self.base as usize && addr_usize < self.base as usize + self.total,
+            "block_ptr: address {addr:#x} is outside pool region"
+        );
+        let offset = addr_usize - self.base as usize;
         // SAFETY: `addr` was originally derived from `self.base + offset`
         // during `new()` or a prior `deallocate`. The offset is within the
-        // mmap region (addr >= base && addr < base + total).
+        // mmap region (checked by debug_assert above).
         unsafe { self.base.add(offset) }
     }
 }
@@ -644,7 +652,8 @@ unsafe impl PoolAllocator for SlabPool {
 
                     return Ok(NonNull::new(block).expect("free list block is non-null"));
                 }
-                // CAS failed — another thread popped. Retry.
+                // CAS failed — another thread popped. Retry with spin hint.
+                std::hint::spin_loop();
             }
         }
 
@@ -666,10 +675,15 @@ unsafe impl PoolAllocator for SlabPool {
 
         let addr = ptr.as_ptr() as usize;
 
-        debug_assert!(
+        // assert! not debug_assert!: a foreign pointer causes UB via
+        // block_ptr() (wrapping ptr::add). Two comparisons prevent the
+        // entire class of foreign-pointer bugs from becoming silent UB.
+        assert!(
             addr >= self.base as usize && addr < self.base as usize + self.total,
-            "SlabPool::deallocate: pointer {:p} is outside pool region",
-            ptr.as_ptr()
+            "SlabPool::deallocate: pointer {:p} is outside pool region [{:p}..+{:#x})",
+            ptr.as_ptr(),
+            self.base,
+            self.total
         );
 
         // Restore provenance from self.base for all block access.
@@ -682,9 +696,12 @@ unsafe impl PoolAllocator for SlabPool {
         let actual_class = (entry & SIDE_TABLE_CLASS_MASK) as usize;
         let was_overflow = (entry & SIDE_TABLE_OVERFLOW_BIT) != 0;
 
-        debug_assert!(
+        // assert! not debug_assert!: an OOB index on self.heads[] is instant
+        // UB. This catches double-free and foreign-pointer contract violations.
+        assert!(
             actual_class < NUM_SIZE_CLASSES,
-            "SlabPool::deallocate: side table entry {entry:#x} has invalid class {actual_class}"
+            "SlabPool::deallocate: side table entry {entry:#x} has invalid class {actual_class} \
+             — possible double-free or foreign pointer"
         );
 
         // Mark side table entry as unallocated BEFORE pushing the block
@@ -713,12 +730,17 @@ unsafe impl PoolAllocator for SlabPool {
                     .fetch_sub(SIZE_CLASSES[actual_class], Ordering::Relaxed);
 
                 if was_overflow {
-                    self.overflow_active[actual_class].fetch_sub(1, Ordering::Relaxed);
+                    let prev = self.overflow_active[actual_class].fetch_sub(1, Ordering::Relaxed);
+                    debug_assert!(
+                        prev > 0,
+                        "overflow_active underflow for class {actual_class}"
+                    );
                 }
 
                 return;
             }
-            // CAS failed — another thread pushed. Retry.
+            // CAS failed — another thread pushed. Retry with spin hint.
+            std::hint::spin_loop();
         }
     }
 
@@ -1100,6 +1122,171 @@ mod tests {
         for ptr in ptrs {
             unsafe { pool.deallocate(ptr, layout_small) };
         }
+    }
+
+    #[test]
+    fn slab_pool_exhaust_both_target_and_overflow_class() {
+        // Small pool: exhaust class 0 AND class 1, verify PoolExhausted.
+        let pool = SlabPool::new(512 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap(); // class 0
+        let layout_medium = Layout::from_size_align(200, 8).unwrap(); // class 1
+
+        // Exhaust class 1 first (overflow target for class 0).
+        let mut ptrs1 = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_medium) {
+            ptrs1.push(ptr);
+        }
+
+        // Now exhaust class 0 — overflow to class 1 will also fail.
+        let mut ptrs0 = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_small) {
+            ptrs0.push(ptr);
+        }
+
+        // Both classes exhausted — next alloc must fail.
+        assert!(pool.allocate(layout_small).is_err());
+
+        for ptr in ptrs0 {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+        for ptr in ptrs1 {
+            unsafe { pool.deallocate(ptr, layout_medium) };
+        }
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_overflow_telemetry() {
+        let pool = SlabPool::new(1024 * 1024, HugePages::Off).unwrap();
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+
+        // Exhaust class 0 to force overflow.
+        let proportion_sum: usize = PROPORTIONS.iter().sum();
+        let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
+
+        let mut ptrs = Vec::new();
+        for _ in 0..class0_blocks {
+            ptrs.push(pool.allocate(layout_small).unwrap());
+        }
+
+        // No overflow yet.
+        assert_eq!(pool.overflow_active(1), 0);
+        assert_eq!(pool.overflow_total(1), 0);
+
+        // Next allocation overflows to class 1.
+        let overflow_ptr = pool.allocate(layout_small).unwrap();
+        assert_eq!(pool.overflow_active(1), 1);
+        assert_eq!(pool.overflow_total(1), 1);
+
+        // Deallocate the overflow block — active drops, total stays.
+        unsafe { pool.deallocate(overflow_ptr, layout_small) };
+        assert_eq!(pool.overflow_active(1), 0);
+        assert_eq!(pool.overflow_total(1), 1);
+
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout_small) };
+        }
+    }
+
+    #[test]
+    fn slab_pool_largest_class_no_overflow() {
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        let layout_large = Layout::from_size_align(1_000_000, 8).unwrap(); // class 5
+
+        // Exhaust class 5 (1MB blocks).
+        let mut ptrs = Vec::new();
+        while let Ok(ptr) = pool.allocate(layout_large) {
+            ptrs.push(ptr);
+        }
+
+        // Class 5 is the largest — no overflow possible, must get error.
+        assert!(pool.allocate(layout_large).is_err());
+
+        // Smaller classes should still work.
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+        let small_ptr = pool.allocate(layout_small).unwrap();
+        unsafe { pool.deallocate(small_ptr, layout_small) };
+
+        for ptr in ptrs {
+            unsafe { pool.deallocate(ptr, layout_large) };
+        }
+    }
+
+    #[test]
+    fn slab_pool_concurrent_multi_class() {
+        let pool = Arc::new(SlabPool::new(16 * 1024 * 1024, HugePages::Off).unwrap());
+        let layout_small = Layout::from_size_align(64, 64).unwrap();
+        let layout_large = Layout::from_size_align(4000, 8).unwrap();
+
+        std::thread::scope(|s| {
+            // 4 threads on class 0.
+            for _ in 0..4 {
+                let pool = Arc::clone(&pool);
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        let ptr = pool.allocate(layout_small).unwrap();
+                        unsafe { pool.deallocate(ptr, layout_small) };
+                    }
+                });
+            }
+            // 4 threads on class 3.
+            for _ in 0..4 {
+                let pool = Arc::clone(&pool);
+                s.spawn(move || {
+                    for _ in 0..50 {
+                        let ptr = pool.allocate(layout_large).unwrap();
+                        unsafe { pool.deallocate(ptr, layout_large) };
+                    }
+                });
+            }
+        });
+
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_small_budget_empty_classes() {
+        // 128KB budget — class 5 (1MB) gets zero blocks.
+        let pool = SlabPool::new(128 * 1024, HugePages::Off).unwrap();
+        let layout_huge = Layout::from_size_align(1_000_000, 8).unwrap();
+        assert!(pool.allocate(layout_huge).is_err());
+
+        // Small classes should still work.
+        let layout_small = Layout::from_size_align(32, 8).unwrap();
+        let ptr = pool.allocate(layout_small).unwrap();
+        unsafe { pool.deallocate(ptr, layout_small) };
+        assert_eq!(pool.used(), Some(0));
+    }
+
+    #[test]
+    fn slab_pool_multi_class_used_bytes_tracking() {
+        let pool = SlabPool::new(8 * 1024 * 1024, HugePages::Off).unwrap();
+        assert_eq!(pool.used(), Some(0));
+
+        let l0 = Layout::from_size_align(32, 8).unwrap(); // class 0 (64B)
+        let l2 = Layout::from_size_align(900, 8).unwrap(); // class 2 (1KB)
+        let l4 = Layout::from_size_align(60_000, 8).unwrap(); // class 4 (64KB)
+
+        let p0 = pool.allocate(l0).unwrap();
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0]));
+
+        let p2 = pool.allocate(l2).unwrap();
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0] + SIZE_CLASSES[2]));
+
+        let p4 = pool.allocate(l4).unwrap();
+        assert_eq!(
+            pool.used(),
+            Some(SIZE_CLASSES[0] + SIZE_CLASSES[2] + SIZE_CLASSES[4])
+        );
+
+        unsafe { pool.deallocate(p4, l4) };
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0] + SIZE_CLASSES[2]));
+
+        unsafe { pool.deallocate(p2, l2) };
+        assert_eq!(pool.used(), Some(SIZE_CLASSES[0]));
+
+        unsafe { pool.deallocate(p0, l0) };
+        assert_eq!(pool.used(), Some(0));
     }
 }
 
