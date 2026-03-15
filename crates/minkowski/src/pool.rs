@@ -1080,7 +1080,7 @@ mod tests {
         let class0_blocks = 1024 * 1024 * PROPORTIONS[0] / proportion_sum / SIZE_CLASSES[0];
 
         let mut ptrs = Vec::new();
-        for _ in 0..class0_blocks + 1 {
+        for _ in 0..=class0_blocks {
             ptrs.push(pool.allocate(layout_small).unwrap());
         }
 
