@@ -346,7 +346,7 @@ struct TypedBatch<T, F> {
 }
 
 // SAFETY: TypedBatch is Send because:
-// - `F` is Send (required by BatchExtractor: Send)
+// - `F` is Send (enforced by the impl's `F: Send` bound)
 // - `comp_id` is Copy
 // - `col_ptr` is derived from BlobVec data in archetypes whose components
 //   are Send+Sync (Component: Send+Sync). The pointer is only valid during
@@ -358,16 +358,21 @@ impl<T: Component, F: Fn(&T) -> f64 + Send> BatchExtractor for TypedBatch<T, F> 
         let Some(col_idx) = archetype.column_index(self.comp_id) else {
             return false;
         };
-        // SAFETY: BlobVec stores T-layout data at 64-byte-aligned base.
-        // column_index guarantees comp_id matches this column. The archetype
-        // is borrowed for the duration of the aggregate scan (&World).
+        // SAFETY: BlobVec stores data with layout Layout::new::<T>()
+        // (guaranteed by ComponentId registration). column_index guarantees
+        // comp_id matches this column. The archetype is borrowed for the
+        // duration of the aggregate scan (&World).
         self.col_ptr = unsafe { archetype.columns[col_idx].get_ptr(0) as *const T };
         true
     }
 
     fn process_all(&mut self, count: usize, accum: &mut AggregateAccum) {
-        // SAFETY: bind_archetype set col_ptr; count == archetype.len().
-        // BlobVec guarantees contiguous layout for `count` elements.
+        debug_assert!(
+            !self.col_ptr.is_null(),
+            "process_all called before successful bind_archetype"
+        );
+        // SAFETY: bind_archetype set col_ptr (caller checked it returned true);
+        // count == archetype.len(). BlobVec guarantees contiguous layout.
         let slice = unsafe { std::slice::from_raw_parts(self.col_ptr, count) };
         for item in slice {
             accum.feed((self.extract)(item));
@@ -375,9 +380,14 @@ impl<T: Component, F: Fn(&T) -> f64 + Send> BatchExtractor for TypedBatch<T, F> 
     }
 
     fn process_rows(&mut self, rows: &[usize], accum: &mut AggregateAccum) {
+        debug_assert!(
+            !self.col_ptr.is_null(),
+            "process_rows called before successful bind_archetype"
+        );
         for &row in rows {
-            // SAFETY: row is a valid index within the bound archetype
-            // (validated by gather_index_batched before calling).
+            // SAFETY: row comes from a validated EntityLocation (via
+            // world.validate_entity), guaranteeing it is a valid index
+            // within the bound archetype.
             let item = unsafe { &*self.col_ptr.add(row) };
             accum.feed((self.extract)(item));
         }
@@ -423,9 +433,9 @@ pub struct AggregateExpr {
     /// Extracts a `f64` value from an entity. `None` for `Count`.
     /// Kept as fallback for join plans where batch extraction isn't possible.
     extractor: Option<ValueExtractor>,
-    /// Deferred factory builder: captures the typed closure + TypeId, produces
-    /// a `BatchFactory` once `ComponentId` is resolved at `build()` time.
-    /// `None` for `Count` (no component access needed).
+    /// Deferred factory builder: captures the typed closure and defers
+    /// `ComponentId` resolution (via the generic type parameter `T`) to
+    /// `ScanBuilder::build()` time. `None` for `Count` (no component access).
     batch_factory_builder: Option<BatchFactoryBuilder>,
     /// Finalized batch factory, set by `ScanBuilder::build()`. Each call
     /// produces a fresh `Box<dyn BatchExtractor>` with its own column pointer
@@ -2256,6 +2266,10 @@ fn gather_index_batched(
     // Row buffer for the current archetype run.
     let mut row_buf: Vec<usize> = Vec::new();
     let mut current_arch_idx: Option<usize> = None;
+    // Per-extractor bind status: true if bind_archetype succeeded for the
+    // current archetype. Prevents stale/null pointer dereference when the
+    // aggregate component is absent from an archetype.
+    let mut bound: Vec<bool> = vec![false; extractors.len()];
 
     for &entity in candidates {
         let Some(loc) = world.validate_entity(entity) else {
@@ -2281,19 +2295,19 @@ fn gather_index_batched(
             continue;
         }
 
-        // Archetype changed — flush accumulated rows.
+        // Archetype changed — flush accumulated rows, rebind extractors.
         if current_arch_idx != Some(arch_idx) {
             if !row_buf.is_empty() {
-                flush_row_batch(extractors, accums, &row_buf);
+                flush_row_batch(extractors, accums, &bound, &row_buf);
                 row_buf.clear();
             }
             current_arch_idx = Some(arch_idx);
             let arch = &world.archetypes.archetypes[arch_idx];
-            for (ext, accum) in extractors.iter_mut().zip(accums.iter()) {
-                if accum.op != AggregateOp::Count
-                    && let Some(e) = ext
-                {
-                    e.bind_archetype(arch);
+            for (i, (ext, accum)) in extractors.iter_mut().zip(accums.iter()).enumerate() {
+                if accum.op != AggregateOp::Count {
+                    bound[i] = ext.as_mut().is_some_and(|e| e.bind_archetype(arch));
+                } else {
+                    bound[i] = false; // Count doesn't need binding
                 }
             }
         }
@@ -2302,21 +2316,26 @@ fn gather_index_batched(
 
     // Flush final batch.
     if !row_buf.is_empty() {
-        flush_row_batch(extractors, accums, &row_buf);
+        flush_row_batch(extractors, accums, &bound, &row_buf);
     }
 }
 
 /// Flush a row buffer through batch extractors and accumulators.
+/// Only processes extractors whose `bound` flag is true (component
+/// present in the current archetype).
 #[inline]
 fn flush_row_batch(
     extractors: &mut [Option<Box<dyn BatchExtractor>>],
     accums: &mut [AggregateAccum],
+    bound: &[bool],
     rows: &[usize],
 ) {
-    for (accum, ext) in accums.iter_mut().zip(extractors.iter_mut()) {
+    for (i, (accum, ext)) in accums.iter_mut().zip(extractors.iter_mut()).enumerate() {
         if accum.op == AggregateOp::Count {
             accum.count += rows.len() as u64;
-        } else if let Some(e) = ext {
+        } else if bound[i]
+            && let Some(e) = ext
+        {
             e.process_rows(rows, accum);
         }
     }
@@ -3118,19 +3137,18 @@ impl ScanBuilder<'_> {
                                 if !passes_change_filter(arch, &changed, tick) {
                                     continue;
                                 }
-                                // Bind all extractors to this archetype.
-                                for (ext, accum) in extractors.iter_mut().zip(accums.iter()) {
-                                    if accum.op != AggregateOp::Count
-                                        && let Some(e) = ext
-                                    {
-                                        e.bind_archetype(arch);
-                                    }
-                                }
+                                // Bind extractors and track which ones succeeded.
+                                // An extractor fails to bind when the aggregate
+                                // component is absent from this archetype (e.g.,
+                                // scan::<&Pos> with sum::<Score> on an archetype
+                                // that has Pos but not Score).
                                 let count = arch.len();
                                 for (accum, ext) in accums.iter_mut().zip(extractors.iter_mut()) {
                                     if accum.op == AggregateOp::Count {
                                         accum.count += count as u64;
-                                    } else if let Some(e) = ext {
+                                    } else if let Some(e) = ext
+                                        && e.bind_archetype(arch)
+                                    {
                                         e.process_all(count, accum);
                                     }
                                 }
@@ -3238,11 +3256,25 @@ impl ScanBuilder<'_> {
 
         // Phase 9a: Resolve batch factory builders → batch factories.
         // This is the deferred ComponentId resolution: AggregateExpr constructors
-        // capture TypeId, and here we resolve to ComponentId via the registry.
+        // capture the component type (via generics), and here we resolve to
+        // ComponentId via the registry.
+        let has_agg_scan = compiled_agg_scan.is_some();
         for expr in &mut self.aggregates {
             if let Some(builder) = expr.batch_factory_builder.take() {
                 expr.batch_factory = builder(self.planner.components);
             }
+            // If the batch scan path is active but a value-based aggregate has
+            // no batch factory AND entities exist, the component type should be
+            // registered. An empty world legitimately has unregistered types.
+            debug_assert!(
+                expr.op == AggregateOp::Count
+                    || expr.batch_factory.is_some()
+                    || !has_agg_scan
+                    || self.planner.total_entities == 0,
+                "aggregate {:?} has no batch factory but batch scan is active — \
+                 component type may not be registered",
+                expr.label,
+            );
         }
 
         // Phase 9b: Wrap with aggregate node if aggregates are present.
@@ -9286,5 +9318,128 @@ mod tests {
         };
         let labels: Vec<_> = result.labels().collect();
         assert_eq!(labels, vec!["COUNT(*)", "SUM(Score)"]);
+    }
+
+    // ── Batch aggregate path activation tests ─────────────────────
+
+    #[test]
+    fn aggregate_batch_path_activates_without_filters() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+        drop(planner);
+
+        let dbg = format!("{plan:?}");
+        assert!(
+            dbg.contains("has_compiled_agg_scan: true"),
+            "batch path should activate for filter-free scan"
+        );
+        assert!(
+            dbg.contains("has_compiled_agg_scan_raw: true"),
+            "raw batch path should activate for filter-free scan"
+        );
+    }
+
+    #[test]
+    fn aggregate_batch_path_disabled_with_filters() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>(
+                "score >= 5",
+                0.5,
+                |world: &World, entity: Entity| {
+                    world.get::<Score>(entity).is_some_and(|s| s.0 >= 5)
+                },
+            ))
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+        drop(planner);
+
+        let dbg = format!("{plan:?}");
+        assert!(
+            dbg.contains("has_compiled_agg_scan: false"),
+            "batch path should NOT activate when filters present"
+        );
+    }
+
+    #[test]
+    fn aggregate_batch_multi_archetype_correctness() {
+        // Entities across 3 archetypes: (Score,), (Score, Health),
+        // (Score, Health, Name). Batch path must bind per archetype.
+        #[derive(Debug)]
+        struct Health(#[expect(dead_code)] i32);
+        #[derive(Debug)]
+        struct Name;
+
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        for i in 5..8 {
+            world.spawn((Score(i), Health(100)));
+        }
+        for i in 8..10 {
+            world.spawn((Score(i), Health(50), Name));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+        drop(planner);
+
+        let dbg = format!("{plan:?}");
+        assert!(dbg.contains("has_compiled_agg_scan: true"));
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(10.0)); // count
+        let expected_sum: f64 = (0..10).map(|i| i as f64).sum();
+        assert_eq!(result.get(1), Some(expected_sum)); // sum(0..10) = 45
+    }
+
+    #[test]
+    fn aggregate_batch_component_absent_from_some_archetypes() {
+        // scan::<&Score> with sum::<Health> — Health is absent from some
+        // archetypes. The batch path must skip extraction for those.
+        #[derive(Debug)]
+        struct Health(i32);
+
+        let mut world = World::new();
+        // Archetype 1: Score only (no Health)
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        // Archetype 2: Score + Health
+        for i in 0..3 {
+            world.spawn((Score(100), Health(i * 10)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Health>("Health", |h| h.0 as f64))
+            .build();
+        drop(planner);
+
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(8.0)); // count: 5 + 3
+        // sum of Health: only from archetype 2 = 0 + 10 + 20 = 30
+        assert_eq!(result.get(1), Some(30.0));
     }
 }
