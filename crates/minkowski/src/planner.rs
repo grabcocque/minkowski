@@ -4979,9 +4979,10 @@ mod tests {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
+        // Use Left join to test strategy selection (Inner joins are eliminated).
         let plan = planner
             .scan_with_estimate::<(&Score,)>(10)
-            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Left)
             .with_right_estimate(5)
             .unwrap()
             .build();
@@ -4999,9 +5000,10 @@ mod tests {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
+        // Use Left join to test strategy selection (Inner joins are eliminated).
         let plan = planner
             .scan::<(&Score,)>()
-            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Left)
             .build();
 
         match plan.root() {
@@ -5017,9 +5019,10 @@ mod tests {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
+        // Use Left join to test strategy selection (Inner joins are eliminated).
         let plan = planner
             .scan_with_estimate::<(&Score,)>(100)
-            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Left)
             .with_right_estimate(500)
             .unwrap()
             .build();
@@ -5083,14 +5086,14 @@ mod tests {
     }
 
     #[test]
-    fn inner_join_still_reorders_smaller_to_build_side() {
+    fn inner_join_eliminated_instead_of_reordered() {
         let mut world = World::new();
         for i in 0..1000 {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
 
-        // Inner join: left (500) > right (100), should swap.
+        // Inner join is eliminated at build time — no reordering needed.
         let plan = planner
             .scan_with_estimate::<(&Score,)>(500)
             .join::<(&Team,)>(JoinKind::Inner)
@@ -5099,15 +5102,11 @@ mod tests {
             .build();
 
         match plan.root() {
-            PlanNode::HashJoin { left, right, .. } => {
-                assert!(
-                    left.estimated_rows() <= right.estimated_rows(),
-                    "inner join build side should be smaller: left={} right={}",
-                    left.estimated_rows(),
-                    right.estimated_rows()
-                );
-            }
-            other => panic!("expected HashJoin, got {:?}", other),
+            PlanNode::Scan { .. } => {} // eliminated — expected
+            other => panic!(
+                "expected Scan after inner join elimination, got {:?}",
+                other
+            ),
         }
     }
 
@@ -5841,9 +5840,10 @@ mod tests {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
+        // Use Left join to test partitioning (Inner joins are eliminated).
         let plan = planner
             .scan::<(&Score,)>()
-            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Left)
             .build();
 
         match plan.root() {
@@ -5861,9 +5861,10 @@ mod tests {
             world.spawn((Score(i),));
         }
         let planner = QueryPlanner::new(&world);
+        // Use Left join to test strategy selection (Inner joins are eliminated).
         let plan = planner
             .scan_with_estimate::<(&Score,)>(10)
-            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Team,)>(JoinKind::Left)
             .with_right_estimate(5)
             .unwrap()
             .build();
@@ -9998,5 +9999,234 @@ mod tests {
             r3, 1,
             "Changed<Score> should detect mutation from for_each_batched"
         );
+    }
+
+    // ── Join elimination ─────────────────────────────────────────────
+
+    #[test]
+    fn join_elimination_inner_becomes_scan() {
+        let mut world = World::new();
+        // Entities with Score only
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        // Entities with Score + Team (these should be the only results)
+        let mut both = Vec::new();
+        for i in 10..20 {
+            both.push(world.spawn((Score(i), Team(i % 3))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+
+        // Inner join — should be eliminated into a scan.
+        let mut join_plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // Tuple scan — the "expected" path.
+        let mut scan_plan = planner.scan::<(&Score, &Team)>().build();
+
+        // Both should produce the same entity set.
+        let mut join_result = join_plan.execute(&mut world).unwrap().to_vec();
+        let mut scan_result = scan_plan.execute(&mut world).unwrap().to_vec();
+        join_result.sort_by_key(|e| e.to_bits());
+        scan_result.sort_by_key(|e| e.to_bits());
+        assert_eq!(join_result, scan_result);
+
+        // The eliminated plan should NOT have a HashJoin/NestedLoopJoin node.
+        match join_plan.root() {
+            PlanNode::Scan { .. } => {} // expected
+            other => panic!("expected Scan after elimination, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn join_elimination_left_join_not_eliminated() {
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        for i in 5..10 {
+            world.spawn((Score(i), Team(1)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+
+        // Left join should NOT be eliminated.
+        match plan.root() {
+            PlanNode::HashJoin { .. } | PlanNode::NestedLoopJoin { .. } => {} // expected
+            other => panic!("expected join node for Left join, got {:?}", other),
+        }
+
+        // Left join preserves all 10 Score entities.
+        let result = plan.execute(&mut world).unwrap();
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn join_elimination_mixed_inner_and_left() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1), Health(100)));
+        world.spawn((Score(2), Team(2))); // no Health
+        world.spawn((Score(3),)); // no Team, no Health
+
+        let planner = QueryPlanner::new(&world);
+        // Inner join on Team (eliminable), Left join on Health (not eliminable).
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Health,)>(JoinKind::Left)
+            .build();
+
+        // Should have a join node (Left join remains).
+        match plan.root() {
+            PlanNode::HashJoin { .. } | PlanNode::NestedLoopJoin { .. } => {} // expected
+            other => panic!(
+                "expected join node for remaining Left join, got {:?}",
+                other
+            ),
+        }
+
+        // Inner join on Team narrows to 2 entities (Score+Team).
+        // Left join on Health preserves both.
+        let result = plan.execute(&mut world).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn join_elimination_triple_join_two_eliminated() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1), Health(100)));
+        world.spawn((Score(2), Team(2))); // no Health
+        world.spawn((Score(3),)); // no Team
+
+        let planner = QueryPlanner::new(&world);
+        // Two inner joins (Score→Team, Score→Health) + one left join (Score→Pos).
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .join::<(&Health,)>(JoinKind::Inner)
+            .join::<(&Pos,)>(JoinKind::Left)
+            .build();
+
+        // Two inner joins eliminated, one left join remains.
+        let eliminated_count = plan
+            .warnings()
+            .iter()
+            .filter(|w| matches!(w, PlanWarning::JoinEliminated { .. }))
+            .count();
+        assert_eq!(eliminated_count, 2);
+
+        // Only entity with Score+Team+Health survives the merged inner joins.
+        // Left join on Pos preserves it (no Pos, but Left keeps it).
+        let result = plan.execute(&mut world).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn join_elimination_changed_merged() {
+        let mut world = World::new();
+        let e1 = world.spawn((Score(1), Team(1)));
+        let _e2 = world.spawn((Score(2), Team(2)));
+
+        let planner = QueryPlanner::new(&world);
+        // Changed<Score> on left, Changed<Team> on right (inner join).
+        let mut plan = planner
+            .scan::<(Changed<Score>, &Score)>()
+            .join::<(Changed<Team>, &Team)>(JoinKind::Inner)
+            .build();
+
+        // First call: all entities are "changed" (new).
+        let r1 = plan.execute(&mut world).unwrap().len();
+        assert_eq!(r1, 2);
+
+        // Second call: nothing changed, should return 0.
+        let r2 = plan.execute(&mut world).unwrap().len();
+        assert_eq!(r2, 0);
+
+        // Mutate Score on e1.
+        *world.get_mut::<Score>(e1).unwrap() = Score(99);
+
+        // Third call: only e1 has Changed<Score>, but we also need Changed<Team>.
+        // Since Team wasn't changed, the merged change filter should still require
+        // both Score AND Team to be changed. Result: 0.
+        let r3 = plan.execute(&mut world).unwrap().len();
+        assert_eq!(r3, 0);
+    }
+
+    #[test]
+    fn join_elimination_idempotent_same_component() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+        world.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world);
+        // Join Score with Score (same component) — union is idempotent.
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Score,)>(JoinKind::Inner)
+            .build();
+
+        let result = plan.execute(&mut world).unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Should be eliminated.
+        let eliminated = plan
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, PlanWarning::JoinEliminated { .. }));
+        assert!(eliminated);
+    }
+
+    #[test]
+    fn join_elimination_emits_warning() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1)));
+
+        let planner = QueryPlanner::new(&world);
+        let plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let has_warning = plan.warnings().iter().any(|w| match w {
+            PlanWarning::JoinEliminated { right_name } => right_name.contains("Team"),
+            _ => false,
+        });
+        assert!(
+            has_warning,
+            "expected JoinEliminated warning, got {:?}",
+            plan.warnings()
+        );
+    }
+
+    #[test]
+    fn join_elimination_benchmark_parity() {
+        // Functional test: eliminated join should produce results in reasonable time.
+        // Not a benchmark — just verifies the optimization works end-to-end.
+        let mut world = World::new();
+        for i in 0..1000 {
+            world.spawn((Score(i), Team(i % 5)));
+        }
+        for i in 1000..2000 {
+            world.spawn((Score(i),)); // no Team
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut join_plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+        let mut scan_plan = planner.scan::<(&Score, &Team)>().build();
+
+        let join_result = join_plan.execute(&mut world).unwrap().to_vec();
+        let scan_result = scan_plan.execute(&mut world).unwrap().to_vec();
+        assert_eq!(join_result.len(), scan_result.len());
+        assert_eq!(join_result.len(), 1000);
     }
 }
