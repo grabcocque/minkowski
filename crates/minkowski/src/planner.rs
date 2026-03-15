@@ -1356,6 +1356,10 @@ pub enum PlanWarning {
     /// Multiple aggregate expressions share the same label. `get_by_label`
     /// returns the first match — the duplicate is silently hidden.
     DuplicateAggregateLabel { label: String },
+    /// An inner join was eliminated at build time — its required components
+    /// were merged into the scan's bitset. The plan executes as a pure
+    /// archetype scan instead of materializing a join.
+    JoinEliminated { right_name: &'static str },
 }
 
 impl fmt::Display for PlanWarning {
@@ -1407,6 +1411,13 @@ impl fmt::Display for PlanWarning {
                 write!(
                     f,
                     "duplicate aggregate label `{label}` — get_by_label() returns the first match"
+                )
+            }
+            PlanWarning::JoinEliminated { right_name } => {
+                write!(
+                    f,
+                    "inner join with `{right_name}` eliminated — merged into scan \
+                     (use scan::<(Left, Right)>() directly to avoid this)"
                 )
             }
         }
@@ -3124,6 +3135,89 @@ impl ScanBuilder<'_> {
                 cost: Cost::filter_with_branchless(parent_cost, pred.selectivity, bl),
                 child: Box::new(node),
             };
+        }
+
+        // Phase 4b: Join elimination — merge simple inner joins into scan.
+        // An inner join with no predicates is pure component-presence filtering,
+        // equivalent to widening the scan's required_ids. Eliminates run_join()
+        // materialization, sort, and intersection for the common case.
+        let mut any_eliminated = false;
+        if let Some(ref mut left_req) = self.left_required {
+            let left_chg = self.left_changed.get_or_insert_with(FixedBitSet::new);
+            self.joins.retain(|join| {
+                if join.join_kind == JoinKind::Inner {
+                    left_req.grow(join.right_required.len());
+                    left_req.union_with(&join.right_required);
+                    left_chg.grow(join.right_changed.len());
+                    left_chg.union_with(&join.right_changed);
+                    warnings.push(PlanWarning::JoinEliminated {
+                        right_name: join.right_query_name,
+                    });
+                    any_eliminated = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // If any joins were eliminated, the compile_for_each factories hold
+        // stale bitsets (captured at scan::<Q>() time with narrower requirements).
+        // Replace them with new factories that capture the merged bitsets.
+        if any_eliminated {
+            let merged_req = self.left_required.clone().unwrap();
+            let merged_chg = self.left_changed.clone().unwrap_or_default();
+            let merged_req2 = merged_req.clone();
+            let merged_chg2 = merged_chg.clone();
+
+            self.compile_for_each = Some(Box::new(move || {
+                Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        for arch in &world.archetypes.archetypes {
+                            if arch.is_empty() || !merged_req.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !passes_change_filter(arch, &merged_chg, tick) {
+                                continue;
+                            }
+                            for &entity in &arch.entities {
+                                callback(entity);
+                            }
+                        }
+                    },
+                )
+            }));
+            self.compile_for_each_raw = Some(Box::new(move || {
+                Box::new(
+                    move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
+                        for arch in &world.archetypes.archetypes {
+                            if arch.is_empty() || !merged_req2.is_subset(&arch.component_ids) {
+                                continue;
+                            }
+                            if !passes_change_filter(arch, &merged_chg2, tick) {
+                                continue;
+                            }
+                            for &entity in &arch.entities {
+                                callback(entity);
+                            }
+                        }
+                    },
+                )
+            }));
+
+            // Also update spatial bitsets if present.
+            if let Some(ref mut spatial_req) = self.required_for_spatial
+                && let Some(ref left_req) = self.left_required
+            {
+                spatial_req.grow(left_req.len());
+                spatial_req.union_with(left_req);
+            }
+            if let Some(ref mut spatial_chg) = self.changed_for_spatial
+                && let Some(ref left_chg) = self.left_changed
+            {
+                spatial_chg.grow(left_chg.len());
+                spatial_chg.union_with(left_chg);
+            }
         }
 
         let opts = VectorizeOpts::default();
