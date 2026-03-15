@@ -396,7 +396,7 @@ fn join_selectivity_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("join_selectivity");
 
     for (label, pct) in [("10pct", 0.1), ("50pct", 0.5), ("90pct", 0.9)] {
-        group.bench_function(&format!("get_{label}"), |b| {
+        group.bench_function(format!("get_{label}"), |b| {
             let (mut world, _) = join_world(10_000, pct);
             let planner = QueryPlanner::new(&world);
             let mut plan = planner
@@ -417,7 +417,7 @@ fn join_selectivity_benches(c: &mut Criterion) {
             });
         });
 
-        group.bench_function(&format!("chunk_{label}"), |b| {
+        group.bench_function(format!("chunk_{label}"), |b| {
             let (mut world, _) = join_world(10_000, pct);
             let planner = QueryPlanner::new(&world);
             let mut plan = planner

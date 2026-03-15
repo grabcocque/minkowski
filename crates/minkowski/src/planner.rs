@@ -9679,7 +9679,7 @@ mod tests {
         // Two archetypes have Team: (Score, Team) and (Score, Team, Health).
         assert_eq!(chunk_entities.len(), 2);
         // Total: 2 entities (one per Team-bearing archetype).
-        let total: usize = chunk_entities.iter().map(|c| c.len()).sum();
+        let total: usize = chunk_entities.iter().map(Vec::len).sum();
         assert_eq!(total, 2);
         // Each chunk should have different entities.
         assert_ne!(chunk_entities[0], chunk_entities[1]);
