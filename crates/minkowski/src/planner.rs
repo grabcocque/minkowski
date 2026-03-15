@@ -10157,6 +10157,20 @@ mod tests {
         // both Score AND Team to be changed. Result: 0.
         let r3 = plan.execute(&mut world).unwrap().len();
         assert_eq!(r3, 0);
+
+        // Fourth call: only Team changed (right side of the eliminated join).
+        // Score not changed → merged filter requires both → 0.
+        *world.get_mut::<Team>(e1).unwrap() = Team(99);
+        let r4 = plan.execute(&mut world).unwrap().len();
+        assert_eq!(r4, 0);
+
+        // Fifth call: mutate BOTH Score and Team on e1. Now both columns
+        // are marked changed at the archetype level → all entities in the
+        // archetype pass (Changed<T> is per-column, not per-entity).
+        *world.get_mut::<Score>(e1).unwrap() = Score(100);
+        *world.get_mut::<Team>(e1).unwrap() = Team(100);
+        let r5 = plan.execute(&mut world).unwrap().len();
+        assert_eq!(r5, 2);
     }
 
     #[test]
@@ -10203,6 +10217,50 @@ mod tests {
             "expected JoinEliminated warning, got {:?}",
             plan.warnings()
         );
+    }
+
+    #[test]
+    fn join_elimination_raw_paths() {
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        let mut both = Vec::new();
+        for i in 10..15 {
+            both.push(world.spawn((Score(i), Team(i % 3))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // Verify elimination happened.
+        assert!(
+            plan.warnings()
+                .iter()
+                .any(|w| matches!(w, PlanWarning::JoinEliminated { .. }))
+        );
+
+        // execute_raw — should yield same entities as execute.
+        let raw_result = plan.execute_raw(&world).unwrap().to_vec();
+        assert_eq!(raw_result.len(), 5);
+
+        // for_each_raw — should yield same entities.
+        let mut raw_entities = Vec::new();
+        plan.for_each_raw(&world, |entity| raw_entities.push(entity))
+            .unwrap();
+        assert_eq!(raw_entities.len(), 5);
+
+        // for_each_batched_raw — pre-resolved column pointers via eliminated path.
+        let mut batched_scores = Vec::new();
+        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, (score,)| {
+            batched_scores.push(score.0);
+        })
+        .unwrap();
+        batched_scores.sort_unstable();
+        assert_eq!(batched_scores, vec![10, 11, 12, 13, 14]);
     }
 
     #[test]
