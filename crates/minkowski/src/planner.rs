@@ -3474,8 +3474,6 @@ impl ScanBuilder<'_> {
             }
         }
 
-        let _has_custom_filters = !filter_preds.is_empty();
-
         // Phase 2: Order index lookups by selectivity (most selective first).
         index_preds.sort_by(|a, b| a.0.selectivity.total_cmp(&b.0.selectivity));
         // Sort spatial predicates by total cost (cpu), not estimated_rows alone.
@@ -3523,8 +3521,6 @@ impl ScanBuilder<'_> {
             )
             .collect();
         // Capture before all_filter_fns is moved into compiled closures.
-        // Includes spatial/index predicate filters that has_custom_filters
-        // misses (it only checks filter_preds).
         let has_any_filters = !all_filter_fns.is_empty();
 
         // Phase 3: Build the logical plan tree.
@@ -4511,11 +4507,7 @@ impl ScanBuilder<'_> {
             cached_accums,
             row_indices: Vec::new(),
             // Direct archetype iteration: only for pure scans with no
-            // predicates, indexes, or spatial drivers. Check all_filter_fns
-            // (not just has_custom_filters) because spatial predicates
-            // registered via add_spatial_index (cost-only, no lookup) land
-            // in spatial_preds with a filter_fn but leave has_custom_filters
-            // false — the fast path must not bypass those filters.
+            // predicates, indexes, or spatial drivers.
             scan_required: if !has_any_filters
                 && !has_any_joins
                 && index_driver.is_none()
@@ -11701,9 +11693,9 @@ mod tests {
     }
 
     /// Regression: add_spatial_index (cost-only, no lookup) registers a
-    /// spatial predicate's filter_fn in all_filter_fns while leaving
-    /// has_custom_filters false.  The scan_required fast path must NOT
-    /// activate for such plans, otherwise the filter is never evaluated.
+    /// spatial predicate's filter_fn in all_filter_fns.  The scan_required
+    /// fast path must NOT activate for such plans, otherwise the filter is
+    /// never evaluated.
     #[test]
     fn spatial_cost_only_filter_applied_in_for_each() {
         let mut world = World::new();
