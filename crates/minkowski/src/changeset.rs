@@ -691,16 +691,15 @@ impl EnumChangeSet {
                 layout,
             } = mutation
             {
-                let index = entity.index() as usize;
-                let location = world.entity_locations[index];
-
-                // Generation check — required even on batch continuation because
-                // EnumChangeSet is a public API. Stale entity handles with reused
-                // indices could silently overwrite live entity data without this.
+                // Generation check first — before location lookup. EnumChangeSet
+                // is a public API; stale/corrupt entity handles could have indices
+                // outside entity_locations. is_alive handles out-of-bounds safely.
                 if !world.is_alive(*entity) {
                     flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                     return Err(map_err(ApplyError::DeadEntity(*entity)));
                 }
+                let index = entity.index() as usize;
+                let location = world.entity_locations[index];
 
                 // Fast path: batch continuation. If the current batch covers
                 // this (archetype, component), skip contains + column_index +
