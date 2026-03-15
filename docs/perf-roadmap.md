@@ -49,6 +49,21 @@ variant alongside the current `entity_extractor`.
 
 ---
 
+### P1-4: Join batch execution --- COMPLETED
+
+**Implementation**: Archetype-sorted batch execution for join plans.
+After `run_join()` materialises entities into ScratchBuffer, sort by
+packed `(archetype_id << 32 | row)` key. Walk archetype runs calling
+`init_fetch` once per archetype, `fetch`/`as_slice` per entity.
+
+**Results**: Benchmarks not yet run. Use `cargo bench -p minkowski-bench -- join`
+to measure `for_each_get` (baseline) vs `for_each_batched` and `for_each_chunk`.
+
+**API**: `for_each_batched`, `for_each_batched_raw`, `for_each_join_chunk`
+on `QueryPlanResult`.
+
+---
+
 ### P1-3: Spawn batching
 
 **Current**: `world.spawn()` resolves the archetype per entity (hash lookup on

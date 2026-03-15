@@ -1,12 +1,13 @@
-# Miri test subset — ~80 tests exercising unsafe code paths.
+# Miri test subset — ~88 tests exercising unsafe code paths.
 # Used by CI: cargo miri test -p minkowski --lib -- $(paste -sd '|' ci/miri-subset.txt)
 #
 # Selection criteria: tests that exercise raw pointer arithmetic, UnsafeCell
 # access, atomic ops on mmap memory, type-erased column storage, arena
 # allocation, or entity lifecycle through unsafe paths.
 #
-# Safe-only modules excluded: planner (211 tests), access (27), view (22),
-# transaction (39), debounce (7), tick (7), lock_table (6), retention (10).
+# Mostly safe modules excluded: access (27), view (22), transaction (39),
+# debounce (7), tick (7), lock_table (6), retention (10).
+# 3 planner tests selected for batch join unsafe paths (init_fetch/fetch/as_slice).
 
 # ── BlobVec: raw pointer column storage (ALL 16) ────────────────────
 storage::blob_vec::tests::push_increments_len
@@ -112,3 +113,8 @@ table::tests::typed_query_table_mut
 # ── Bundle: unsafe put (2 selected) ─────────────────────────────────
 bundle::tests::put_writes_correct_data
 bundle::tests::pair_component_ids_sorted
+
+# ── Planner: batch join execution (3 selected) ────────────────────
+planner::tests::for_each_batched_yields_all_join_results
+planner::tests::for_each_join_chunk_yields_correct_slices
+planner::tests::for_each_join_chunk_multi_archetype

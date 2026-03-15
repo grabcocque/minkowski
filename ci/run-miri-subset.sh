@@ -67,6 +67,10 @@ EXACT_TESTS=(
     # Bundle unsafe put (2)
     "bundle::tests::put_writes_correct_data"
     "bundle::tests::pair_component_ids_sorted"
+    # Planner batch join execution (3)
+    "planner::tests::for_each_batched_yields_all_join_results"
+    "planner::tests::for_each_join_chunk_yields_correct_slices"
+    "planner::tests::for_each_join_chunk_multi_archetype"
 )
 
 TOTAL=0

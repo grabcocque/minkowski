@@ -83,12 +83,13 @@ use fixedbitset::FixedBitSet;
 use crate::component::{Component, ComponentId, ComponentRegistry};
 use crate::entity::Entity;
 use crate::index::{BTreeIndex, HashIndex, SpatialCost, SpatialExpr, SpatialIndex};
-use crate::storage::archetype::Archetype;
+use crate::storage::archetype::{Archetype, ArchetypeId};
 use crate::tick::Tick;
 // Use std Arc directly — the planner has no concurrent code, so it does not
 // need loom's Arc (which lacks unsized coercion for Arc<dyn Fn> type erasure).
+use crate::query::fetch::{ReadOnlyWorldQuery, WorldQuery};
 use crate::transaction::WorldMismatch;
-use crate::world::{World, WorldId};
+use crate::world::{EntityLocation, World, WorldId};
 use std::sync::Arc;
 
 // ── Planner errors ───────────────────────────────────────────────────
@@ -136,6 +137,14 @@ pub enum PlanExecError {
         note = "join plans are now supported by all execution methods; this variant is never returned"
     )]
     JoinNotSupported,
+    /// Batch execution method called with a `Q: WorldQuery` whose required
+    /// components are not present in one of the matched archetypes.
+    ComponentMismatch {
+        /// `std::any::type_name::<Q>()` of the query tuple.
+        query: &'static str,
+        /// Archetype that was missing a required component.
+        archetype_id: ArchetypeId,
+    },
 }
 
 impl fmt::Display for PlanExecError {
@@ -147,6 +156,14 @@ impl fmt::Display for PlanExecError {
                 f,
                 "for_each/for_each_raw do not support join plans — use execute() instead"
             ),
+            PlanExecError::ComponentMismatch {
+                query,
+                archetype_id,
+            } => write!(
+                f,
+                "batch query `{query}` has components missing from archetype {arch}",
+                arch = archetype_id.0
+            ),
         }
     }
 }
@@ -156,7 +173,7 @@ impl std::error::Error for PlanExecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PlanExecError::WorldMismatch(e) => Some(e),
-            PlanExecError::JoinNotSupported => None,
+            PlanExecError::JoinNotSupported | PlanExecError::ComponentMismatch { .. } => None,
         }
     }
 }
@@ -1415,6 +1432,9 @@ pub struct QueryPlanResult {
     compiled_agg_scan: Option<CompiledAggScan>,
     /// Compiled batch aggregate scan for raw path (for `execute_aggregates_raw`).
     compiled_agg_scan_raw: Option<CompiledAggScan>,
+    /// Reusable buffer for row indices in batch execution methods.
+    /// Cleared and repopulated on each `for_each_join_chunk` call.
+    row_indices: Vec<usize>,
 }
 
 impl QueryPlanResult {
@@ -1685,6 +1705,306 @@ impl QueryPlanResult {
         Ok(())
     }
 
+    /// Execute the plan with archetype-sorted batch extraction.
+    ///
+    /// After join materialisation (or scan collection), entities are sorted
+    /// by `(ArchetypeId, Row)` so that consecutive entities share the same
+    /// archetype. For each archetype run, `Q::init_fetch` is called once
+    /// to resolve column pointers, then `Q::fetch` is called per entity
+    /// with just a pointer offset — no generation check, no TypeId hash,
+    /// no column search.
+    ///
+    /// `Q` is specified at the call site and validated at runtime against
+    /// each archetype's component set. Returns `Err(ComponentMismatch)` if
+    /// `Q`'s required components are missing from any matched archetype.
+    ///
+    /// Advances the read tick (same as `for_each`).
+    pub fn for_each_batched<Q, F>(
+        &mut self,
+        world: &mut World,
+        mut callback: F,
+    ) -> Result<(), PlanExecError>
+    where
+        Q: WorldQuery,
+        F: FnMut(Entity, Q::Item<'_>),
+    {
+        // Mark mutable columns changed before iteration (mirrors world.query()).
+        let mutable = Q::mutable_ids(&world.components);
+        if !mutable.is_empty() {
+            let tick = world.next_tick();
+            for arch in &mut world.archetypes.archetypes {
+                if arch.is_empty()
+                    || !Q::required_ids(&world.components).is_subset(&arch.component_ids)
+                {
+                    continue;
+                }
+                for comp_id in mutable.ones() {
+                    if let Some(col_idx) = arch.column_index(comp_id) {
+                        arch.columns[col_idx].mark_changed(tick);
+                    }
+                }
+            }
+        }
+        self.for_each_batched_inner::<Q, F>(world, &mut callback)?;
+        self.last_read_tick = world.next_tick();
+        Ok(())
+    }
+
+    /// Read-only variant of [`for_each_batched`](Self::for_each_batched).
+    /// No tick advancement.
+    /// Safe for use inside transactions where only `&World` is available.
+    pub fn for_each_batched_raw<Q, F>(
+        &mut self,
+        world: &World,
+        mut callback: F,
+    ) -> Result<(), PlanExecError>
+    where
+        Q: ReadOnlyWorldQuery,
+        F: FnMut(Entity, Q::Item<'_>),
+    {
+        self.for_each_batched_inner::<Q, F>(world, &mut callback)
+    }
+
+    /// Shared implementation for `for_each_batched` and `for_each_batched_raw`.
+    fn for_each_batched_inner<Q, F>(
+        &mut self,
+        world: &World,
+        callback: &mut F,
+    ) -> Result<(), PlanExecError>
+    where
+        Q: WorldQuery,
+        F: FnMut(Entity, Q::Item<'_>),
+    {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
+        }
+
+        // Phase 1: Populate scratch buffer.
+        if self.join_exec.is_some() {
+            self.run_join(world);
+        } else if let Some(compiled) = &mut self.compiled_for_each_raw {
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("for_each_batched requires a scratch buffer");
+            scratch.clear();
+            let tick = self.last_read_tick;
+            compiled(world, tick, &mut |entity: Entity| {
+                scratch.push(entity);
+            });
+        } else {
+            // Scan-only plan with no compiled closure — empty result.
+            // Tick advancement is the caller's responsibility.
+            return Ok(());
+        }
+
+        // Phase 2: Sort by (archetype_id, row).
+        let scratch = self
+            .scratch
+            .as_mut()
+            .expect("for_each_batched requires a scratch buffer");
+        scratch.sort_by_archetype(&world.entity_locations);
+
+        // Phase 3: Walk archetype runs with pre-resolved fetch.
+        let entities = scratch.as_slice();
+        if entities.is_empty() {
+            // Tick advancement is the caller's responsibility.
+            return Ok(());
+        }
+
+        // Guard against aliased &mut T from duplicate entities (would be UB).
+        debug_assert!(
+            entities.windows(2).all(|w| w[0] != w[1]),
+            "duplicate entity in batch buffer — would alias &mut T"
+        );
+
+        let required = Q::required_ids(&world.components);
+        let mut run_start = 0;
+
+        while run_start < entities.len() {
+            let loc = world.entity_locations[entities[run_start].index() as usize]
+                .expect("sorted entity has no location");
+            let arch_id = loc.archetype_id;
+            let archetype = &world.archetypes.archetypes[arch_id.0];
+
+            // Validate Q's required components are present in this archetype.
+            if !required.is_subset(&archetype.component_ids) {
+                return Err(PlanExecError::ComponentMismatch {
+                    query: std::any::type_name::<Q>(),
+                    archetype_id: arch_id,
+                });
+            }
+
+            let fetch = Q::init_fetch(archetype, &world.components);
+
+            // Find end of this archetype run.
+            let mut run_end = run_start + 1;
+            while run_end < entities.len() {
+                let next_loc = world.entity_locations[entities[run_end].index() as usize]
+                    .expect("sorted entity has no location");
+                if next_loc.archetype_id != arch_id {
+                    break;
+                }
+                run_end += 1;
+            }
+
+            // Iterate entities in this run.
+            for &entity in &entities[run_start..run_end] {
+                let row = world.entity_locations[entity.index() as usize]
+                    .expect("sorted entity has no location")
+                    .row;
+                debug_assert!(
+                    row < archetype.len(),
+                    "row {row} >= archetype len {}",
+                    archetype.len()
+                );
+                let item = unsafe { Q::fetch(&fetch, row) };
+                callback(entity, item);
+            }
+
+            run_start = run_end;
+        }
+
+        Ok(())
+    }
+
+    /// Execute the plan with archetype-chunked slice extraction.
+    ///
+    /// After join materialisation and archetype sorting, the callback
+    /// receives per-archetype chunks containing:
+    /// - `&[Entity]` — matched entities (sorted by row within this archetype)
+    /// - `&[usize]` — row indices into the column slices
+    /// - `Q::Slice<'_>` — full column slice for the archetype
+    ///
+    /// The callback can iterate `rows` and index into the slice:
+    /// `for (i, &row) in rows.iter().enumerate() { let val = slice[row]; }`
+    ///
+    /// This enables SIMD-friendly access patterns on join results.
+    /// Advances the read tick.
+    pub fn for_each_join_chunk<Q, F>(
+        &mut self,
+        world: &mut World,
+        mut callback: F,
+    ) -> Result<(), PlanExecError>
+    where
+        Q: WorldQuery,
+        F: FnMut(&[Entity], &[usize], Q::Slice<'_>),
+    {
+        if self.world_id != world.world_id() {
+            return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
+        }
+
+        // Mark mutable columns changed before iteration (mirrors world.query()).
+        let mutable = Q::mutable_ids(&world.components);
+        if !mutable.is_empty() {
+            let tick = world.next_tick();
+            for arch in &mut world.archetypes.archetypes {
+                if arch.is_empty()
+                    || !Q::required_ids(&world.components).is_subset(&arch.component_ids)
+                {
+                    continue;
+                }
+                for comp_id in mutable.ones() {
+                    if let Some(col_idx) = arch.column_index(comp_id) {
+                        arch.columns[col_idx].mark_changed(tick);
+                    }
+                }
+            }
+        }
+
+        // Phase 1: Populate scratch buffer.
+        if self.join_exec.is_some() {
+            self.run_join(&*world);
+        } else if let Some(compiled) = &mut self.compiled_for_each_raw {
+            let scratch = self
+                .scratch
+                .as_mut()
+                .expect("for_each_join_chunk requires a scratch buffer");
+            scratch.clear();
+            let tick = self.last_read_tick;
+            compiled(&*world, tick, &mut |entity: Entity| {
+                scratch.push(entity);
+            });
+        } else {
+            // Scan-only plan with no compiled closure — empty result.
+            self.last_read_tick = world.next_tick();
+            return Ok(());
+        }
+
+        // Phase 2: Sort by (archetype_id, row).
+        let scratch = self
+            .scratch
+            .as_mut()
+            .expect("for_each_join_chunk requires a scratch buffer");
+        scratch.sort_by_archetype(&world.entity_locations);
+
+        // Early exit if scratch is empty (before destructuring self).
+        if scratch.as_slice().is_empty() {
+            self.last_read_tick = world.next_tick();
+            return Ok(());
+        }
+
+        // Reborrow disjoint fields to avoid borrow conflict between
+        // scratch.as_slice() (borrows self.scratch) and self.row_indices.
+        let Self {
+            scratch,
+            row_indices,
+            last_read_tick,
+            ..
+        } = self;
+        let scratch = scratch.as_ref().expect("scratch buffer disappeared");
+        let entities = scratch.as_slice();
+
+        let required = Q::required_ids(&world.components);
+        let mut run_start = 0;
+
+        while run_start < entities.len() {
+            let loc = world.entity_locations[entities[run_start].index() as usize]
+                .expect("sorted entity has no location");
+            let arch_id = loc.archetype_id;
+            let archetype = &world.archetypes.archetypes[arch_id.0];
+
+            // Validate Q's required components.
+            if !required.is_subset(&archetype.component_ids) {
+                return Err(PlanExecError::ComponentMismatch {
+                    query: std::any::type_name::<Q>(),
+                    archetype_id: arch_id,
+                });
+            }
+
+            let fetch = Q::init_fetch(archetype, &world.components);
+
+            // Find end of this archetype run.
+            let mut run_end = run_start + 1;
+            while run_end < entities.len() {
+                let next_loc = world.entity_locations[entities[run_end].index() as usize]
+                    .expect("sorted entity has no location");
+                if next_loc.archetype_id != arch_id {
+                    break;
+                }
+                run_end += 1;
+            }
+
+            // Collect row indices for this run.
+            row_indices.clear();
+            for &entity in &entities[run_start..run_end] {
+                let row = world.entity_locations[entity.index() as usize]
+                    .expect("sorted entity has no location")
+                    .row;
+                debug_assert!(row < archetype.len());
+                row_indices.push(row);
+            }
+
+            let slice = unsafe { Q::as_slice(&fetch, archetype.len()) };
+            callback(&entities[run_start..run_end], row_indices, slice);
+
+            run_start = run_end;
+        }
+
+        *last_read_tick = world.next_tick();
+        Ok(())
+    }
+
     /// The `WorldId` this plan was built from.
     pub fn world_id(&self) -> WorldId {
         self.world_id
@@ -1897,6 +2217,7 @@ impl fmt::Debug for QueryPlanResult {
                 "has_compiled_agg_scan_raw",
                 &self.compiled_agg_scan_raw.is_some(),
             )
+            .field("row_indices_cap", &self.row_indices.capacity())
             .finish()
     }
 }
@@ -3417,6 +3738,7 @@ impl ScanBuilder<'_> {
             aggregate_exprs,
             compiled_agg_scan,
             compiled_agg_scan_raw,
+            row_indices: Vec::new(),
         }
     }
 }
@@ -4242,6 +4564,22 @@ impl ScratchBuffer {
 
         let final_len = self.entities.len();
         &self.entities[final_len - match_count..final_len]
+    }
+
+    /// Sort entities by (ArchetypeId, Row) to restore cache locality after
+    /// join materialisation. Entities from the same archetype become
+    /// contiguous, and within each archetype group, rows are in physical
+    /// memory order (ascending).
+    ///
+    /// # Panics
+    /// Panics if any entity in the buffer has no location (dead entity).
+    /// This should never happen: join collectors only iterate live archetypes.
+    fn sort_by_archetype(&mut self, entity_locations: &[Option<EntityLocation>]) {
+        self.entities.sort_unstable_by_key(|e| {
+            let loc = entity_locations[e.index() as usize]
+                .expect("entity in scratch buffer has no location");
+            ((loc.archetype_id.0 as u64) << 32) | (loc.row as u64)
+        });
     }
 }
 
@@ -9163,5 +9501,408 @@ mod tests {
         assert_eq!(result.get(0), Some(8.0)); // count: 5 + 3
         // sum of Health: only from archetype 2 = 0 + 10 + 20 = 30
         assert_eq!(result.get(1), Some(30.0));
+    }
+
+    // ── Batch join execution ──────────────────────────────────────────
+
+    #[test]
+    fn scratch_sort_by_archetype_groups_entities() {
+        let mut world = World::new();
+        // Archetype A: Score only
+        let a1 = world.spawn((Score(1),));
+        let a2 = world.spawn((Score(2),));
+        // Archetype B: Score + Team
+        let b1 = world.spawn((Score(3), Team(1)));
+        let b2 = world.spawn((Score(4), Team(2)));
+
+        // Deliberately interleave: [b1, a1, b2, a2]
+        let mut scratch = ScratchBuffer::new(4);
+        scratch.push(b1);
+        scratch.push(a1);
+        scratch.push(b2);
+        scratch.push(a2);
+
+        scratch.sort_by_archetype(&world.entity_locations);
+
+        // After sort: entities from same archetype should be contiguous.
+        let sorted = scratch.as_slice();
+        // First two share one archetype, last two share another.
+        let loc0 = world.entity_locations[sorted[0].index() as usize].unwrap();
+        let loc1 = world.entity_locations[sorted[1].index() as usize].unwrap();
+        let loc2 = world.entity_locations[sorted[2].index() as usize].unwrap();
+        let loc3 = world.entity_locations[sorted[3].index() as usize].unwrap();
+        assert_eq!(loc0.archetype_id, loc1.archetype_id);
+        assert_eq!(loc2.archetype_id, loc3.archetype_id);
+        assert_ne!(loc0.archetype_id, loc2.archetype_id);
+
+        // Within each archetype group, rows should be sorted ascending.
+        assert!(loc0.row < loc1.row);
+        assert!(loc2.row < loc3.row);
+    }
+
+    #[test]
+    fn for_each_batched_yields_all_join_results() {
+        let mut world = World::new();
+        // Score-only entities (should NOT appear in inner join)
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+        // Score+Team entities (SHOULD appear)
+        let mut expected = Vec::new();
+        for i in 5..15 {
+            let e = world.spawn((Score(i), Team(i % 3)));
+            expected.push((e, Score(i)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut results: Vec<(Entity, Score)> = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, (score,)| {
+            results.push((entity, *score));
+        })
+        .unwrap();
+
+        // Sort both by entity for comparison.
+        results.sort_by_key(|(e, _)| e.to_bits());
+        expected.sort_by_key(|(e, _)| e.to_bits());
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn for_each_join_chunk_yields_correct_slices() {
+        let mut world = World::new();
+        // Archetype A: Score only (will not match inner join)
+        for i in 0..3 {
+            world.spawn((Score(i),));
+        }
+        // Archetype B: Score + Team (deterministic scores 10..15)
+        for i in 10..15 {
+            world.spawn((Score(i), Team(1)));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut total_entities = 0;
+        let mut chunk_count = 0;
+        let mut collected_scores = Vec::new();
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+            // rows and entities must have the same length.
+            assert_eq!(entities.len(), rows.len());
+            // Each row index must be valid for the slice.
+            for &row in rows {
+                assert!(
+                    row < scores.len(),
+                    "row {row} out of bounds for slice len {}",
+                    scores.len()
+                );
+                collected_scores.push(scores[row]);
+            }
+            total_entities += entities.len();
+            chunk_count += 1;
+        })
+        .unwrap();
+
+        assert_eq!(total_entities, 5); // Only Score+Team entities
+        assert!(chunk_count >= 1); // At least one archetype chunk
+        // Verify we read the correct score values (10..15).
+        collected_scores.sort_by_key(|s| s.0);
+        assert_eq!(collected_scores, (10..15).map(Score).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn for_each_batched_raw_no_tick_advance() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // Call raw twice — both should succeed (no tick advancement).
+        let mut count1 = 0u32;
+        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, _| count1 += 1)
+            .unwrap();
+        assert_eq!(count1, 1);
+
+        let mut count2 = 0u32;
+        plan.for_each_batched_raw::<(&Score,), _>(&world, |_, _| count2 += 1)
+            .unwrap();
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn for_each_join_chunk_works_for_scan_plans() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+        world.spawn((Score(2),));
+        world.spawn((Score(3),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut total = 0;
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+            assert_eq!(entities.len(), rows.len());
+            total += entities.len();
+            // For scan plans, rows should be 0..len (all entities in the archetype).
+            for (i, &row) in rows.iter().enumerate() {
+                assert_eq!(row, i, "scan plan rows should be sequential");
+            }
+            assert_eq!(scores.len(), entities.len());
+        })
+        .unwrap();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn for_each_batched_left_join() {
+        let mut world = World::new();
+        // 5 Score-only, 5 Score+Team
+        let mut all_score = Vec::new();
+        for i in 0..5 {
+            all_score.push(world.spawn((Score(i),)));
+        }
+        for i in 5..10 {
+            all_score.push(world.spawn((Score(i), Team(1))));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Left)
+            .build();
+
+        let mut results = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |entity, _| {
+            results.push(entity);
+        })
+        .unwrap();
+
+        // Left join: all 10 Score entities should appear.
+        assert_eq!(results.len(), 10);
+        all_score.sort_by_key(|e| e.to_bits());
+        results.sort_by_key(|e| e.to_bits());
+        assert_eq!(results, all_score);
+    }
+
+    #[test]
+    fn for_each_join_chunk_multi_archetype() {
+        let mut world = World::new();
+        // 3 different archetypes, all with Score
+        world.spawn((Score(1),));
+        world.spawn((Score(2), Team(1)));
+        world.spawn((Score(3), Team(1), Health(50)));
+
+        let planner = QueryPlanner::new(&world);
+        // Scan Score, join Team — only archetypes with Team match the join.
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        // Collect chunk info: (entity_count, first_entity) per chunk.
+        let mut chunk_entities: Vec<Vec<Entity>> = Vec::new();
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |entities, _, _| {
+            assert!(!entities.is_empty());
+            chunk_entities.push(entities.to_vec());
+        })
+        .unwrap();
+
+        // Two archetypes have Team: (Score, Team) and (Score, Team, Health).
+        assert_eq!(chunk_entities.len(), 2);
+        // Total: 2 entities (one per Team-bearing archetype).
+        let total: usize = chunk_entities.iter().map(Vec::len).sum();
+        assert_eq!(total, 2);
+        // Each chunk should have different entities.
+        assert_ne!(chunk_entities[0], chunk_entities[1]);
+    }
+
+    #[test]
+    fn for_each_batched_empty_join() {
+        let mut world = World::new();
+        // Score-only entities, no Team — inner join produces empty result.
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut called = false;
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, _| {
+            called = true;
+        })
+        .unwrap();
+        assert!(!called);
+    }
+
+    #[test]
+    fn for_each_batched_world_mismatch() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        world_a.spawn((Score(1),));
+        world_b.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world_a);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.for_each_batched::<(&Score,), _>(&mut world_b, |_, _| {});
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn for_each_batched_component_mismatch() {
+        let mut world = World::new();
+        // Entities have Score only — no Health component.
+        world.spawn((Score(1),));
+        world.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        // Request (&Health,) via Q, but no archetype has Health.
+        let result = plan.for_each_batched::<(&Health,), _>(&mut world, |_, _| {});
+        assert!(
+            matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
+            "expected ComponentMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn for_each_join_chunk_component_mismatch() {
+        let mut world = World::new();
+        world.spawn((Score(1),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let result = plan.for_each_join_chunk::<(&Health,), _>(&mut world, |_, _, _| {});
+        assert!(
+            matches!(result, Err(PlanExecError::ComponentMismatch { .. })),
+            "expected ComponentMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn for_each_join_chunk_world_mismatch() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        world_a.spawn((Score(1),));
+        world_b.spawn((Score(2),));
+
+        let planner = QueryPlanner::new(&world_a);
+        let mut plan = planner.scan::<(&Score,)>().build();
+        let result = plan.for_each_join_chunk::<(&Score,), _>(&mut world_b, |_, _, _| {});
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn for_each_join_chunk_empty_join() {
+        let mut world = World::new();
+        for i in 0..5 {
+            world.spawn((Score(i),));
+        }
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut called = false;
+        plan.for_each_join_chunk::<(&Score,), _>(&mut world, |_, _, _| {
+            called = true;
+        })
+        .unwrap();
+        assert!(!called);
+    }
+
+    #[test]
+    fn for_each_batched_scan_only_happy_path() {
+        let mut world = World::new();
+        world.spawn((Score(10),));
+        world.spawn((Score(20),));
+        world.spawn((Score(30),));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner.scan::<(&Score,)>().build();
+
+        let mut sum = 0u32;
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+            sum += score.0;
+        })
+        .unwrap();
+        assert_eq!(sum, 60);
+    }
+
+    #[test]
+    fn for_each_batched_multi_archetype_values() {
+        let mut world = World::new();
+        // Archetype A: Score + Team
+        world.spawn((Score(10), Team(1)));
+        world.spawn((Score(20), Team(2)));
+        // Archetype B: Score + Team + Health
+        world.spawn((Score(30), Team(3), Health(100)));
+        world.spawn((Score(40), Team(4), Health(200)));
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .join::<(&Team,)>(JoinKind::Inner)
+            .build();
+
+        let mut scores = Vec::new();
+        plan.for_each_batched::<(&Score,), _>(&mut world, |_, (score,)| {
+            scores.push(score.0);
+        })
+        .unwrap();
+        scores.sort_unstable();
+        assert_eq!(scores, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn for_each_batched_marks_mutable_changed() {
+        let mut world = World::new();
+        world.spawn((Score(1), Team(1)));
+
+        let planner = QueryPlanner::new(&world);
+        // Use Changed<Score> to check change detection.
+        let mut changed_plan = planner.scan::<(Changed<Score>, &Score)>().build();
+
+        // First call: all entities are new, so Changed sees them.
+        let r1 = changed_plan.execute(&mut world).unwrap().len();
+        assert_eq!(r1, 1);
+
+        // Second call: nothing mutated, Changed skips.
+        let r2 = changed_plan.execute(&mut world).unwrap().len();
+        assert_eq!(r2, 0);
+
+        // Now mutate via for_each_batched with &mut Score.
+        let scan_planner = QueryPlanner::new(&world);
+        let mut scan_plan = scan_planner.scan::<(&Score,)>().build();
+        scan_plan
+            .for_each_batched::<(&mut Score,), _>(&mut world, |_, (score,)| {
+                score.0 += 1;
+            })
+            .unwrap();
+
+        // Changed<Score> should now see the mutation.
+        let r3 = changed_plan.execute(&mut world).unwrap().len();
+        assert_eq!(
+            r3, 1,
+            "Changed<Score> should detect mutation from for_each_batched"
+        );
     }
 }
