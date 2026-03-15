@@ -453,11 +453,12 @@ pub(crate) struct SlabPool {
 impl Drop for SlabPool {
     fn drop(&mut self) {
         if self.side_table_len > 0 {
-            // SAFETY: side_table was allocated via Vec in new(), then
-            // ownership was transferred to the raw pointer via mem::forget.
+            // SAFETY: side_table was allocated via Vec::with_capacity(len)
+            // in new(), then ownership transferred via mem::forget.
+            // Layout matches: size = side_table_len, align = 1 (u8).
             unsafe {
-                let _ =
-                    Vec::from_raw_parts(self.side_table, self.side_table_len, self.side_table_len);
+                let layout = Layout::from_size_align_unchecked(self.side_table_len, 1);
+                std::alloc::dealloc(self.side_table, layout);
             }
         }
     }
