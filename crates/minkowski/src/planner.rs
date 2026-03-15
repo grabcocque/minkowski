@@ -1794,6 +1794,37 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Bypass CompiledForEach and push entities directly into scratch.
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                scratch,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let scratch = scratch
+                .as_mut()
+                .expect("execute() requires a plan with a scratch buffer");
+            scratch.clear();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    scratch.push(entity);
+                }
+            }
+            *last_read_tick = world.next_tick();
+            return Ok(scratch.as_slice());
+        }
+
         if self.join_exec.is_some() {
             self.run_join(&*world);
             self.last_read_tick = world.next_tick();
@@ -1841,6 +1872,35 @@ impl QueryPlanResult {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
 
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                scratch,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let scratch = scratch
+                .as_mut()
+                .expect("execute_raw() requires a plan with a scratch buffer");
+            scratch.clear();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    scratch.push(entity);
+                }
+            }
+            return Ok(scratch.as_slice());
+        }
+
         if self.join_exec.is_some() {
             self.run_join(world);
             Ok(self.scratch.as_ref().unwrap().as_slice())
@@ -1886,6 +1946,33 @@ impl QueryPlanResult {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
         }
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Walk archetypes directly — the callback is monomorphic (`impl FnMut`),
+        // so this avoids the double trait-object dispatch through CompiledForEach
+        // (`Box<dyn FnMut>` outer + `&mut dyn FnMut` inner).
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    callback(entity);
+                }
+            }
+            *last_read_tick = world.next_tick();
+            return Ok(());
+        }
         if self.join_exec.is_some() {
             self.run_join(&*world);
             for &entity in self.scratch.as_ref().unwrap().as_slice() {
@@ -1928,6 +2015,30 @@ impl QueryPlanResult {
     ) -> Result<(), PlanExecError> {
         if self.world_id != world.world_id() {
             return Err(WorldMismatch::new(self.world_id, world.world_id()).into());
+        }
+        // Fast path: scan-only plan with no custom predicates or index drivers.
+        // Same as for_each but without tick advancement (transactional read).
+        if self.scan_required.is_some() {
+            let Self {
+                scan_required,
+                scan_changed,
+                last_read_tick,
+                ..
+            } = self;
+            let required = scan_required.as_ref().unwrap();
+            let tick = *last_read_tick;
+            for arch in &world.archetypes.archetypes {
+                if arch.is_empty() || !required.is_subset(&arch.component_ids) {
+                    continue;
+                }
+                if !passes_change_filter(arch, scan_changed, tick) {
+                    continue;
+                }
+                for &entity in &arch.entities {
+                    callback(entity);
+                }
+            }
+            return Ok(());
         }
         if self.join_exec.is_some() {
             self.run_join(world);
