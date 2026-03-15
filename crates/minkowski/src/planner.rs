@@ -429,8 +429,42 @@ impl<T: Component, F: Fn(&T) -> f64 + Send> BatchExtractor for TypedBatch<T, F> 
         // SAFETY: bind_archetype set col_ptr (caller checked it returned true);
         // count == archetype.len(). BlobVec guarantees contiguous layout.
         let slice = unsafe { std::slice::from_raw_parts(self.col_ptr, count) };
-        for item in slice {
-            accum.feed((self.extract)(item));
+        // Hoist the op-match outside the inner loop so LLVM sees a tight
+        // branchless loop per variant and can auto-vectorize.
+        match accum.op {
+            AggregateOp::Count => {
+                accum.count += count as u64;
+            }
+            AggregateOp::Sum | AggregateOp::Avg => {
+                let mut local_sum = 0.0f64;
+                for item in slice {
+                    local_sum += (self.extract)(item);
+                }
+                accum.count += count as u64;
+                accum.sum += local_sum;
+            }
+            AggregateOp::Min => {
+                let mut local_min = accum.min;
+                for item in slice {
+                    let v = (self.extract)(item);
+                    if v.is_nan() || v < local_min {
+                        local_min = v;
+                    }
+                }
+                accum.count += count as u64;
+                accum.min = local_min;
+            }
+            AggregateOp::Max => {
+                let mut local_max = accum.max;
+                for item in slice {
+                    let v = (self.extract)(item);
+                    if v.is_nan() || v > local_max {
+                        local_max = v;
+                    }
+                }
+                accum.count += count as u64;
+                accum.max = local_max;
+            }
         }
     }
 
@@ -439,12 +473,47 @@ impl<T: Component, F: Fn(&T) -> f64 + Send> BatchExtractor for TypedBatch<T, F> 
             !self.col_ptr.is_null(),
             "process_rows called before successful bind_archetype"
         );
-        for &row in rows {
-            // SAFETY: row comes from a validated EntityLocation (via
-            // world.validate_entity), guaranteeing it is a valid index
-            // within the bound archetype.
-            let item = unsafe { &*self.col_ptr.add(row) };
-            accum.feed((self.extract)(item));
+        // Same op-hoisting strategy as process_all for index-gather paths.
+        match accum.op {
+            AggregateOp::Count => {
+                accum.count += rows.len() as u64;
+            }
+            AggregateOp::Sum | AggregateOp::Avg => {
+                let mut local_sum = 0.0f64;
+                for &row in rows {
+                    // SAFETY: row comes from a validated EntityLocation (via
+                    // world.validate_entity), guaranteeing it is a valid index
+                    // within the bound archetype.
+                    let item = unsafe { &*self.col_ptr.add(row) };
+                    local_sum += (self.extract)(item);
+                }
+                accum.count += rows.len() as u64;
+                accum.sum += local_sum;
+            }
+            AggregateOp::Min => {
+                let mut local_min = accum.min;
+                for &row in rows {
+                    let item = unsafe { &*self.col_ptr.add(row) };
+                    let v = (self.extract)(item);
+                    if v.is_nan() || v < local_min {
+                        local_min = v;
+                    }
+                }
+                accum.count += rows.len() as u64;
+                accum.min = local_min;
+            }
+            AggregateOp::Max => {
+                let mut local_max = accum.max;
+                for &row in rows {
+                    let item = unsafe { &*self.col_ptr.add(row) };
+                    let v = (self.extract)(item);
+                    if v.is_nan() || v > local_max {
+                        local_max = v;
+                    }
+                }
+                accum.count += rows.len() as u64;
+                accum.max = local_max;
+            }
         }
     }
 }
@@ -651,6 +720,14 @@ impl AggregateAccum {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
         }
+    }
+
+    /// Reset accumulator to initial state, reusing the existing label allocation.
+    fn reset(&mut self) {
+        self.count = 0;
+        self.sum = 0.0;
+        self.min = f64::INFINITY;
+        self.max = f64::NEG_INFINITY;
     }
 
     /// Feed a value into the accumulator.
@@ -1524,6 +1601,13 @@ pub struct QueryPlanResult {
     /// Reusable buffer for row indices in batch execution methods.
     /// Cleared and repopulated on each `for_each_join_chunk` call.
     row_indices: Vec<usize>,
+    /// Cached batch extractors for `execute_aggregates`. Initialized at
+    /// build time and reused across calls to avoid per-call heap allocation.
+    cached_batch_extractors: Vec<Option<Box<dyn BatchExtractor>>>,
+    /// Same for the raw (transactional) path.
+    cached_batch_extractors_raw: Vec<Option<Box<dyn BatchExtractor>>>,
+    /// Cached accumulators reused across calls (avoids String clones per call).
+    cached_accums: Vec<AggregateAccum>,
     /// Component requirements for the direct archetype iteration fast path.
     /// `Some` when the plan is scan-only with no custom predicates.
     /// `None` when the plan has joins or custom filter closures.
@@ -2228,26 +2312,26 @@ impl QueryPlanResult {
             return Ok(AggregateResult { values: Vec::new() });
         }
 
-        // Initialize accumulators.
-        let mut accums: Vec<AggregateAccum> = self
-            .aggregate_exprs
-            .iter()
-            .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
-            .collect();
+        // Reset cached accumulators instead of allocating new ones.
+        for accum in &mut self.cached_accums {
+            accum.reset();
+        }
 
         let tick = self.last_read_tick;
 
         // Fast path: batch aggregate scan (chunk-at-a-time, no per-entity world.get).
         if let Some(compiled) = &mut self.compiled_agg_scan {
-            let mut extractors: Vec<Option<Box<dyn BatchExtractor>>> = self
-                .aggregate_exprs
-                .iter()
-                .map(|expr| expr.batch_factory.as_ref().map(|f| f()))
-                .collect();
-            compiled(&*world, tick, &mut extractors, &mut accums);
+            compiled(
+                &*world,
+                tick,
+                &mut self.cached_batch_extractors,
+                &mut self.cached_accums,
+            );
         } else if let Some(compiled) = &mut self.compiled_for_each {
-            // Fallback: per-entity extraction (used for join plans or when
-            // batch factories are unavailable).
+            // Fallback: per-entity extraction (used for filter plans or when
+            // batch factories are unavailable). Take accums temporarily to
+            // avoid borrow conflict with the compiled closure.
+            let mut accums = std::mem::take(&mut self.cached_accums);
             let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
                 .aggregate_exprs
                 .iter()
@@ -2264,6 +2348,7 @@ impl QueryPlanResult {
                     }
                 }
             });
+            self.cached_accums = accums;
         } else if self.join_exec.is_some() {
             // Join plans: materialise into scratch, then aggregate per-entity.
             self.run_join(&*world);
@@ -2275,11 +2360,11 @@ impl QueryPlanResult {
             for &entity in self.scratch.as_ref().unwrap().as_slice() {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
-                        accums[i].feed_count();
+                        self.cached_accums[i].feed_count();
                     } else if let Some(ext) = extractor
                         && let Some(val) = ext(world, entity)
                     {
-                        accums[i].feed(val);
+                        self.cached_accums[i].feed(val);
                     }
                 }
             }
@@ -2291,7 +2376,8 @@ impl QueryPlanResult {
 
         self.last_read_tick = world.next_tick();
 
-        let values = accums
+        let values = self
+            .cached_accums
             .iter()
             .map(|a| (a.label.clone(), a.finish()))
             .collect();
@@ -2319,24 +2405,25 @@ impl QueryPlanResult {
             return Ok(AggregateResult { values: Vec::new() });
         }
 
-        let mut accums: Vec<AggregateAccum> = self
-            .aggregate_exprs
-            .iter()
-            .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
-            .collect();
+        // Reset cached accumulators.
+        for accum in &mut self.cached_accums {
+            accum.reset();
+        }
 
         let tick = self.last_read_tick;
 
         // Fast path: batch aggregate scan.
         if let Some(compiled) = &mut self.compiled_agg_scan_raw {
-            let mut extractors: Vec<Option<Box<dyn BatchExtractor>>> = self
-                .aggregate_exprs
-                .iter()
-                .map(|expr| expr.batch_factory.as_ref().map(|f| f()))
-                .collect();
-            compiled(world, tick, &mut extractors, &mut accums);
+            compiled(
+                world,
+                tick,
+                &mut self.cached_batch_extractors_raw,
+                &mut self.cached_accums,
+            );
         } else if let Some(compiled) = &mut self.compiled_for_each_raw {
-            // Fallback: per-entity extraction.
+            // Fallback: per-entity extraction. Take accums temporarily to
+            // avoid borrow conflict with the compiled closure.
+            let mut accums = std::mem::take(&mut self.cached_accums);
             let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
                 .aggregate_exprs
                 .iter()
@@ -2353,6 +2440,7 @@ impl QueryPlanResult {
                     }
                 }
             });
+            self.cached_accums = accums;
         } else if self.join_exec.is_some() {
             // Join path: materialise into scratch, then aggregate per-entity.
             self.run_join(world);
@@ -2364,17 +2452,18 @@ impl QueryPlanResult {
             for &entity in self.scratch.as_ref().unwrap().as_slice() {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
-                        accums[i].feed_count();
+                        self.cached_accums[i].feed_count();
                     } else if let Some(ext) = extractor
                         && let Some(val) = ext(world, entity)
                     {
-                        accums[i].feed(val);
+                        self.cached_accums[i].feed(val);
                     }
                 }
             }
         }
 
-        let values = accums
+        let values = self
+            .cached_accums
             .iter()
             .map(|a| (a.label.clone(), a.finish()))
             .collect();
@@ -2409,6 +2498,15 @@ impl fmt::Debug for QueryPlanResult {
                 "has_compiled_agg_scan_raw",
                 &self.compiled_agg_scan_raw.is_some(),
             )
+            .field(
+                "cached_batch_extractors_len",
+                &self.cached_batch_extractors.len(),
+            )
+            .field(
+                "cached_batch_extractors_raw_len",
+                &self.cached_batch_extractors_raw.len(),
+            )
+            .field("cached_accums_len", &self.cached_accums.len())
             .field("row_indices_cap", &self.row_indices.capacity())
             .field("has_scan_required", &self.scan_required.is_some())
             .field("scan_changed", &self.scan_changed)
@@ -4231,6 +4329,21 @@ impl ScanBuilder<'_> {
             Some(ScratchBuffer::new(pre_agg_rows as usize))
         };
 
+        // Pre-allocate batch extractors and accumulators so execute_aggregates
+        // doesn't heap-allocate on every call.
+        let cached_batch_extractors: Vec<Option<Box<dyn BatchExtractor>>> = aggregate_exprs
+            .iter()
+            .map(|expr| expr.batch_factory.as_ref().map(|f| f()))
+            .collect();
+        let cached_batch_extractors_raw: Vec<Option<Box<dyn BatchExtractor>>> = aggregate_exprs
+            .iter()
+            .map(|expr| expr.batch_factory.as_ref().map(|f| f()))
+            .collect();
+        let cached_accums: Vec<AggregateAccum> = aggregate_exprs
+            .iter()
+            .map(|expr| AggregateAccum::new(expr.op, expr.label.clone()))
+            .collect();
+
         QueryPlanResult {
             root: node,
             join_exec,
@@ -4244,6 +4357,9 @@ impl ScanBuilder<'_> {
             aggregate_exprs,
             compiled_agg_scan,
             compiled_agg_scan_raw,
+            cached_batch_extractors,
+            cached_batch_extractors_raw,
+            cached_accums,
             row_indices: Vec::new(),
             // Direct archetype iteration: only for pure scans with no
             // predicates, indexes, or spatial drivers. Plans with index/spatial
