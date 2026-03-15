@@ -694,29 +694,30 @@ impl EnumChangeSet {
                 let index = entity.index() as usize;
                 let location = world.entity_locations[index];
 
-                // Fast path: batch continuation. If the current batch covers
-                // this (archetype, component), skip is_alive, contains, column
-                // lookup — all invariant within a batch run. The first entity
-                // in the batch was validated when the batch was created; subsequent
-                // entities in the same archetype are guaranteed alive (no mutations
-                // occur between QueryWriter::for_each collection and apply).
-                if let Some(loc) = location {
-                    let key_matches = batch.as_ref().is_some_and(|b| {
-                        b.arch_idx == loc.archetype_id.0 && b.comp_id == *component_id
-                    });
-                    if key_matches {
-                        let src = self.arena.get(*offset);
-                        batch.as_mut().unwrap().entries.push((loc.row, src));
-                        continue;
-                    }
-                }
-
-                // Slow path: validate entity, check archetype, maybe start new batch.
+                // Generation check — required even on batch continuation because
+                // EnumChangeSet is a public API. Stale entity handles with reused
+                // indices could silently overwrite live entity data without this.
                 if !world.is_alive(*entity) {
                     flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                     return Err(map_err(ApplyError::DeadEntity(*entity)));
                 }
-                let location = location.unwrap();
+
+                // Fast path: batch continuation. If the current batch covers
+                // this (archetype, component), skip contains + column_index +
+                // info lookup — all invariant within a batch run.
+                let Some(location) = location else {
+                    // Alive but unplaced (from alloc_entity) — treat as dead.
+                    flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
+                    return Err(map_err(ApplyError::DeadEntity(*entity)));
+                };
+                let key_matches = batch.as_ref().is_some_and(|b| {
+                    b.arch_idx == location.archetype_id.0 && b.comp_id == *component_id
+                });
+                if key_matches {
+                    let src = self.arena.get(*offset);
+                    batch.as_mut().unwrap().entries.push((location.row, src));
+                    continue;
+                }
                 let arch = &world.archetypes.archetypes[location.archetype_id.0];
 
                 if arch.component_ids.contains(*component_id) {
@@ -730,7 +731,6 @@ impl EnumChangeSet {
                         drop_fn: info.drop_fn,
                         layout: *layout,
                         entries: Vec::new(),
-                        first_mutation_idx: mutation_idx,
                     };
                     flush_insert_batch(&mut world.archetypes.archetypes, &mut batch, tick);
                     batch = Some(new_batch);
@@ -870,9 +870,6 @@ struct InsertBatch {
     drop_fn: Option<unsafe fn(*mut u8)>,
     layout: Layout,
     entries: Vec<(usize, *const u8)>,
-    /// Index of the first mutation in this batch (for error attribution).
-    #[expect(dead_code)]
-    first_mutation_idx: usize,
 }
 
 /// Flush a pending insert batch by writing all accumulated entries into
