@@ -714,6 +714,11 @@ impl EnumChangeSet {
                     b.arch_idx == location.archetype_id.0 && b.comp_id == *component_id
                 });
                 if key_matches {
+                    debug_assert_eq!(
+                        batch.as_ref().unwrap().layout,
+                        *layout,
+                        "batch layout mismatch for same ComponentId"
+                    );
                     let src = self.arena.get(*offset);
                     batch.as_mut().unwrap().entries.push((location.row, src));
                     continue;
