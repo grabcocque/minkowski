@@ -64,6 +64,23 @@ on `QueryPlanResult`.
 
 ---
 
+### P1-5: Join elimination (inner joins → scan rewrite) --- COMPLETED
+
+**Implementation**: Build-time detection of inner joins that are pure
+component-presence filters. Merges right-side required/changed bitsets
+into the left-side scan, replaces compile_for_each factories with
+merged-bitset closures, drops the join entirely. Phase 4b in
+`ScanBuilder::build()`.
+
+**Results**: Benchmarks not yet run. Inner joins are eliminated entirely —
+no `run_join()` materialization, sort, or intersection. The plan becomes
+a pure archetype scan with the merged component requirements.
+
+**API**: Automatic — no user code changes needed. `PlanWarning::JoinEliminated`
+informs users when the optimization fires.
+
+---
+
 ### P1-3: Spawn batching
 
 **Current**: `world.spawn()` resolves the archetype per entity (hash lookup on
