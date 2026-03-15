@@ -819,9 +819,10 @@ pub unsafe trait WriterQuery: WorldQuery {
         registry: &ComponentRegistry,
     ) -> Self::WriterFetch<'w>;
 
-    /// Set the column slot index for fast-lane archetype batches.
-    /// Only meaningful for `&mut T` — other impls use the default no-op.
-    fn set_column_slot(_fetch: &mut Self::WriterFetch<'_>, _slot: usize) {}
+    /// Add an offset to the column slot index for fast-lane archetype batches.
+    /// `&mut T` adds to its slot; tuples propagate to sub-elements.
+    /// Other impls use the default no-op.
+    fn set_column_slot(_fetch: &mut Self::WriterFetch<'_>, _offset: usize) {}
 
     /// # Safety
     /// `row` must be less than `archetype.len()`. `changeset` must be valid.
@@ -872,8 +873,8 @@ unsafe impl<T: Component> WriterQuery for &mut T {
         (ptr, id, 0) // column_slot set by tuple or defaults to 0 for single
     }
 
-    fn set_column_slot(fetch: &mut Self::WriterFetch<'_>, slot: usize) {
-        fetch.2 = slot;
+    fn set_column_slot(fetch: &mut Self::WriterFetch<'_>, offset: usize) {
+        fetch.2 += offset;
     }
 
     unsafe fn fetch_writer<'w>(
@@ -1004,11 +1005,9 @@ macro_rules! impl_writer_query_tuple {
                 ($(<$name as WriterQuery>::fetch_writer($name, row, entity, changeset),)*)
             }}
 
-            fn set_column_slot(_fetch: &mut Self::WriterFetch<'_>, _slot: usize) {
-                // Tuple column slots are assigned in init_writer_fetch at construction
-                // time. Nested mutable tuples (e.g., `(&mut A, (&mut B, &mut C))`)
-                // are NOT supported — inner slots would not be globally offset.
-                // Use flat tuple queries instead.
+            fn set_column_slot(fetch: &mut Self::WriterFetch<'_>, offset: usize) {
+                let ($($name,)*) = fetch;
+                $(<$name as WriterQuery>::set_column_slot($name, offset);)*
             }
         }
     };
@@ -4736,5 +4735,33 @@ mod tests {
         registry.call(&strategy, &mut world, id, ()).unwrap();
         assert_eq!(world.get::<Pos>(e).unwrap().0, 10.0);
         assert_eq!(world.get::<Vel>(e).unwrap().0, 30.0);
+    }
+
+    #[test]
+    fn query_writer_nested_tuple() {
+        // Exercises nested mutable tuple: (&mut Pos, (&mut Vel,))
+        // Without the offset-propagation fix, Vel would get slot 0
+        // instead of slot 1, triggering the debug_assert on comp_id.
+        let mut world = World::new();
+        let e = world.spawn((Pos(1.0), Vel(2.0)));
+
+        let strategy = Optimistic::new(&world);
+        let mut registry = ReducerRegistry::new();
+        let id = registry
+            .register_query_writer::<(&mut Pos, (&mut Vel,)), (), _>(
+                &mut world,
+                "nested_tuple",
+                |mut qw: QueryWriter<'_, (&mut Pos, (&mut Vel,))>, ()| {
+                    qw.for_each(|(mut pos, (mut vel,))| {
+                        pos.set(Pos(10.0));
+                        vel.set(Vel(20.0));
+                    });
+                },
+            )
+            .unwrap();
+
+        registry.call(&strategy, &mut world, id, ()).unwrap();
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 10.0);
+        assert_eq!(world.get::<Vel>(e).unwrap().0, 20.0);
     }
 }

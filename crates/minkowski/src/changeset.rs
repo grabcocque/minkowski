@@ -291,12 +291,15 @@ impl EnumChangeSet {
         self.mutations.len() + fast_lane_count
     }
 
-    /// Returns `true` when the changeset has no mutations and no open
-    /// archetype batches. Note: returns `false` when archetype batches are
-    /// open even if they contain zero entries. Use `len() == 0` for
-    /// semantic emptiness (counts actual entries).
+    /// Returns `true` when the changeset contains no mutations and no
+    /// fast-lane entries. Empty archetype batches (open but with no
+    /// entries) do not count — consistent with `len()`.
     pub fn is_empty(&self) -> bool {
-        self.mutations.is_empty() && self.archetype_batches.is_empty()
+        self.mutations.is_empty()
+            && self
+                .archetype_batches
+                .iter()
+                .all(|b| b.columns.iter().all(|c| c.entries.is_empty()))
     }
 
     /// Record a spawn: entity + raw component data.
@@ -2199,12 +2202,13 @@ mod tests {
         assert!(cs.is_empty());
         assert_eq!(cs.len(), 0);
 
-        // Add an empty archetype batch — is_empty should be false.
+        // Add an empty archetype batch — is_empty should still be true
+        // (consistent with len() == 0).
         cs.archetype_batches.push(ArchetypeBatch {
             arch_idx: 0,
             columns: Vec::new(),
         });
-        assert!(!cs.is_empty());
+        assert!(cs.is_empty());
         assert_eq!(cs.len(), 0); // no entries yet
 
         // Add a column batch with entries.
