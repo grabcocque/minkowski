@@ -5965,8 +5965,8 @@ mod tests {
 
     #[test]
     fn execution_produces_correct_results() {
-        // End-to-end: vectorized plan must produce the same results as
-        // a naive query would.
+        // End-to-end: plan must produce the same results as a naive
+        // query would.
         let mut world = World::new();
         for i in 0..500 {
             world.spawn((Score(i), Team(i % 5)));

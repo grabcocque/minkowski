@@ -110,7 +110,7 @@ Each unique set of component types gets an **Archetype** — a struct containing
 
 ### Column Alignment & Vectorization
 
-BlobVec columns are allocated with 64-byte alignment (cache line). `QueryIter::for_each_chunk` yields typed `&[T]` / `&mut [T]` slices per archetype — LLVM can auto-vectorize loops over these slices.
+BlobVec columns are allocated with 64-byte alignment (cache line). `QueryIter::for_each_chunk` yields typed `&[T]` / `&mut [T]` slices per archetype — LLVM can auto-vectorize loops over these slices. Reducer handles (`QueryMut::for_each`, `QueryRef::for_each`, `DynamicCtx::for_each`) delegate to `for_each_chunk` internally.
 
 Component types that are 16-byte-aligned (e.g., `#[repr(align(16))]` or naturally `[f32; 4]`) vectorize better than odd-sized ones. The engine guarantees 64-byte column alignment; component layout determines whether LLVM can pack operations.
 
