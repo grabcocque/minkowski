@@ -789,6 +789,36 @@ impl AggregateAccum {
     }
 }
 
+/// RAII guard that restores a `Vec<AggregateAccum>` to its owner on drop.
+/// Used when accumulators must be temporarily moved out of `QueryPlanResult`
+/// to satisfy borrow-splitting requirements (e.g., the `compiled_for_each`
+/// callback borrows both the closure and the accums). If the callback panics,
+/// Drop restores the field so the plan remains usable after catch_unwind.
+struct AccumGuard<'a> {
+    slot: &'a mut Vec<AggregateAccum>,
+    accums: Option<Vec<AggregateAccum>>,
+}
+
+impl<'a> AccumGuard<'a> {
+    fn take(slot: &'a mut Vec<AggregateAccum>) -> Self {
+        let accums = Some(std::mem::take(slot));
+        Self { slot, accums }
+    }
+
+    /// Borrow the accumulators mutably.
+    fn accums_mut(&mut self) -> &mut Vec<AggregateAccum> {
+        self.accums.as_mut().unwrap()
+    }
+}
+
+impl Drop for AccumGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(accums) = self.accums.take() {
+            *self.slot = accums;
+        }
+    }
+}
+
 /// The result of executing an aggregate plan.
 ///
 /// Contains one `f64` result per aggregate expression, in the same order
@@ -2329,14 +2359,16 @@ impl QueryPlanResult {
             );
         } else if let Some(compiled) = &mut self.compiled_for_each {
             // Fallback: per-entity extraction (used for filter plans or when
-            // batch factories are unavailable). Take accums temporarily to
-            // avoid borrow conflict with the compiled closure.
-            let mut accums = std::mem::take(&mut self.cached_accums);
+            // batch factories are unavailable). AccumGuard moves accums out
+            // to avoid borrow conflict and restores them on drop (including
+            // unwind from user-supplied extractors/filters).
+            let mut guard = AccumGuard::take(&mut self.cached_accums);
             let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
                 .aggregate_exprs
                 .iter()
                 .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
                 .collect();
+            let accums = guard.accums_mut();
             compiled(&*world, tick, &mut |entity: Entity| {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
@@ -2348,7 +2380,7 @@ impl QueryPlanResult {
                     }
                 }
             });
-            self.cached_accums = accums;
+            drop(guard);
         } else if self.join_exec.is_some() {
             // Join plans: materialise into scratch, then aggregate per-entity.
             self.run_join(&*world);
@@ -2421,14 +2453,16 @@ impl QueryPlanResult {
                 &mut self.cached_accums,
             );
         } else if let Some(compiled) = &mut self.compiled_for_each_raw {
-            // Fallback: per-entity extraction. Take accums temporarily to
-            // avoid borrow conflict with the compiled closure.
-            let mut accums = std::mem::take(&mut self.cached_accums);
+            // Fallback: per-entity extraction. AccumGuard moves accums out
+            // to avoid borrow conflict and restores them on drop (including
+            // unwind from user-supplied extractors/filters).
+            let mut guard = AccumGuard::take(&mut self.cached_accums);
             let extractors: Vec<(AggregateOp, Option<ValueExtractor>)> = self
                 .aggregate_exprs
                 .iter()
                 .map(|expr| (expr.op, expr.extractor.as_ref().map(Arc::clone)))
                 .collect();
+            let accums = guard.accums_mut();
             compiled(world, tick, &mut |entity: Entity| {
                 for (i, (op, extractor)) in extractors.iter().enumerate() {
                     if *op == AggregateOp::Count {
@@ -2440,7 +2474,7 @@ impl QueryPlanResult {
                     }
                 }
             });
-            self.cached_accums = accums;
+            drop(guard);
         } else if self.join_exec.is_some() {
             // Join path: materialise into scratch, then aggregate per-entity.
             self.run_join(world);
@@ -10143,6 +10177,103 @@ mod tests {
         assert_eq!(result.get(0), Some(8.0)); // count: 5 + 3
         // sum of Health: only from archetype 2 = 0 + 10 + 20 = 30
         assert_eq!(result.get(1), Some(30.0));
+    }
+
+    #[test]
+    fn aggregate_accum_guard_restores_on_panic() {
+        // Verify that if a user-supplied filter panics during the
+        // compiled_for_each aggregate path, cached_accums is restored
+        // so the plan remains usable on subsequent calls.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+
+        let should_panic = Arc::new(AtomicBool::new(true));
+        let panic_flag = Arc::clone(&should_panic);
+
+        let planner = QueryPlanner::new(&world);
+        // Add a filter predicate so the plan takes the compiled_for_each
+        // path (batch scan is disabled when filters are present).
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>(
+                "panicking filter",
+                1.0,
+                move |_w: &World, _e: Entity| {
+                    assert!(
+                        !panic_flag.load(Ordering::Relaxed),
+                        "intentional test panic"
+                    );
+                    true
+                },
+            ))
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+        drop(planner);
+
+        // First call: the filter panics. catch_unwind captures it.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plan.execute_aggregates(&mut world)
+        }));
+        assert!(result.is_err(), "expected panic from filter");
+
+        // Disable the panic and execute again — plan must still work.
+        // Without AccumGuard, cached_accums would be empty after the
+        // panic, causing indexing failures or wrong results.
+        should_panic.store(false, Ordering::Relaxed);
+        let result = plan.execute_aggregates(&mut world).unwrap();
+        assert_eq!(result.get(0), Some(10.0)); // count
+        let expected_sum: f64 = (0..10).map(|i| i as f64).sum();
+        assert_eq!(result.get(1), Some(expected_sum)); // sum
+    }
+
+    #[test]
+    fn aggregate_accum_guard_restores_on_panic_raw() {
+        // Same as above but for execute_aggregates_raw.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Score(i),));
+        }
+
+        let should_panic = Arc::new(AtomicBool::new(true));
+        let panic_flag = Arc::clone(&should_panic);
+
+        let planner = QueryPlanner::new(&world);
+        let mut plan = planner
+            .scan::<(&Score,)>()
+            .filter(Predicate::custom::<Score>(
+                "panicking filter",
+                1.0,
+                move |_w: &World, _e: Entity| {
+                    assert!(
+                        !panic_flag.load(Ordering::Relaxed),
+                        "intentional test panic"
+                    );
+                    true
+                },
+            ))
+            .aggregate(AggregateExpr::count())
+            .aggregate(AggregateExpr::sum::<Score>("Score", |s| s.0 as f64))
+            .build();
+        drop(planner);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plan.execute_aggregates_raw(&world)
+        }));
+        assert!(result.is_err(), "expected panic from filter");
+
+        // Plan is structurally intact — cached_accums was restored by guard.
+        should_panic.store(false, Ordering::Relaxed);
+        let result = plan.execute_aggregates_raw(&world).unwrap();
+        assert_eq!(result.get(0), Some(10.0));
+        let expected_sum: f64 = (0..10).map(|i| i as f64).sum();
+        assert_eq!(result.get(1), Some(expected_sum));
     }
 
     // ── Batch join execution ──────────────────────────────────────────
