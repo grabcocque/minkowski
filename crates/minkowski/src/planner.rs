@@ -4022,7 +4022,7 @@ impl ScanBuilder<'_> {
                     let left_rows = self.estimated_rows;
                     let right_rows = join.right_estimated_rows;
                     let build_rows = left_rows.min(right_rows);
-                    let build_bytes = build_rows * opts.avg_component_bytes;
+                    let build_bytes = build_rows.saturating_mul(opts.avg_component_bytes);
                     let l2 = opts.l2_cache_bytes.max(1);
                     let partitions = build_bytes.div_ceil(l2).max(1);
                     JoinStep {
@@ -5378,7 +5378,10 @@ impl ScratchBuffer {
     /// capped at 4096) so that overestimated planner row counts cannot
     /// cause unbounded bucket allocation at runtime.
     fn partitioned_intersection(&mut self, left_len: usize, partitions: usize) -> &[Entity] {
-        debug_assert!(partitions > 1);
+        assert!(
+            partitions > 0,
+            "partitioned_intersection: partitions must be > 0, got {partitions}"
+        );
         let total = self.entities.len();
         assert!(
             left_len <= total,
@@ -5398,7 +5401,7 @@ impl ScratchBuffer {
         let mut left_buckets: Vec<Vec<u64>> = vec![Vec::new(); partitions];
         for &e in &self.entities[..left_len] {
             let bits = e.to_bits();
-            left_buckets[bits as usize % partitions].push(bits);
+            left_buckets[(bits % partitions as u64) as usize].push(bits);
         }
         // Sort each left bucket for binary search.
         for bucket in &mut left_buckets {
@@ -5410,7 +5413,7 @@ impl ScratchBuffer {
         for i in left_len..total {
             let entity = self.entities[i];
             let bits = entity.to_bits();
-            let bucket = &left_buckets[bits as usize % partitions];
+            let bucket = &left_buckets[(bits % partitions as u64) as usize];
             if bucket.binary_search(&bits).is_ok() {
                 self.entities.push(entity);
                 match_count += 1;
