@@ -304,48 +304,17 @@ pub(crate) fn apply_record(
 /// A collected WAL record with its CRC proof and optional ID remap.
 type CollectedRecord = (crate::record::WalRecord, CrcProof, Option<HashMap<ComponentId, ComponentId>>);
 
-/// Non-Insert mutations that preserve their original order.
-enum OrderedMutation {
-    Spawn {
-        entity: Entity,
-        components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)>,
-    },
-    Despawn {
-        entity: Entity,
-    },
-    Remove {
-        entity: Entity,
-        component_id: ComponentId,
-    },
-    SparseInsert {
-        entity: Entity,
-        component_id: ComponentId,
-        data: Vec<u8>,
-        layout: std::alloc::Layout,
-    },
-    SparseRemove {
-        entity: Entity,
-        component_id: ComponentId,
-    },
-}
-
 /// Apply all collected WAL records as a single batched changeset.
-/// Insert mutations are sorted by `(component_id, entity)` for cache locality;
-/// ordering-sensitive mutations (Spawn, Despawn, Remove) are applied first
-/// in original order.
+/// All mutations are kept in WAL order to preserve replay semantics:
+/// insert-then-despawn and insert-then-remove sequences must apply in
+/// the same order they were originally recorded.
 fn apply_records_batched(
     records: &[CollectedRecord],
     world: &mut World,
     codecs: &CodecRegistry,
 ) -> Result<(), WalError> {
-    // Estimate total mutation count for pre-allocation.
-    let total_mutations: usize = records.iter().map(|(r, _, _)| r.mutations.len()).sum();
+    let mut changeset = EnumChangeSet::new();
 
-    let mut ordered: Vec<OrderedMutation> = Vec::new();
-    let mut inserts: Vec<(ComponentId, Entity, Vec<u8>, std::alloc::Layout)> =
-        Vec::with_capacity(total_mutations);
-
-    // Phase 1: Decode all mutations, separating inserts from ordered ops.
     for (record, proof, remap) in records {
         let remap_id = |id: ComponentId| -> Result<ComponentId, WalError> {
             match remap {
@@ -361,6 +330,7 @@ fn apply_records_batched(
             match mutation {
                 SerializedMutation::Spawn { entity, components } => {
                     let entity = Entity::from_bits(*entity);
+                    world.alloc_entity();
                     let mut raw_components: Vec<(ComponentId, Vec<u8>, std::alloc::Layout)> =
                         Vec::new();
                     for (comp_id, data) in components {
@@ -371,15 +341,14 @@ fn apply_records_batched(
                             .ok_or(CodecError::UnregisteredComponent(local_id))?;
                         raw_components.push((local_id, raw, layout));
                     }
-                    ordered.push(OrderedMutation::Spawn {
-                        entity,
-                        components: raw_components,
-                    });
+                    let ptrs: Vec<_> = raw_components
+                        .iter()
+                        .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
+                        .collect();
+                    changeset.record_spawn(entity, &ptrs);
                 }
                 SerializedMutation::Despawn { entity } => {
-                    ordered.push(OrderedMutation::Despawn {
-                        entity: Entity::from_bits(*entity),
-                    });
+                    changeset.record_despawn(Entity::from_bits(*entity));
                 }
                 SerializedMutation::Insert {
                     entity,
@@ -391,16 +360,19 @@ fn apply_records_batched(
                     let layout = codecs
                         .layout(local_id)
                         .ok_or(CodecError::UnregisteredComponent(local_id))?;
-                    inserts.push((local_id, Entity::from_bits(*entity), raw, layout));
+                    changeset.record_insert(
+                        Entity::from_bits(*entity),
+                        local_id,
+                        raw.as_ptr(),
+                        layout,
+                    );
                 }
                 SerializedMutation::Remove {
                     entity,
                     component_id,
                 } => {
-                    ordered.push(OrderedMutation::Remove {
-                        entity: Entity::from_bits(*entity),
-                        component_id: remap_id(*component_id)?,
-                    });
+                    changeset
+                        .record_remove(Entity::from_bits(*entity), remap_id(*component_id)?);
                 }
                 SerializedMutation::SparseInsert {
                     entity,
@@ -412,73 +384,24 @@ fn apply_records_batched(
                     let layout = codecs
                         .layout(local_id)
                         .ok_or(CodecError::UnregisteredComponent(local_id))?;
-                    ordered.push(OrderedMutation::SparseInsert {
-                        entity: Entity::from_bits(*entity),
-                        component_id: local_id,
-                        data: raw,
+                    changeset.record_sparse_insert(
+                        Entity::from_bits(*entity),
+                        local_id,
+                        raw.as_ptr(),
                         layout,
-                    });
+                    );
                 }
                 SerializedMutation::SparseRemove {
                     entity,
                     component_id,
                 } => {
-                    ordered.push(OrderedMutation::SparseRemove {
-                        entity: Entity::from_bits(*entity),
-                        component_id: remap_id(*component_id)?,
-                    });
+                    changeset.record_sparse_remove(
+                        Entity::from_bits(*entity),
+                        remap_id(*component_id)?,
+                    );
                 }
             }
         }
-    }
-
-    // Phase 2: Sort inserts by (component_id, entity) for cache locality.
-    // Entities in the same archetype tend to have nearby indices (especially
-    // after snapshot restore), so sorting by entity within component groups
-    // maximizes batch-continuation hits in apply_mutations.
-    inserts.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_bits().cmp(&b.1.to_bits())));
-
-    // Phase 3: Build single changeset — ordered ops first, then sorted inserts.
-    let mut changeset = EnumChangeSet::new();
-
-    for op in &ordered {
-        match op {
-            OrderedMutation::Spawn { entity, components } => {
-                world.alloc_entity();
-                let ptrs: Vec<_> = components
-                    .iter()
-                    .map(|(id, raw, layout)| (*id, raw.as_ptr(), *layout))
-                    .collect();
-                changeset.record_spawn(*entity, &ptrs);
-            }
-            OrderedMutation::Despawn { entity } => {
-                changeset.record_despawn(*entity);
-            }
-            OrderedMutation::Remove {
-                entity,
-                component_id,
-            } => {
-                changeset.record_remove(*entity, *component_id);
-            }
-            OrderedMutation::SparseInsert {
-                entity,
-                component_id,
-                data,
-                layout,
-            } => {
-                changeset.record_sparse_insert(*entity, *component_id, data.as_ptr(), *layout);
-            }
-            OrderedMutation::SparseRemove {
-                entity,
-                component_id,
-            } => {
-                changeset.record_sparse_remove(*entity, *component_id);
-            }
-        }
-    }
-
-    for (component_id, entity, data, layout) in &inserts {
-        changeset.record_insert(*entity, *component_id, data.as_ptr(), *layout);
     }
 
     changeset.apply(world).map_err(WalError::Apply)?;
@@ -767,9 +690,9 @@ impl Wal {
     /// ID remapping from the sender's ID space to the receiver's.
     ///
     /// Uses batched replay: all matching records are collected first, their
-    /// mutations decoded and sorted by `(component_id, entity)` for Insert
-    /// mutations, then applied as a single `EnumChangeSet`. This improves
-    /// cache locality and amortizes per-apply overhead.
+    /// mutations decoded and applied as a single `EnumChangeSet`. Mutation
+    /// order within and across records is preserved so that sequences like
+    /// insert-then-despawn replay correctly.
     pub fn replay_from(
         &mut self,
         from_seq: u64,
@@ -809,8 +732,7 @@ impl Wal {
             return Ok(last_seq);
         }
 
-        // Phase 2: Decode all mutations. Separate ordering-sensitive mutations
-        // (Spawn, Despawn, Remove) from Insert mutations that can be sorted.
+        // Phase 2: Decode all mutations in WAL order and apply as one changeset.
         apply_records_batched(&pending, world, codecs)?;
 
         Ok(last_seq)
@@ -2612,5 +2534,115 @@ mod tests {
         let data = std::fs::read(&seg_path).unwrap();
         assert!(data.len() >= 4);
         assert_eq!(&data[0..4], b"MKW2", "segment must start with v2 magic");
+    }
+
+    #[test]
+    fn replay_insert_then_despawn_preserves_order() {
+        // Regression: batched replay must not reorder Insert before Despawn.
+        // WAL: spawn(e) / insert(e, Health) / despawn(e)
+        // After replay the entity must be dead.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("insert_despawn.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+
+        // Record 1: spawn with Pos
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 },))
+            .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Record 2: insert Health then despawn in the same record
+        let mut cs2 = EnumChangeSet::new();
+        cs2.insert::<Health>(&mut world, e, Health(99));
+        cs2.record_despawn(e);
+        wal.append(&cs2, &codecs).unwrap();
+        cs2.apply(&mut world).unwrap();
+
+        assert!(!world.is_alive(e));
+
+        // Replay into fresh world (must re-register codecs on the new world)
+        drop(wal);
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        assert!(!world2.is_alive(e), "entity must be dead after replay");
+        assert_eq!(
+            world2.query::<(&Pos,)>().count(),
+            0,
+            "no Pos components should remain"
+        );
+        assert_eq!(
+            world2.query::<(&Health,)>().count(),
+            0,
+            "no Health components should remain"
+        );
+    }
+
+    #[test]
+    fn replay_insert_then_remove_preserves_order() {
+        // Regression: batched replay must not reorder Insert before Remove.
+        // WAL: spawn(e, Pos+Health) / insert(e, Health(new)) / remove(e, Health)
+        // After replay the entity must exist with Pos but without Health.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("insert_remove.wal");
+
+        let mut world = World::new();
+        let mut codecs = CodecRegistry::new();
+        codecs.register::<Pos>(&mut world).unwrap();
+        codecs.register::<Health>(&mut world).unwrap();
+
+        let mut wal = Wal::create(&wal_dir, &codecs, default_config()).unwrap();
+
+        // Record 1: spawn with Pos + Health
+        let e = world.alloc_entity();
+        let mut cs = EnumChangeSet::new();
+        cs.spawn_bundle(&mut world, e, (Pos { x: 1.0, y: 2.0 }, Health(10)))
+            .unwrap();
+        wal.append(&cs, &codecs).unwrap();
+        cs.apply(&mut world).unwrap();
+
+        // Record 2: overwrite Health, then remove it
+        let mut cs2 = EnumChangeSet::new();
+        cs2.insert::<Health>(&mut world, e, Health(99));
+        cs2.remove::<Health>(&mut world, e);
+        wal.append(&cs2, &codecs).unwrap();
+        cs2.apply(&mut world).unwrap();
+
+        assert!(world.is_alive(e));
+        assert_eq!(world.get::<Health>(e), None);
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+
+        // Replay into fresh world (must re-register codecs on the new world)
+        drop(wal);
+        let mut world2 = World::new();
+        let mut codecs2 = CodecRegistry::new();
+        codecs2.register::<Pos>(&mut world2).unwrap();
+        codecs2.register::<Health>(&mut world2).unwrap();
+        let mut wal2 = Wal::open(&wal_dir, &codecs2, default_config()).unwrap();
+        wal2.replay(&mut world2, &codecs2).unwrap();
+
+        assert!(world2.is_alive(e), "entity must be alive after replay");
+        assert_eq!(
+            world2.get::<Health>(e),
+            None,
+            "Health must be removed after replay"
+        );
+        assert_eq!(
+            world2.get::<Pos>(e),
+            Some(&Pos { x: 1.0, y: 2.0 }),
+            "Pos must survive replay"
+        );
     }
 }
