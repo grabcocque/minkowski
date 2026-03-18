@@ -1149,24 +1149,37 @@ impl Predicate {
             let filter = Arc::clone(&filter);
             Arc::new(
                 move |world: &World, arch: &Archetype, entities: &[Entity], mask: &mut [bool]| {
+                    debug_assert_eq!(mask.len(), arch.len());
+                    debug_assert_eq!(mask.len(), entities.len());
+
                     let Some(comp_id) = world.components.id::<T>() else {
                         // Component not registered — no entity can pass.
-                        mask.iter_mut().for_each(|m| *m = false);
+                        for m in &mut *mask {
+                            *m = false;
+                        }
                         return;
                     };
                     if let Some(col_idx) = arch.column_index(comp_id) {
                         // Dense path: iterate contiguous column slice.
-                        debug_assert_eq!(mask.len(), arch.len());
+                        if arch.is_empty() {
+                            return;
+                        }
+                        debug_assert_eq!(
+                            arch.columns[col_idx].item_layout,
+                            std::alloc::Layout::new::<T>(),
+                            "BlobVec layout mismatch in custom_column filter for {}",
+                            std::any::type_name::<T>()
+                        );
                         let ptr = unsafe { arch.columns[col_idx].get_ptr(0) as *const T };
                         let slice = unsafe { std::slice::from_raw_parts(ptr, arch.len()) };
-                        for (m, val) in mask.iter_mut().zip(slice.iter()) {
+                        for (m, val) in mask.iter_mut().zip(slice) {
                             if *m && !filter(val) {
                                 *m = false;
                             }
                         }
                     } else if world.components.is_sparse(comp_id) {
                         // Sparse fallback: per-entity world.get().
-                        for (m, &entity) in mask.iter_mut().zip(entities.iter()) {
+                        for (m, &entity) in mask.iter_mut().zip(entities) {
                             if *m {
                                 let pass = world
                                     .sparse
@@ -1180,7 +1193,9 @@ impl Predicate {
                     } else {
                         // Archetype doesn't have this component and it's not
                         // sparse — no entity can pass.
-                        mask.iter_mut().for_each(|m| *m = false);
+                        for m in &mut *mask {
+                            *m = false;
+                        }
                     }
                 },
             ) as ColumnFilterFn
@@ -1744,6 +1759,10 @@ pub struct QueryPlanResult {
     /// Reusable boolean mask for column filter evaluation.
     /// Avoids per-archetype allocation in the scan fast path.
     column_filter_mask: Vec<bool>,
+    /// Reusable entity buffer for column-filtered join_chunk paths.
+    /// Avoids per-archetype allocation when column filters reduce the
+    /// entity set before passing to the chunk callback.
+    filtered_entities: Vec<Entity>,
 }
 
 impl QueryPlanResult {
@@ -2328,7 +2347,7 @@ impl QueryPlanResult {
                 } else {
                     self.column_filter_mask.clear();
                     self.column_filter_mask.resize(arch.len(), true);
-                    for cf in self.scan_column_filters.iter() {
+                    for cf in &self.scan_column_filters {
                         cf(world, arch, &arch.entities, &mut self.column_filter_mask);
                     }
                     for (row, &entity) in arch.entities.iter().enumerate() {
@@ -2484,6 +2503,7 @@ impl QueryPlanResult {
                 scan_changed,
                 scan_column_filters,
                 column_filter_mask,
+                filtered_entities,
                 last_read_tick,
                 row_indices,
                 ..
@@ -2517,15 +2537,11 @@ impl QueryPlanResult {
                         cf(world, arch, &arch.entities, column_filter_mask);
                     }
                     row_indices.clear();
-                    row_indices.extend(
-                        (0..arch.len()).filter(|&i| column_filter_mask[i]),
-                    );
+                    row_indices.extend((0..arch.len()).filter(|&i| column_filter_mask[i]));
                     if !row_indices.is_empty() {
-                        let entities: Vec<Entity> = row_indices
-                            .iter()
-                            .map(|&row| arch.entities[row])
-                            .collect();
-                        callback(&entities, row_indices, slice);
+                        filtered_entities.clear();
+                        filtered_entities.extend(row_indices.iter().map(|&row| arch.entities[row]));
+                        callback(filtered_entities, row_indices, slice);
                     }
                 }
             }
@@ -2852,6 +2868,11 @@ impl fmt::Debug for QueryPlanResult {
             .field("has_scan_required", &self.scan_required.is_some())
             .field("scan_column_filters", &self.scan_column_filters.len())
             .field("scan_changed", &self.scan_changed)
+            .field(
+                "column_filter_mask_cap",
+                &self.column_filter_mask.capacity(),
+            )
+            .field("filtered_entities_cap", &self.filtered_entities.capacity())
             .finish()
     }
 }
@@ -3711,17 +3732,19 @@ impl ScanBuilder<'_> {
         // a predicate appears in the plan but has no executable filter, the
         // plan's EXPLAIN would show a filter node that doesn't actually run.
         debug_assert!(
-            index_preds
-                .iter()
-                .all(|(p, _)| p.filter_fn.is_some()
-                    || matches!(p.kind, PredicateKind::Custom(_) | PredicateKind::CustomColumn(_))),
+            index_preds.iter().all(|(p, _)| p.filter_fn.is_some()
+                || matches!(
+                    p.kind,
+                    PredicateKind::Custom(_) | PredicateKind::CustomColumn(_)
+                )),
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
         debug_assert!(
-            filter_preds
-                .iter()
-                .all(|p| p.filter_fn.is_some()
-                    || matches!(p.kind, PredicateKind::Custom(_) | PredicateKind::CustomColumn(_))),
+            filter_preds.iter().all(|p| p.filter_fn.is_some()
+                || matches!(
+                    p.kind,
+                    PredicateKind::Custom(_) | PredicateKind::CustomColumn(_)
+                )),
             "Eq/Range predicate with filter_fn: None — plan would show filter but not apply it"
         );
         debug_assert!(
@@ -4767,6 +4790,7 @@ impl ScanBuilder<'_> {
                 Vec::new()
             },
             column_filter_mask: Vec::new(),
+            filtered_entities: Vec::new(),
         }
     }
 }
@@ -7276,11 +7300,9 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "even scores",
-                0.5,
-                |s| s.0 % 2 == 0,
-            ))
+            .filter(Predicate::custom_column::<Score>("even scores", 0.5, |s| {
+                s.0 % 2 == 0
+            }))
             .build();
         // Column-filter plans should use the scan_required fast path.
         assert!(plan.scan_required.is_some());
@@ -7306,11 +7328,9 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "score < 25",
-                0.5,
-                |s| s.0 < 25,
-            ))
+            .filter(Predicate::custom_column::<Score>("score < 25", 0.5, |s| {
+                s.0 < 25
+            }))
             .build();
         let result = plan.execute_collect(&mut world).unwrap().to_vec();
         assert_eq!(result.len(), 25);
@@ -7329,11 +7349,9 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "score >= 90",
-                0.1,
-                |s| s.0 >= 90,
-            ))
+            .filter(Predicate::custom_column::<Score>("score >= 90", 0.1, |s| {
+                s.0 >= 90
+            }))
             .build();
         let mut count = 0u32;
         plan.execute_stream(&mut world, |_| count += 1).unwrap();
@@ -7350,11 +7368,9 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "score >= 90",
-                0.1,
-                |s| s.0 >= 90,
-            ))
+            .filter(Predicate::custom_column::<Score>("score >= 90", 0.1, |s| {
+                s.0 >= 90
+            }))
             .build();
         let mut count = 0u32;
         plan.execute_stream_raw(&world, |_| count += 1).unwrap();
@@ -7371,16 +7387,12 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "score >= 20",
-                0.8,
-                |s| s.0 >= 20,
-            ))
-            .filter(Predicate::custom_column::<Score>(
-                "score < 30",
-                0.1,
-                |s| s.0 < 30,
-            ))
+            .filter(Predicate::custom_column::<Score>("score >= 20", 0.8, |s| {
+                s.0 >= 20
+            }))
+            .filter(Predicate::custom_column::<Score>("score < 30", 0.1, |s| {
+                s.0 < 30
+            }))
             .build();
         // Should use scan_required fast path with both column filters.
         assert!(plan.scan_required.is_some());
@@ -7402,16 +7414,12 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "even",
-                0.5,
-                |s| s.0 % 2 == 0,
-            ))
-            .filter(Predicate::custom::<Score>(
-                "small",
-                0.5,
-                |world, entity| world.get::<Score>(entity).is_some_and(|s| s.0 < 25),
-            ))
+            .filter(Predicate::custom_column::<Score>("even", 0.5, |s| {
+                s.0 % 2 == 0
+            }))
+            .filter(Predicate::custom::<Score>("small", 0.5, |world, entity| {
+                world.get::<Score>(entity).is_some_and(|s| s.0 < 25)
+            }))
             .build();
         // Mixed column + per-entity filters should NOT use scan_required.
         assert!(plan.scan_required.is_none());
@@ -11234,30 +11242,25 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "reject all",
-                0.0,
-                |_| false,
-            ))
+            .filter(Predicate::custom_column::<Score>("reject all", 0.0, |_| {
+                false
+            }))
             .build();
 
         let mut invocations = 0u32;
-        plan.execute_stream_join_chunk::<(&Score,), _>(
-            &mut world,
-            |entities, rows, (_scores,)| {
-                assert!(
-                    !entities.is_empty(),
-                    "callback invoked with empty entity slice"
-                );
-                assert!(
-                    !rows.is_empty(),
-                    "callback invoked with empty row indices"
-                );
-                invocations += 1;
-            },
-        )
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (_scores,)| {
+            assert!(
+                !entities.is_empty(),
+                "callback invoked with empty entity slice"
+            );
+            assert!(!rows.is_empty(), "callback invoked with empty row indices");
+            invocations += 1;
+        })
         .unwrap();
-        assert_eq!(invocations, 0, "no chunks should be emitted when all entities are filtered out");
+        assert_eq!(
+            invocations, 0,
+            "no chunks should be emitted when all entities are filtered out"
+        );
     }
 
     #[test]
@@ -11272,27 +11275,22 @@ mod tests {
         let planner = QueryPlanner::new(&world);
         let mut plan = planner
             .scan::<(&Score,)>()
-            .filter(Predicate::custom_column::<Score>(
-                "even",
-                0.5,
-                |s| s.0 % 2 == 0,
-            ))
+            .filter(Predicate::custom_column::<Score>("even", 0.5, |s| {
+                s.0 % 2 == 0
+            }))
             .build();
 
         let mut total = 0u32;
         let mut collected = Vec::new();
-        plan.execute_stream_join_chunk::<(&Score,), _>(
-            &mut world,
-            |entities, rows, (scores,)| {
-                assert!(!entities.is_empty());
-                assert_eq!(entities.len(), rows.len());
-                for &row in rows.iter() {
-                    assert!(row < scores.len());
-                    collected.push(scores[row]);
-                }
-                total += entities.len() as u32;
-            },
-        )
+        plan.execute_stream_join_chunk::<(&Score,), _>(&mut world, |entities, rows, (scores,)| {
+            assert!(!entities.is_empty());
+            assert_eq!(entities.len(), rows.len());
+            for &row in rows.iter() {
+                assert!(row < scores.len());
+                collected.push(scores[row]);
+            }
+            total += entities.len() as u32;
+        })
         .unwrap();
         assert_eq!(total, 10);
         collected.sort_by_key(|s| s.0);
