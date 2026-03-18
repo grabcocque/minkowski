@@ -66,7 +66,7 @@
 //!
 //! ```rust,ignore
 //! let sub = planner
-//!     .subscribe::<(&Pos, &Score)>()
+//!     .subscribe::<(Changed<Score>, &Pos, &Score)>()
 //!     .where_eq(Indexed::btree(&score_index), Predicate::eq(Score(42)))
 //!     .build()
 //!     .unwrap();
@@ -2729,6 +2729,7 @@ pub struct SubscriptionBuilder<'w> {
     errors: Vec<SubscriptionError>,
     has_predicates: bool,
     attempted_predicates: bool,
+    has_changed_filter: bool,
 }
 
 /// Errors from [`SubscriptionBuilder::build`].
@@ -2759,6 +2760,10 @@ pub enum SubscriptionError {
     /// would silently degrade to a full scan, violating the subscription's
     /// no-full-scan guarantee.
     IndexNotRegistered { component_name: &'static str },
+    /// The query type has no `Changed<T>` filter. Without change detection,
+    /// the subscription matches all entities on every execution — use a
+    /// regular `scan` instead, or add `Changed<T>` to the query type.
+    NoChangedFilter,
 }
 
 impl fmt::Display for SubscriptionError {
@@ -2800,6 +2805,14 @@ impl fmt::Display for SubscriptionError {
                     f,
                     "Indexed<{component_name}> witness provided but the index was not registered \
                      with the planner — call add_btree_index or add_hash_index first"
+                )
+            }
+            SubscriptionError::NoChangedFilter => {
+                write!(
+                    f,
+                    "subscription query has no Changed<T> filter — without change detection the \
+                     subscription matches all entities every time. Add Changed<T> to the query \
+                     type or use a regular scan instead"
                 )
             }
         }
@@ -2894,6 +2907,12 @@ impl SubscriptionBuilder<'_> {
     /// Returns all [`SubscriptionError`]s if any predicates were invalid
     /// (e.g. a Hash index used with `where_range`, or a type mismatch).
     pub fn build(mut self) -> Result<QueryPlanResult, Vec<SubscriptionError>> {
+        // Subscription queries require Changed<T> in the query type so that
+        // unchanged archetypes are skipped. Without it the subscription
+        // matches all entities every time — indistinguishable from a scan.
+        if !self.has_changed_filter {
+            self.errors.push(SubscriptionError::NoChangedFilter);
+        }
         // Only report NoPredicates if the user never attempted to add any.
         // If they attempted but all failed validation, the specific errors
         // are already in self.errors — NoPredicates would be spurious.
@@ -4917,11 +4936,14 @@ impl<'w> QueryPlanner<'w> {
     pub fn subscribe<Q: crate::query::fetch::WorldQuery + 'static>(
         &'w self,
     ) -> SubscriptionBuilder<'w> {
+        let changed = Q::changed_ids(self.components);
+        let has_changed_filter = !changed.is_clear();
         SubscriptionBuilder {
             scan: self.scan::<Q>(),
             errors: Vec::new(),
             has_predicates: false,
             attempted_predicates: false,
+            has_changed_filter,
         }
     }
 
@@ -5901,7 +5923,7 @@ mod tests {
         let witness = Indexed::btree(&*idx);
 
         let sub = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_eq(witness, Predicate::eq(Score(42)))
             .build()
             .unwrap();
@@ -5937,7 +5959,7 @@ mod tests {
 
         // Score predicate gets lower selectivity (more selective) → should drive.
         let sub = planner
-            .subscribe::<(&Score, &Team)>()
+            .subscribe::<(Changed<Score>, &Score, &Team)>()
             .where_eq(team_w, Predicate::eq(Team(2)).with_selectivity(0.2))
             .where_eq(score_w, Predicate::eq(Score(42)).with_selectivity(0.001))
             .build()
@@ -5973,7 +5995,7 @@ mod tests {
         let witness = Indexed::btree(&*idx);
 
         let sub = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_range(witness, Predicate::range(Score(10)..Score(50)))
             .build()
             .unwrap();
@@ -6000,7 +6022,7 @@ mod tests {
 
         // Hash indexes cannot serve range queries — build returns an error.
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_range(witness, Predicate::range(Score(10)..Score(50)))
             .build();
         match result {
@@ -6023,13 +6045,41 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
 
-        let result = planner.subscribe::<(&Score,)>().build();
+        let result = planner.subscribe::<(Changed<Score>, &Score)>().build();
         match result {
             Err(errs)
                 if errs
                     .iter()
                     .any(|e| matches!(e, SubscriptionError::NoPredicates)) => {}
             other => panic!("expected NoPredicates error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscription_without_changed_filter_returns_error() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn((Score(i),));
+        }
+        let mut idx = BTreeIndex::<Score>::new();
+        idx.rebuild(&mut world);
+        let idx = Arc::new(idx);
+
+        let mut planner = QueryPlanner::new(&world);
+        planner.add_btree_index(&idx, &world).unwrap();
+        let witness = Indexed::btree(&*idx);
+
+        // Query type has no Changed<T> — subscription should error.
+        let result = planner
+            .subscribe::<(&Score,)>()
+            .where_eq(witness, Predicate::eq(Score(42)))
+            .build();
+        match result {
+            Err(errs)
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, SubscriptionError::NoChangedFilter)) => {}
+            other => panic!("expected NoChangedFilter error, got {:?}", other),
         }
     }
 
@@ -6049,7 +6099,7 @@ mod tests {
 
         // Witness is for Score but predicate is for Team — should error.
         let result = planner
-            .subscribe::<(&Score, &Team)>()
+            .subscribe::<(Changed<Score>, &Score, &Team)>()
             .where_eq(score_w, Predicate::eq(Team(2)))
             .build();
         match result {
@@ -6077,7 +6127,7 @@ mod tests {
 
         // where_eq expects an Eq predicate, but we pass a Range.
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_eq(witness, Predicate::range(Score(10)..Score(50)))
             .build();
         match result {
@@ -6104,7 +6154,7 @@ mod tests {
         let witness = Indexed::btree(&*idx);
 
         let mut plan = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_eq(witness, Predicate::eq(Score(42)))
             .build()
             .unwrap();
@@ -6131,7 +6181,7 @@ mod tests {
         let witness = Indexed::btree(&*idx);
 
         let mut plan = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_eq(witness, Predicate::eq(Score(42)))
             .build()
             .unwrap();
@@ -6159,7 +6209,7 @@ mod tests {
 
         // where_range expects a Range predicate, but we pass Eq.
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_range(witness, Predicate::eq(Score(42)))
             .build();
         assert!(matches!(
@@ -6181,7 +6231,7 @@ mod tests {
         // Witness exists but index NOT registered with planner.
         let planner = QueryPlanner::new(&world);
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_eq(witness, Predicate::eq(Score(42)))
             .build();
         assert!(
@@ -6211,7 +6261,7 @@ mod tests {
         // Pass a Team predicate with a Score witness — ComponentMismatch.
         // Should NOT also get NoPredicates.
         let result = planner
-            .subscribe::<(&Score, &Team)>()
+            .subscribe::<(Changed<Score>, &Score, &Team)>()
             .where_eq(witness, Predicate::eq(Team(2)).with_selectivity(0.2))
             .build();
         match result {
