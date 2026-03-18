@@ -8115,6 +8115,13 @@ mod tests {
 
     impl SpatialIndex for UnsupportedGridIndex {
         fn rebuild(&mut self, _world: &mut World) {}
+
+        fn supports(&self, _expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            None
+        }
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            Vec::new()
+        }
     }
 
     /// Test spatial index that returns a fixed set of entities.
@@ -8564,6 +8571,10 @@ mod tests {
                 _ => None,
             }
         }
+
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -8629,6 +8640,10 @@ mod tests {
                 }),
                 _ => None,
             }
+        }
+
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            Vec::new()
         }
     }
 
@@ -8751,6 +8766,10 @@ mod tests {
                 }),
                 _ => None,
             }
+        }
+
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            Vec::new()
         }
     }
 

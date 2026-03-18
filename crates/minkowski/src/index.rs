@@ -130,11 +130,10 @@ pub trait SpatialIndex {
     /// the index cannot accelerate the expression (the planner will
     /// fall back to a scan + post-filter).
     ///
-    /// The default implementation returns `None`, keeping backward
-    /// compatibility for indexes that predate capability discovery.
-    fn supports(&self, _expr: &SpatialExpr) -> Option<SpatialCost> {
-        None
-    }
+    /// Indexes that return `Some` from this method **must** return
+    /// meaningful results from [`query`](Self::query) for the same
+    /// expression — the planner will use the index as a scan driver.
+    fn supports(&self, expr: &SpatialExpr) -> Option<SpatialCost>;
 
     /// Execute a spatial query, returning matching entities.
     ///
@@ -142,11 +141,7 @@ pub trait SpatialIndex {
     /// returned `Some` for the given expression. The planner guarantees
     /// that `query` is only called with expressions that `supports`
     /// accepted — implementations may panic on unsupported expressions.
-    ///
-    /// The default returns an empty vec.
-    fn query(&self, _expr: &SpatialExpr) -> Vec<Entity> {
-        Vec::new()
-    }
+    fn query(&self, expr: &SpatialExpr) -> Vec<Entity>;
 }
 
 /// A sorted index over a single component column, backed by a [`BTreeMap`].
@@ -327,6 +322,13 @@ impl<T: Component + Ord + Clone> SpatialIndex for BTreeIndex<T> {
         }
         self.last_sync = world.change_tick();
     }
+
+    fn supports(&self, _expr: &SpatialExpr) -> Option<SpatialCost> {
+        None
+    }
+    fn query(&self, _expr: &SpatialExpr) -> Vec<Entity> {
+        Vec::new()
+    }
 }
 
 /// A hash-based index over a single component column, backed by a [`HashMap`].
@@ -474,6 +476,13 @@ impl<T: Component + Hash + Eq + Clone> SpatialIndex for HashIndex<T> {
         }
         self.last_sync = world.change_tick();
     }
+
+    fn supports(&self, _expr: &SpatialExpr) -> Option<SpatialCost> {
+        None
+    }
+    fn query(&self, _expr: &SpatialExpr) -> Vec<Entity> {
+        Vec::new()
+    }
 }
 
 // ── Compile-time index markers ────────────────────────────────────────
@@ -550,6 +559,13 @@ mod tests {
     impl SpatialIndex for EntityCollector {
         fn rebuild(&mut self, world: &mut World) {
             self.entities = world.query::<(Entity, &Pos)>().map(|(e, _)| e).collect();
+        }
+
+        fn supports(&self, _expr: &SpatialExpr) -> Option<SpatialCost> {
+            None
+        }
+        fn query(&self, _expr: &SpatialExpr) -> Vec<Entity> {
+            Vec::new()
         }
     }
 
@@ -1028,6 +1044,10 @@ mod tests {
                     cpu: 8.0,
                 }),
             }
+        }
+
+        fn query(&self, _expr: &SpatialExpr) -> Vec<Entity> {
+            Vec::new()
         }
     }
 
