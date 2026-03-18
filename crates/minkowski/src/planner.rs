@@ -3217,11 +3217,11 @@ fn collect_matching_entities(
 
 // ── Scan builder ─────────────────────────────────────────────────────
 
-/// Carries the spatial lookup function and expression resolved during Phase 3
+/// Carries the spatial index and expression resolved during Phase 3
 /// (driver selection) to Phase 7 (join collectors) and Phase 8 (closure compilation).
 struct SpatialDriver {
     expr: SpatialExpr,
-    lookup_fn: SpatialLookupFn,
+    index: Arc<dyn SpatialIndex + Send + Sync>,
 }
 
 /// Carries a pre-bound index lookup function from Phase 3 (driver selection)
@@ -3451,15 +3451,16 @@ impl ScanBuilder<'_> {
 
         // Phase 1: Classify predicates — index-driven vs spatial vs post-filter.
         let mut index_preds: Vec<(Predicate, &IndexDescriptor)> = Vec::new();
-        let mut spatial_preds: Vec<(Predicate, SpatialCost, Option<SpatialLookupFn>)> = Vec::new();
+        let mut spatial_preds: Vec<(Predicate, SpatialCost, Arc<dyn SpatialIndex + Send + Sync>)> =
+            Vec::new();
         let mut filter_preds = Vec::new();
         let planner = self.planner;
 
         for pred in self.predicates {
             if pred.can_use_spatial() {
                 match planner.find_spatial_index(&pred) {
-                    SpatialLookupResult::Accelerated(_name, cost, lookup) => {
-                        spatial_preds.push((pred, cost, lookup));
+                    SpatialLookupResult::Accelerated(_name, cost, index) => {
+                        spatial_preds.push((pred, cost, index));
                     }
                     SpatialLookupResult::Declined(expression) => {
                         warnings.push(PlanWarning::SpatialIndexDeclined {
@@ -3572,18 +3573,14 @@ impl ScanBuilder<'_> {
 
         // Compute spatial driver if spatial is the best driving access.
         let spatial_driver = if use_spatial_driver && !spatial_preds.is_empty() {
-            let (first_pred, _, first_lookup) = &spatial_preds[0];
-            if let Some(lookup_fn) = first_lookup {
-                let PredicateKind::Spatial(sp) = &first_pred.kind else {
-                    unreachable!("spatial_preds only contains Spatial predicates");
-                };
-                Some(SpatialDriver {
-                    expr: sp.into(),
-                    lookup_fn: Arc::clone(lookup_fn),
-                })
-            } else {
-                None
-            }
+            let (first_pred, _, first_index) = &spatial_preds[0];
+            let PredicateKind::Spatial(sp) = &first_pred.kind else {
+                unreachable!("spatial_preds only contains Spatial predicates");
+            };
+            Some(SpatialDriver {
+                expr: sp.into(),
+                index: Arc::clone(first_index),
+            })
         } else {
             None
         };
@@ -3938,15 +3935,15 @@ impl ScanBuilder<'_> {
             let left_changed = self.left_changed.clone().unwrap_or_default();
             let left_filters: Vec<FilterFn> = all_filter_fns.iter().map(Arc::clone).collect();
             let left_collector: EntityCollector = if let Some(ref driver) = spatial_driver {
-                // Index-gather path: use the spatial lookup function instead of
+                // Index-gather path: call the spatial index directly instead of
                 // archetype scanning. Mirrors the Phase 8 index-gather closure.
-                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let index = Arc::clone(&driver.index);
                 let expr = driver.expr.clone();
                 let left_required_for_index = left_required.clone();
                 let left_changed_for_index = left_changed.clone();
                 Box::new(
                     move |world: &World, tick: Tick, scratch: &mut ScratchBuffer| {
-                        let candidates = lookup_fn(&expr);
+                        let candidates = index.query(&expr);
                         gather_index_candidates(
                             world,
                             &candidates,
@@ -4114,15 +4111,15 @@ impl ScanBuilder<'_> {
 
         let compiled_for_each = if !has_any_joins {
             if let Some(ref driver) = spatial_driver {
-                // Spatial index-gather path: call the lookup function instead of
-                // scanning archetypes.
-                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                // Spatial index-gather path: call the spatial index directly
+                // instead of scanning archetypes.
+                let index = Arc::clone(&driver.index);
                 let expr = driver.expr.clone();
                 let required = required_for_index;
                 let changed = changed_for_index;
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
-                        let candidates = lookup_fn(&expr);
+                        let candidates = index.query(&expr);
                         gather_index_candidates(
                             world,
                             &candidates,
@@ -4181,13 +4178,13 @@ impl ScanBuilder<'_> {
         let compiled_for_each_raw = if !has_any_joins {
             if let Some(ref driver) = spatial_driver {
                 // Spatial index-gather path for the raw (transactional read) variant.
-                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let index = Arc::clone(&driver.index);
                 let expr = driver.expr.clone();
                 let required = required_for_index_raw;
                 let changed = changed_for_index_raw;
                 Some(Box::new(
                     move |world: &World, tick: Tick, callback: &mut dyn FnMut(Entity)| {
-                        let candidates = lookup_fn(&expr);
+                        let candidates = index.query(&expr);
                         gather_index_candidates(
                             world,
                             &candidates,
@@ -4248,7 +4245,7 @@ impl ScanBuilder<'_> {
         // archetypes or index results and call batch extractors directly.
         let compiled_agg_scan: Option<CompiledAggScan> = if !has_any_joins {
             if let Some(ref driver) = spatial_driver {
-                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let index = Arc::clone(&driver.index);
                 let expr = driver.expr.clone();
                 let required = required_for_agg;
                 let changed = changed_for_agg;
@@ -4258,7 +4255,7 @@ impl ScanBuilder<'_> {
                           tick: Tick,
                           extractors: &mut [Option<Box<dyn BatchExtractor>>],
                           accums: &mut [AggregateAccum]| {
-                        let candidates = lookup_fn(&expr);
+                        let candidates = index.query(&expr);
                         gather_index_batched(
                             world,
                             &candidates,
@@ -4341,7 +4338,7 @@ impl ScanBuilder<'_> {
 
         let compiled_agg_scan_raw: Option<CompiledAggScan> = if !has_any_joins {
             if let Some(ref driver) = spatial_driver {
-                let lookup_fn = Arc::clone(&driver.lookup_fn);
+                let index = Arc::clone(&driver.index);
                 let expr = driver.expr.clone();
                 let required = required_for_agg_raw;
                 let changed = changed_for_agg_raw;
@@ -4351,7 +4348,7 @@ impl ScanBuilder<'_> {
                           tick: Tick,
                           extractors: &mut [Option<Box<dyn BatchExtractor>>],
                           accums: &mut [AggregateAccum]| {
-                        let candidates = lookup_fn(&expr);
+                        let candidates = index.query(&expr);
                         gather_index_batched(
                             world,
                             &candidates,
@@ -4541,17 +4538,11 @@ impl ScanBuilder<'_> {
 
 // ── QueryPlanner ─────────────────────────────────────────────────────
 
-/// Type-erased spatial lookup: takes a `SpatialExpr`, returns candidate entities.
-/// Provided by the user at registration time to bridge between the planner's
-/// expression protocol and the index's concrete query API.
-pub type SpatialLookupFn = Arc<dyn Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync>;
-
 /// Descriptor for a registered spatial index.
 struct SpatialIndexDescriptor {
     component_name: &'static str,
     /// The spatial index, behind Arc for shared access at execution time.
     index: Arc<dyn SpatialIndex + Send + Sync>,
-    lookup_fn: Option<SpatialLookupFn>,
 }
 
 impl fmt::Debug for SpatialIndexDescriptor {
@@ -4565,7 +4556,11 @@ impl fmt::Debug for SpatialIndexDescriptor {
 /// Result of checking whether a spatial index can accelerate a predicate.
 enum SpatialLookupResult {
     /// The index can accelerate the expression at the given cost.
-    Accelerated(&'static str, SpatialCost, Option<SpatialLookupFn>),
+    Accelerated(
+        &'static str,
+        SpatialCost,
+        Arc<dyn SpatialIndex + Send + Sync>,
+    ),
     /// A spatial index is registered but it declined the expression.
     Declined(String),
     /// No spatial index is registered for this component type.
@@ -4753,38 +4748,6 @@ impl<'w> QueryPlanner<'w> {
             SpatialIndexDescriptor {
                 component_name: std::any::type_name::<T>(),
                 index,
-                lookup_fn: None,
-            },
-        );
-        Ok(())
-    }
-
-    /// Register a spatial index with both cost discovery and execution-time lookup.
-    ///
-    /// The `lookup` closure bridges between the planner's [`SpatialExpr`]
-    /// protocol and the index's concrete query API. The planner makes no
-    /// assumptions about how the index answers queries — the closure is the
-    /// adapter.
-    ///
-    /// Returns `Err(PlannerError::UnregisteredComponent)` if `T` has not been
-    /// registered as a component in `world`.
-    pub fn add_spatial_index_with_lookup<T: Component>(
-        &mut self,
-        index: Arc<dyn SpatialIndex + Send + Sync>,
-        world: &World,
-        lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
-    ) -> Result<(), PlannerError> {
-        if world.component_id::<T>().is_none() {
-            return Err(PlannerError::UnregisteredComponent(
-                std::any::type_name::<T>(),
-            ));
-        }
-        self.spatial_indexes.insert(
-            TypeId::of::<T>(),
-            SpatialIndexDescriptor {
-                component_name: std::any::type_name::<T>(),
-                index,
-                lookup_fn: Some(Arc::new(lookup)),
             },
         );
         Ok(())
@@ -4971,11 +4934,9 @@ impl<'w> QueryPlanner<'w> {
         };
         let expr: SpatialExpr = sp.into();
         match desc.index.supports(&expr) {
-            Some(cost) => SpatialLookupResult::Accelerated(
-                desc.component_name,
-                cost,
-                desc.lookup_fn.as_ref().map(Arc::clone),
-            ),
+            Some(cost) => {
+                SpatialLookupResult::Accelerated(desc.component_name, cost, Arc::clone(&desc.index))
+            }
             None => SpatialLookupResult::Declined(sp.to_string()),
         }
     }
@@ -5241,23 +5202,11 @@ impl<'w, T: crate::table::Table> TablePlanner<'w, T> {
         self.planner.add_hash_index::<C>(index, self.world)
     }
 
-    /// Register a spatial index with cost discovery and execution-time lookup.
-    ///
-    /// Delegates to [`QueryPlanner::add_spatial_index_with_lookup`].
-    /// No compile-time index enforcement — spatial indexes are orthogonal to
-    /// table schemas.
-    pub fn add_spatial_index_with_lookup<C: Component>(
-        &mut self,
-        index: Arc<dyn SpatialIndex + Send + Sync>,
-        lookup: impl Fn(&SpatialExpr) -> Vec<Entity> + Send + Sync + 'static,
-    ) -> Result<(), PlannerError> {
-        self.planner
-            .add_spatial_index_with_lookup::<C>(index, self.world, lookup)
-    }
-
-    /// Register a spatial index for cost discovery only (no execution-time lookup).
+    /// Register a spatial index for cost discovery and execution.
     ///
     /// Delegates to [`QueryPlanner::add_spatial_index`].
+    /// No compile-time index enforcement — spatial indexes are orthogonal to
+    /// table schemas.
     pub fn add_spatial_index<C: Component>(
         &mut self,
         index: Arc<dyn SpatialIndex + Send + Sync>,
@@ -8148,6 +8097,10 @@ mod tests {
                 }),
             }
         }
+
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            self.entities.clone()
+        }
     }
 
     /// Grid index that does NOT support any spatial queries.
@@ -8155,6 +8108,76 @@ mod tests {
 
     impl SpatialIndex for UnsupportedGridIndex {
         fn rebuild(&mut self, _world: &mut World) {}
+    }
+
+    /// Test spatial index that returns a fixed set of entities.
+    struct FixedSpatialIndex {
+        entities: Vec<Entity>,
+    }
+
+    impl FixedSpatialIndex {
+        fn new(entities: Vec<Entity>) -> Self {
+            Self { entities }
+        }
+    }
+
+    impl SpatialIndex for FixedSpatialIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+        fn supports(&self, _expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            Some(crate::index::SpatialCost {
+                estimated_rows: self.entities.len() as f64,
+                cpu: 1.0,
+            })
+        }
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            self.entities.clone()
+        }
+    }
+
+    /// Test spatial index that counts calls and returns a fixed set of entities.
+    struct CountingSpatialIndex {
+        entities: Vec<Entity>,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SpatialIndex for CountingSpatialIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+        fn supports(&self, _expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            Some(crate::index::SpatialCost {
+                estimated_rows: self.entities.len() as f64,
+                cpu: 1.0,
+            })
+        }
+        fn query(&self, _expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.entities.clone()
+        }
+    }
+
+    /// Test spatial index that records the received expression and returns fixed entities.
+    struct RecordingSpatialIndex {
+        entities: Vec<Entity>,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+        received_center: Arc<std::sync::Mutex<Vec<f64>>>,
+    }
+
+    impl SpatialIndex for RecordingSpatialIndex {
+        fn rebuild(&mut self, _world: &mut World) {}
+        fn supports(&self, _expr: &crate::index::SpatialExpr) -> Option<crate::index::SpatialCost> {
+            Some(crate::index::SpatialCost {
+                estimated_rows: self.entities.len() as f64,
+                cpu: 1.0,
+            })
+        }
+        fn query(&self, expr: &crate::index::SpatialExpr) -> Vec<Entity> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let crate::index::SpatialExpr::Within { center, .. } = expr {
+                *self.received_center.lock().unwrap() = center.clone();
+            }
+            self.entities.clone()
+        }
     }
 
     #[test]
@@ -8783,20 +8806,15 @@ mod tests {
         let _e3 = world.spawn((Pos { x: 100.0, y: 100.0 },));
 
         let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = Arc::clone(&call_count);
-
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(
-                Arc::new(grid),
+            .add_spatial_index::<Pos>(
+                Arc::new(CountingSpatialIndex {
+                    entities: vec![e1, e2],
+                    call_count: Arc::clone(&call_count),
+                }),
                 &world,
-                move |_expr: &crate::index::SpatialExpr| {
-                    call_count_clone.fetch_add(1, Ordering::Relaxed);
-                    vec![e1, e2]
-                },
             )
             .unwrap();
 
@@ -8813,7 +8831,7 @@ mod tests {
 
         assert!(
             call_count.load(Ordering::Relaxed) > 0,
-            "lookup function was never called"
+            "query method was never called"
         );
         assert_eq!(results.len(), 2);
         assert!(results.contains(&e1));
@@ -8830,20 +8848,15 @@ mod tests {
         let _e3 = world.spawn((Pos { x: 100.0, y: 100.0 }, Score(30)));
 
         let call_count = Arc::new(AtomicUsize::new(0));
-        let cc = Arc::clone(&call_count);
-
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(
-                Arc::new(grid),
+            .add_spatial_index::<Pos>(
+                Arc::new(CountingSpatialIndex {
+                    entities: vec![e1, e2],
+                    call_count: Arc::clone(&call_count),
+                }),
                 &world,
-                move |_expr: &crate::index::SpatialExpr| {
-                    cc.fetch_add(1, Ordering::Relaxed);
-                    vec![e1, e2]
-                },
             )
             .unwrap();
 
@@ -8856,7 +8869,7 @@ mod tests {
         let results = plan.execute(&mut world).unwrap();
         assert!(
             call_count.load(Ordering::Relaxed) > 0,
-            "lookup not called in join"
+            "query not called in join"
         );
         assert_eq!(results.len(), 2);
     }
@@ -8868,12 +8881,9 @@ mod tests {
         let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
         let _far = world.spawn((Pos { x: 999.0, y: 999.0 },));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -8893,12 +8903,9 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
         let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         // Build the plan while the planner still borrows world, then drop planner.
@@ -8926,17 +8933,16 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
 
         let call_count = Arc::new(AtomicUsize::new(0));
-        let cc = Arc::clone(&call_count);
-
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
 
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-                cc.fetch_add(1, Ordering::Relaxed);
-                vec![e1]
-            })
+            .add_spatial_index::<Pos>(
+                Arc::new(CountingSpatialIndex {
+                    entities: vec![e1],
+                    call_count: Arc::clone(&call_count),
+                }),
+                &world,
+            )
             .unwrap();
 
         let mut plan = planner
@@ -8995,14 +9001,9 @@ mod tests {
         // the column-level filter skips the unmodified archetype on the second scan.
         let e3 = world.spawn((Pos { x: 3.0, y: 3.0 }, Score(99)));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| {
-                vec![e1, e2, e3]
-            })
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2, e3])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -9042,16 +9043,9 @@ mod tests {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 1.0 },));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(
-                Arc::new(grid),
-                &world,
-                |_expr| Vec::new(), // empty result set
-            )
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -9070,12 +9064,9 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
         let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -9098,12 +9089,9 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
         let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -9126,13 +9114,10 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 1.0 }, Score(10))); // has both
         let e2 = world.spawn((Pos { x: 2.0, y: 2.0 },)); // only Pos
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
-        // Lookup returns both entities.
+        // Index returns both entities.
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         // Query requires BOTH Pos and Score.
@@ -9159,12 +9144,9 @@ mod tests {
         let e1 = world.spawn((Pos { x: 1.0, y: 1.0 },));
         let e2 = world.spawn((Pos { x: 2.0, y: 2.0 }, Score(10)));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -9191,12 +9173,9 @@ mod tests {
         let e2 = world.spawn((Pos { x: 5.0, y: 5.0 },));
         let _far = world.spawn((Pos { x: 99.0, y: 99.0 },));
 
-        let mut grid = TestGridIndex::new();
-        grid.rebuild(&mut world);
-
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos>(Arc::new(grid), &world, move |_expr| vec![e1, e2])
+            .add_spatial_index::<Pos>(Arc::new(FixedSpatialIndex::new(vec![e1, e2])), &world)
             .unwrap();
 
         let mut plan = planner
@@ -9231,35 +9210,20 @@ mod tests {
             z: 3.0,
         },));
 
-        // Verify 3D coordinates are passed through to the lookup closure.
+        // Verify 3D coordinates are passed through to the index's query method.
         let received_center = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rc = Arc::clone(&received_center);
         let call_count = Arc::new(AtomicUsize::new(0));
-        let cc = Arc::clone(&call_count);
-
-        struct Dummy3DIndex;
-        impl SpatialIndex for Dummy3DIndex {
-            fn rebuild(&mut self, _world: &mut World) {}
-            fn supports(
-                &self,
-                _expr: &crate::index::SpatialExpr,
-            ) -> Option<crate::index::SpatialCost> {
-                Some(crate::index::SpatialCost {
-                    estimated_rows: 1.0,
-                    cpu: 1.0,
-                })
-            }
-        }
 
         let mut planner = QueryPlanner::new(&world);
         planner
-            .add_spatial_index_with_lookup::<Pos3D>(Arc::new(Dummy3DIndex), &world, move |expr| {
-                cc.fetch_add(1, Ordering::Relaxed);
-                if let crate::index::SpatialExpr::Within { center, .. } = expr {
-                    *rc.lock().unwrap() = center.clone();
-                }
-                vec![e1]
-            })
+            .add_spatial_index::<Pos3D>(
+                Arc::new(RecordingSpatialIndex {
+                    entities: vec![e1],
+                    call_count: Arc::clone(&call_count),
+                    received_center: Arc::clone(&received_center),
+                }),
+                &world,
+            )
             .unwrap();
 
         let mut plan = planner

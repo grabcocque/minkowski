@@ -135,6 +135,18 @@ pub trait SpatialIndex {
     fn supports(&self, _expr: &SpatialExpr) -> Option<SpatialCost> {
         None
     }
+
+    /// Execute a spatial query, returning matching entities.
+    ///
+    /// Called by the query planner at execution time when [`supports`]
+    /// returned `Some` for the given expression. The planner guarantees
+    /// that `query` is only called with expressions that `supports`
+    /// accepted — implementations may panic on unsupported expressions.
+    ///
+    /// The default returns an empty vec.
+    fn query(&self, _expr: &SpatialExpr) -> Vec<Entity> {
+        Vec::new()
+    }
 }
 
 /// A sorted index over a single component column, backed by a [`BTreeMap`].

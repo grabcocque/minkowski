@@ -14,7 +14,7 @@
 //! - Plan execution against a live World (execute returns &[Entity])
 //! - Zero-allocation for_each iteration for scan-only plans
 //! - Transactional for_each_raw with &World (no tick advancement)
-//! - Spatial index execution via add_spatial_index_with_lookup
+//! - Spatial index execution via add_spatial_index
 
 use std::sync::Arc;
 
@@ -458,6 +458,17 @@ fn main() {
                 _ => None,
             }
         }
+
+        fn query(&self, expr: &SpatialExpr) -> Vec<Entity> {
+            match expr {
+                SpatialExpr::Within { center, radius } => self.query_within(
+                    center.first().copied().unwrap_or(0.0) as f32,
+                    center.get(1).copied().unwrap_or(0.0) as f32,
+                    *radius as f32,
+                ),
+                _ => Vec::new(),
+            }
+        }
     }
 
     // Build and populate the index.
@@ -485,24 +496,14 @@ fn main() {
         })
     };
 
-    // The lookup closure: maps SpatialExpr → candidate Entity list.
-    // This is the bridge between the planner's expression protocol and the
-    // index's concrete query API.
-    let spatial_arc_lookup = std::sync::Arc::clone(&spatial_arc);
+    // Register the spatial index — the planner calls `index.query(&expr)` at
+    // execution time, bridging the planner's expression protocol to the
+    // index's concrete query API via the SpatialIndex trait.
     let mut planner = QueryPlanner::new(&world);
     planner
-        .add_spatial_index_with_lookup::<Pos>(
-            std::sync::Arc::clone(&spatial_arc) as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
+        .add_spatial_index::<Pos>(
+            spatial_arc as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
             &world,
-            move |expr| match expr {
-                SpatialExpr::Within { center, radius } => {
-                    assert!(center.len() >= 2, "expected at least 2D coordinates");
-                    let qx = center[0] as f32;
-                    let qy = center[1] as f32;
-                    spatial_arc_lookup.query_within(qx, qy, *radius as f32)
-                }
-                _ => Vec::new(),
-            },
         )
         .unwrap();
 
@@ -540,21 +541,11 @@ fn main() {
     let mut spatial_idx2 = LinearSpatialIndex::new();
     spatial_idx2.rebuild(&mut world);
     let arc2 = std::sync::Arc::new(spatial_idx2);
-    let arc2c = std::sync::Arc::clone(&arc2);
-
     let mut planner2 = QueryPlanner::new(&world);
     planner2
-        .add_spatial_index_with_lookup::<Pos>(
+        .add_spatial_index::<Pos>(
             arc2 as std::sync::Arc<dyn SpatialIndex + Send + Sync>,
             &world,
-            move |expr| match expr {
-                SpatialExpr::Within { center, radius } => {
-                    let qx = center.first().copied().unwrap_or(0.0) as f32;
-                    let qy = center.get(1).copied().unwrap_or(0.0) as f32;
-                    arc2c.query_within(qx, qy, *radius as f32)
-                }
-                _ => Vec::new(),
-            },
         )
         .unwrap();
 
