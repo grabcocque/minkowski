@@ -6022,7 +6022,7 @@ mod tests {
 
         // Hash indexes cannot serve range queries — build returns an error.
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_range(witness, Predicate::range(Score(10)..Score(50)))
             .build();
         match result {
@@ -6045,7 +6045,7 @@ mod tests {
 
         let planner = QueryPlanner::new(&world);
 
-        let result = planner.subscribe::<(&Score,)>().build();
+        let result = planner.subscribe::<(Changed<Score>, &Score)>().build();
         match result {
             Err(errs)
                 if errs
@@ -6099,7 +6099,7 @@ mod tests {
 
         // Witness is for Score but predicate is for Team — should error.
         let result = planner
-            .subscribe::<(&Score, &Team)>()
+            .subscribe::<(Changed<Score>, &Score, &Team)>()
             .where_eq(score_w, Predicate::eq(Team(2)))
             .build();
         match result {
@@ -6127,7 +6127,7 @@ mod tests {
 
         // where_eq expects an Eq predicate, but we pass a Range.
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_eq(witness, Predicate::range(Score(10)..Score(50)))
             .build();
         match result {
@@ -6209,7 +6209,7 @@ mod tests {
 
         // where_range expects a Range predicate, but we pass Eq.
         let result = planner
-            .subscribe::<(&Score,)>()
+            .subscribe::<(Changed<Score>, &Score)>()
             .where_range(witness, Predicate::eq(Score(42)))
             .build();
         assert!(matches!(
@@ -6261,7 +6261,7 @@ mod tests {
         // Pass a Team predicate with a Score witness — ComponentMismatch.
         // Should NOT also get NoPredicates.
         let result = planner
-            .subscribe::<(&Score, &Team)>()
+            .subscribe::<(Changed<Score>, &Score, &Team)>()
             .where_eq(witness, Predicate::eq(Team(2)).with_selectivity(0.2))
             .build();
         match result {
