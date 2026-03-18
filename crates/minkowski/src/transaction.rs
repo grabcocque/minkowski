@@ -591,12 +591,25 @@ impl<'a, 'w> TxScope<'a, 'w> {
         self.tx.spawn(self.world, bundle)
     }
 
-    /// Access the underlying [`Tx`] directly for advanced use cases.
-    pub fn tx(&mut self) -> &mut Tx<'w> {
-        self.tx
+    /// Borrow the underlying [`Tx`] and [`World`] simultaneously.
+    ///
+    /// Use this when the convenience methods on `TxScope` are not
+    /// sufficient — for example, to call
+    /// [`QueryPlanResult::execute_collect_raw`] or other APIs that
+    /// take `(&mut Tx, &mut World)` directly.
+    ///
+    /// ```ignore
+    /// let (tx, world) = scope.parts();
+    /// let entities = plan.execute_collect_raw(world)?;
+    /// for &e in entities {
+    ///     tx.write(world, e, NewComponent(42));
+    /// }
+    /// ```
+    pub fn parts(&mut self) -> (&mut Tx<'w>, &mut World) {
+        (self.tx, self.world)
     }
 
-    /// Access the underlying [`World`] directly for advanced use cases
+    /// Access the underlying [`World`] for read-only operations
     /// (e.g., passing to [`QueryPlanResult::execute_collect_raw`]).
     pub fn world(&self) -> &World {
         self.world
