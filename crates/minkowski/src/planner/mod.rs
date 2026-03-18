@@ -72,16 +72,16 @@
 //!     .unwrap();
 //! ```
 
-pub mod aggregate;
-pub mod builder;
-pub mod cost;
-pub mod error;
-pub mod exec;
-pub mod node;
-pub mod predicate;
-pub mod scratch;
-pub mod table;
-pub mod traits;
+mod aggregate;
+mod builder;
+mod cost;
+mod error;
+mod exec;
+mod node;
+mod predicate;
+mod scratch;
+mod table;
+mod traits;
 
 #[cfg(test)]
 mod tests;
