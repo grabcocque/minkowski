@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run Miri on the curated unsafe-code test subset (~85 tests).
+# Run Miri on the curated unsafe-code test subset (~92 tests).
 # Usage: ci/run-miri-subset.sh
 #
 # Runs cargo miri test with Tree Borrows on module-level filters
@@ -9,7 +9,7 @@ set -euo pipefail
 
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-tree-borrows}"
 
-echo "=== Miri subset: ~85 tests targeting unsafe code paths ==="
+echo "=== Miri subset: ~92 tests targeting unsafe code paths ==="
 
 # Tier 1: ALL tests in unsafe-heavy modules
 FILTERS=(
@@ -34,13 +34,12 @@ EXACT_TESTS=(
     "pool::tests::tcache_thread_exit_flushes"
     "pool::tests::tcache_overflow_refill_correct_bin"
     "pool::tests::tcache_cross_thread_dealloc"
-    # Query iter (6)
+    # Query iter (5 — par_for_each excluded: rayon unsupported by Miri, covered by TSan)
     "query::iter::tests::iterate_single_archetype"
     "query::iter::tests::iterate_multiple_archetypes"
     "query::iter::tests::mutate_during_iteration"
     "query::iter::tests::for_each_chunk_yields_correct_data"
     "query::iter::tests::for_each_chunk_mutation"
-    "query::iter::tests::par_for_each_mutation"
     # World entity lifecycle (11)
     "world::tests::spawn_and_get"
     "world::tests::get_mut"
@@ -53,13 +52,17 @@ EXACT_TESTS=(
     "world::tests::despawn_batch_multiple_archetypes"
     "world::tests::get_batch_mut_basic"
     "world::tests::get_batch_mut_marks_changed"
-    # Changeset arena + drop safety (6)
+    # Changeset arena + drop safety (10)
     "changeset::tests::arena_alloc_and_read_back"
     "changeset::tests::arena_alignment"
     "changeset::tests::apply_does_not_double_drop"
     "changeset::tests::drop_runs_destructor_for_unapplied_insert"
     "changeset::tests::insert_raw_and_apply"
     "changeset::tests::insert_raw_drop_on_abort"
+    "changeset::tests::fast_lane_single_component"
+    "changeset::tests::fast_lane_drop_on_abort"
+    "changeset::tests::fast_lane_partial_failure_no_double_free"
+    "changeset::tests::fast_lane_overwrite_drops_old_value"
     # Table derive macro type erasure (3)
     "table::tests::derive_table_register"
     "table::tests::query_table_yields_correct_data"
@@ -68,9 +71,11 @@ EXACT_TESTS=(
     "bundle::tests::put_writes_correct_data"
     "bundle::tests::pair_component_ids_sorted"
     # Planner batch join execution (3)
-    "planner::tests::for_each_batched_yields_all_join_results"
-    "planner::tests::for_each_join_chunk_yields_correct_slices"
-    "planner::tests::for_each_join_chunk_multi_archetype"
+    "query::planner::tests::execute_stream_batched_yields_all_join_results"
+    "query::planner::tests::execute_stream_join_chunk_yields_correct_slices"
+    "query::planner::tests::execute_stream_join_chunk_multi_archetype"
+    # Reducer fast-lane streaming (1)
+    "reducer::tests::query_writer_fast_lane_roundtrip"
 )
 
 TOTAL=0

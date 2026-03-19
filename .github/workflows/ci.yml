@@ -51,7 +51,6 @@ jobs:
   miri:
     name: Miri
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +60,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: nightly
-      - name: Miri subset (~85 tests targeting unsafe code)
+      - name: Miri subset (~92 tests targeting unsafe code)
         run: ci/run-miri-subset.sh
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows"
@@ -103,8 +102,8 @@ jobs:
           RUSTFLAGS: "--cfg loom"
 
   # Aggregator job — the single required status check for branch protection.
-  # fmt and clippy run in parallel. test runs after both. TSan, Loom run on
-  # every PR. Miri runs only on push to main — "skipped" on PRs is expected.
+  # fmt and clippy run in parallel. test runs after both. Miri, TSan, Loom
+  # run after test on every PR and push.
   ci-pass:
     name: CI
     needs: [fmt, clippy, test, miri, tsan, loom]
@@ -116,19 +115,15 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ||
                 "${{ needs.clippy.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
+                "${{ needs.miri.result }}" != "success" ||
                 "${{ needs.tsan.result }}" != "success" ||
                 "${{ needs.loom.result }}" != "success" ]]; then
             echo "One or more CI jobs failed or were skipped."
             echo "  fmt:    ${{ needs.fmt.result }}"
             echo "  clippy: ${{ needs.clippy.result }}"
             echo "  test:   ${{ needs.test.result }}"
+            echo "  miri:   ${{ needs.miri.result }}"
             echo "  tsan:   ${{ needs.tsan.result }}"
             echo "  loom:   ${{ needs.loom.result }}"
-            exit 1
-          fi
-          # Miri only runs on push to main — "skipped" on PRs is expected.
-          if [[ "${{ needs.miri.result }}" != "success" &&
-                "${{ needs.miri.result }}" != "skipped" ]]; then
-            echo "miri failed: ${{ needs.miri.result }}"
             exit 1
           fi

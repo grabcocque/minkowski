@@ -1,5 +1,5 @@
-# Miri test subset — ~88 tests exercising unsafe code paths.
-# Used by CI: cargo miri test -p minkowski --lib -- $(paste -sd '|' ci/miri-subset.txt)
+# Miri test subset — ~92 tests exercising unsafe code paths.
+# Used by CI: ci/run-miri-subset.sh
 #
 # Selection criteria: tests that exercise raw pointer arithmetic, UnsafeCell
 # access, atomic ops on mmap memory, type-erased column storage, arena
@@ -76,13 +76,13 @@ query::fetch::tests::changed_ids_for_changed_contains_component
 query::fetch::tests::changed_ids_tuple_unions_terms
 query::fetch::tests::changed_ids_tuple_multiple_changed
 
-# ── Query iter: archetype iteration through unsafe fetch (6 selected)
+# ── Query iter: archetype iteration through unsafe fetch (5 selected)
+# par_for_each_mutation excluded: rayon thread pool unsupported by Miri, covered by TSan
 query::iter::tests::iterate_single_archetype
 query::iter::tests::iterate_multiple_archetypes
 query::iter::tests::mutate_during_iteration
 query::iter::tests::for_each_chunk_yields_correct_data
 query::iter::tests::for_each_chunk_mutation
-query::iter::tests::par_for_each_mutation
 
 # ── World: entity lifecycle through unsafe storage (11 selected) ─────
 world::tests::spawn_and_get
@@ -97,7 +97,7 @@ world::tests::despawn_batch_multiple_archetypes
 world::tests::get_batch_mut_basic
 world::tests::get_batch_mut_marks_changed
 
-# ── Changeset: arena alloc + drop safety (6 selected) ───────────────
+# ── Changeset: arena alloc + drop safety (10 selected) ──────────────
 changeset::tests::arena_alloc_and_read_back
 changeset::tests::arena_alignment
 changeset::tests::apply_does_not_double_drop
@@ -118,10 +118,10 @@ table::tests::typed_query_table_mut
 bundle::tests::put_writes_correct_data
 bundle::tests::pair_component_ids_sorted
 
-# ── Planner: batch join execution (3 selected) ────────────────────
-planner::tests::for_each_batched_yields_all_join_results
-planner::tests::for_each_join_chunk_yields_correct_slices
-planner::tests::for_each_join_chunk_multi_archetype
+# ── Planner: batch join execution (3 selected) ──────────────────────
+query::planner::tests::execute_stream_batched_yields_all_join_results
+query::planner::tests::execute_stream_join_chunk_yields_correct_slices
+query::planner::tests::execute_stream_join_chunk_multi_archetype
 
-# ── Fast-lane: streaming archetype buffers (1 selected) ────────────
+# ── Reducer: streaming archetype buffers (1 selected) ───────────────
 reducer::tests::query_writer_fast_lane_roundtrip
