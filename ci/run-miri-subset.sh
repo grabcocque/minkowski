@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Run Miri on the curated unsafe-code test subset via cargo-nextest.
+# Run Miri on the full test suite via cargo-nextest.
 # Usage: ci/run-miri-subset.sh
 #
-# Uses the [profile.default-miri] filterset in .config/nextest.toml to select
-# tests. Nextest runs each test in its own process, enabling parallel Miri
-# execution (Miri itself is single-threaded).
+# Exclusions (defined in .config/nextest.toml [profile.default-miri]):
+#   - par_for_each: rayon thread pool unsupported by Miri (covered by TSan)
+#   - concurrent/contention pool tests: too slow under Miri (covered by TSan + Loom)
 
 set -euo pipefail
 
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-tree-borrows}"
 
-echo "=== Miri subset (nextest, parallel) ==="
+echo "=== Miri full suite (nextest, parallel) ==="
 
 # --no-fail-fast: run all tests even if some fail, for full diagnostics.
 cargo +nightly miri nextest run -p minkowski --lib --no-fail-fast

@@ -1,16 +1,12 @@
-# Miri test selection has moved to .config/nextest.toml
+# Miri runs the full test suite (~860 tests) via cargo-nextest.
 #
-# The [profile.default-miri] filterset defines which tests run under Miri.
-# Nextest activates this profile automatically when MIRI_SYSROOT is set.
+# Configuration: .config/nextest.toml [profile.default-miri]
+# Schedule: nightly (04:00 UTC) + release tags (v*)
+# Workflow: .github/workflows/miri.yml
 #
 # To list which tests will run:
-#   cargo miri nextest list -p minkowski --lib
+#   cargo nextest list -p minkowski --lib --profile default-miri
 #
-# Selection criteria: tests that exercise raw pointer arithmetic, UnsafeCell
-# access, atomic ops on mmap memory, type-erased column storage, arena
-# allocation, or entity lifecycle through unsafe paths.
-#
-# Excluded from Miri:
+# Excluded (in .config/nextest.toml):
 #   - par_for_each (rayon thread pool unsupported by Miri, covered by TSan)
-#   - Mostly-safe modules: access, view, transaction, debounce, tick,
-#     lock_table, retention, planner (except execute_stream batch paths)
+#   - concurrent/contention pool tests (too slow under Miri, covered by TSan + Loom)
