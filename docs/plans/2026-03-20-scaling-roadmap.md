@@ -1,0 +1,741 @@
+# Minkowski Scaling Roadmap: Seven Stages
+
+*Inspired by TigerBeetle's "Seven Stages of Database Scaling."*
+*Status: Minkowski is at Stage 2. This document is the roadmap to Stage 7.*
+
+---
+
+## Table of Contents
+
+1. [Stage 1: The Log](#stage-1-the-log) ✅
+2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (current)
+3. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage)
+4. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
+5. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
+6. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
+7. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
+
+---
+
+## Stage 1: The Log
+
+**Status: Complete.** (`minkowski-persist` crate, WAL subsystem)
+
+The log is the foundation of durability. Every committed transaction is written
+to the WAL before being applied to the in-memory World. On crash, replay the
+log to recover state. The log is also the unit of replication (Stage 4).
+
+### What exists
+
+- `Wal`: segmented write-ahead log with CRC32 frame integrity, rollover, crash recovery
+- `Durable<S>`: wraps any `Transact` strategy to add WAL logging on commit
+- `WalCursor`: filesystem-specific log reader for pull-based replication
+- `ReplicationBatch`: transport-agnostic wire format + `apply_batch`
+- `CodecRegistry`: component name → serializer mapping, stable names for schema evolution
+- `CrcProof`: zero-sized proof token — gates the raw memcpy fast path (only
+  CRC-validated frames bypass rkyv bytecheck)
+
+### The in-memory foundation
+
+The log sits atop a column-oriented archetype ECS:
+
+- `World`: entity allocator, archetype storage, sparse storage, query cache
+- `BlobVec`: type-erased column storage with 64-byte alignment for SIMD
+- `SlabPool`: mmap-backed slab allocator with thread-local cache
+- `QueryPlanner`: cost-based plans, joins, aggregates, index-driven lookups
+- `ReducerRegistry`: typed mutation handles with compile-time conflict detection
+- `EnumChangeSet`: ordered mutation log with arena allocation
+- `Transact`: Sequential, Optimistic (tick-based), Pessimistic (lock-based)
+
+### Key properties carried forward
+
+These properties were established at Stage 1 and are load-bearing for every
+subsequent stage:
+
+| Property | Why it matters later |
+|---|---|
+| **Deterministic reducers** | RSM (Stage 4) requires identical replay across replicas |
+| **Ordered mutation log** (`EnumChangeSet`) | Unit of WAL write (Stage 1), replication (Stage 4), and compaction (Stage 3) |
+| **Generational entity IDs** | Stale references detected without coordination (Stage 5 cross-shard) |
+| **External composition** (indexes, registry, planner outside World) | Clean separation for compute/storage split (Stage 6) |
+| **Access bitsets** | Conflict detection generalizes to cross-shard conflict detection (Stage 5) |
+
+---
+
+## Stage 2: Snapshots
+
+**Status: Complete.** (`minkowski-persist` crate, snapshot + checkpoint subsystem)
+
+The log alone means crash recovery replays *every* mutation since the beginning
+of time. Snapshots provide a baseline: checkpoint the world state to disk, then
+recovery only needs to replay the WAL tail from the last checkpoint.
+
+### What exists
+
+- `Snapshot`: full-world serialization via rkyv (v2 format with CRC32 envelope)
+- `CheckpointHandler` / `AutoCheckpoint`: snapshot trigger when WAL exceeds threshold
+- `Durable<S>` integration: checkpoint handler fires automatically on WAL rollover
+
+### What makes this a good Stage 2
+
+The WAL and snapshots are properly integrated, not bolted on separately:
+
+1. `Durable<S>` writes the WAL on every commit (Stage 1)
+2. `AutoCheckpoint` triggers a snapshot when WAL size exceeds a threshold
+3. On recovery: load snapshot → replay WAL from checkpoint sequence number
+4. `WalCursor` can read from the checkpoint point for replication
+5. `CrcProof` validates both snapshot and WAL frame integrity
+
+### What's missing (prerequisites for Stage 3)
+
+- **WAL compaction**: old segments are deleted after checkpoint but never merged.
+  Stage 3 needs a log-structured compaction pipeline.
+- **Incremental snapshots**: `Snapshot::save` serializes the entire world every
+  time. Large worlds make this prohibitively expensive. Stage 3 replaces this
+  with incremental (delta) snapshots via LSM compaction.
+- **Column-level change tracking**: `Changed<T>` is archetype-granular (a single
+  mutation marks the entire column as changed). Incremental snapshots need
+  row-level or page-level dirty tracking.
+
+---
+
+## Stage 3: LSM Tree Storage
+
+**Status: Not started.**
+
+**Goal**: Incremental persistence. Only write what changed, not the entire world.
+
+### The problem
+
+Full-world snapshots are O(world size) regardless of how much changed. A world
+with 10M entities and 1KB average row size is ~10 GB. Snapshotting 10 GB to disk
+every checkpoint is unsustainable. We need persistence cost proportional to the
+*mutation rate*, not the *world size*.
+
+This is also the **128 TiB ceiling** that plagues cloud databases. Many claim
+"unlimited storage" but monolithic snapshot save/restore at that scale takes
+5–6 hours. The ceiling isn't storage capacity — it's recovery time. If your
+recovery procedure is O(total data), your architecture has a hard upper bound
+no matter how much disk you provision. LSM breaks this ceiling by making
+recovery O(delta since last checkpoint): load the baseline from sorted runs,
+replay the WAL tail. Recovery time scales with *mutation rate*, not *world size*.
+
+The ambition here — following TigerBeetle's lead — is a system with no
+theoretical upper bound on storage. Petabytes of state, if you can afford the
+RAM and NVMe to hold the working set, with object storage for the rest.
+
+### Architecture: LSM over archetypes
+
+The LSM tree operates on **archetype pages**, not individual rows. This preserves
+column-oriented access patterns and SIMD alignment.
+
+```
+ ┌─────────────────────────────────────────────────┐
+ │  L0: MemTable (current World archetypes)        │
+ │  - Hot data, fully mutable, in-memory only      │
+ │  - This IS the existing World storage            │
+ └────────────────────┬────────────────────────────┘
+                      │ flush (dirty pages only)
+ ┌────────────────────▼────────────────────────────┐
+ │  L1: Immutable sorted runs (memory-mapped)      │
+ │  - Recent flushes, still in main memory         │
+ │  - Sorted by (archetype_id, page_id)            │
+ │  - Read via mmap, zero-copy access              │
+ └────────────────────┬────────────────────────────┘
+                      │ compaction (merge sorted runs)
+ ┌────────────────────▼────────────────────────────┐
+ │  L2: Compacted sorted runs (NVMe)               │
+ │  - Merged from L1, larger files, fewer seeks    │
+ │  - Page-aligned for O_DIRECT / io_uring         │
+ └────────────────────┬────────────────────────────┘
+                      │ major compaction
+ ┌────────────────────▼────────────────────────────┐
+ │  L3: Archive (NVMe / object storage)            │
+ │  - Full compacted baseline                      │
+ │  - Input for snapshot restore                   │
+ └─────────────────────────────────────────────────┘
+```
+
+### Key design decisions
+
+**Unit of flush: the dirty page, not the row.**
+BlobVec columns are already page-aligned (64-byte columns, mmap-backed via
+SlabPool). A "page" in the LSM is a contiguous range of rows within one
+archetype column. Dirty tracking is a bitset per page. Flush writes only dirty
+pages to L1.
+
+**WAL remains the source of truth for crash recovery.**
+The LSM is not a replacement for the WAL. The WAL captures the logical mutations
+(insert, update, remove, spawn, despawn). The LSM captures the physical state
+(page images). On crash, replay the WAL from the last L1 flush point. On clean
+shutdown, flush all dirty pages to L1 and discard the WAL.
+
+**Compaction is archetype-aware.**
+L1→L2 compaction merges sorted runs for the same archetype. Cross-archetype
+compaction is never needed because archetypes are independent column groups.
+This means compaction parallelizes trivially across archetypes.
+
+**Reads never touch L1/L2/L3 in normal operation.**
+L0 (the live World) always has the latest data. LSM levels are only read during
+recovery (snapshot restore) and cold-start (load world from L2/L3). This is a
+critical difference from a traditional LSM database where reads must merge
+across levels. In Minkowski, the in-memory World IS the merged view.
+
+### New components
+
+| Component | Purpose |
+|---|---|
+| `DirtyPageTracker` | Per-column bitset tracking which pages were mutated since last flush |
+| `SortedRun` | Immutable file containing sorted archetype page images, with a sparse index for page lookup |
+| `FlushWriter` | Writes dirty pages from L0 → L1 as a new sorted run |
+| `Compactor` | Merges L1 sorted runs → L2, L2 → L3. Archetype-parallel. |
+| `LsmManifest` | Tracks which sorted runs exist at each level, their archetype coverage, and sequence ranges |
+| `LsmRecovery` | Restores World from L2/L3 baseline + L1 delta + WAL tail |
+
+### Dependencies on existing infrastructure
+
+- `SlabPool` page alignment → natural page boundary for dirty tracking
+- `BlobVec::changed_tick` → drives dirty detection (but needs page granularity)
+- `CrcProof` → gates the zero-copy read path from mmap'd sorted runs
+- `CodecRegistry` → sorted runs use the same serialization as WAL/snapshots
+
+### Open questions
+
+1. **Page size**: 4 KB (NVMe-aligned) or 64 KB (fewer metadata entries)?
+   TigerBeetle uses 64 KB. Larger pages reduce compaction metadata but waste
+   space for sparse archetypes.
+
+2. **Compaction scheduling**: background thread vs. cooperative (compact during
+   idle frames)? Game loops want deterministic frame times; background compaction
+   can spike I/O. Cooperative compaction bounds I/O per frame but extends total
+   compaction time.
+
+3. **Archetype migration during compaction**: if an entity moves between
+   archetypes (insert/remove component), the old archetype page is dirty and the
+   new one is dirty. Compaction must handle tombstones. Does the sorted run
+   store tombstones explicitly, or is "page not present" sufficient?
+
+4. **Bloom filters**: traditional LSMs use bloom filters to avoid reading levels
+   that don't contain a key. Our "reads never touch L1+" property may make this
+   unnecessary for normal operation, but recovery-time reads would benefit.
+
+---
+
+## Stage 4: Replicated State Machine (RSM)
+
+**Status: Not started. Prerequisites: Stage 3 (efficient state transfer for new replicas).**
+
+**Goal**: Fault tolerance. The world survives machine failure.
+
+### The insight
+
+Minkowski already has the two hardest prerequisites for RSM:
+
+1. **Deterministic execution**: the reducer determinism rule (no RNG, no
+   HashMap iteration, no system time, no I/O) means two replicas processing
+   the same mutation log produce identical state.
+
+2. **Ordered mutation log**: `EnumChangeSet` is an ordered mutation log.
+   `Durable<S>` already writes this log to a WAL. RSM extends this from
+   "write to local disk" to "replicate to quorum of machines."
+
+### Architecture
+
+```
+ Client
+   │
+   ▼
+ ┌─────────┐    log replication    ┌─────────┐    ┌─────────┐
+ │ Leader  │ ──────────────────▶   │Follower │    │Follower │
+ │         │                       │  (hot   │    │  (hot   │
+ │ World   │                       │ standby)│    │ standby)│
+ │ WAL     │                       │ World   │    │ World   │
+ │ LSM     │                       │ WAL     │    │ WAL     │
+ └─────────┘                       └─────────┘    └─────────┘
+```
+
+All mutations go through the leader. The leader appends to its local WAL and
+replicates the log entry to followers. Once a quorum acknowledges, the mutation
+is committed. Followers apply mutations in log order — deterministic execution
+guarantees convergence.
+
+### Consensus protocol
+
+**Viewstamped Replication (VR)** over Raft. Rationale:
+
+- VR is conceptually simpler (no log compaction, no snapshots-as-part-of-consensus)
+- TigerBeetle chose VR for the same reasons
+- The Minkowski WAL already has sequence numbers — these become VR operation numbers
+- Leader election uses view numbers, not term+index pairs
+
+### Key design decisions
+
+**Log entry = `ReplicationBatch`.**
+The existing `ReplicationBatch` is already the transport-agnostic wire format.
+RSM replication sends the same bytes that `WalCursor` reads. No new
+serialization format needed.
+
+**State transfer uses LSM sorted runs, not full snapshots.**
+When a new replica joins or a follower falls too far behind, it needs the full
+world state. Instead of a monolithic snapshot (Stage 2), send the LSM L2/L3
+sorted runs + L1 delta + WAL tail. This is incremental — if the follower has
+a recent baseline, only the delta needs to transfer.
+
+**Reads can go to any replica.**
+`World::query_raw(&self)` (the shared-ref read path) requires no mutation. Any
+replica can serve reads. This is free linearizable reads for queries that don't
+need the absolute latest write — configurable staleness bound.
+
+### New components
+
+| Component | Purpose |
+|---|---|
+| `ReplicaGroup` | Manages the set of replicas, their states, and the consensus protocol |
+| `LogReplicator` | Sends `ReplicationBatch` entries from leader to followers |
+| `ConsensusState` | VR protocol state: view number, op number, commit number, log |
+| `StateTransfer` | Sends LSM sorted runs to new/lagging replicas |
+| `LeaderElection` | VR view change protocol |
+
+### Dependencies on existing infrastructure
+
+- `ReplicationBatch` → already the wire format
+- `WalCursor` → followers use cursor to track replication position
+- `apply_batch` → followers apply mutations identically to leader
+- `CodecRegistry` → all replicas must agree on component schemas (version negotiation)
+- Reducer determinism → guarantees replicas converge
+
+### Open questions
+
+1. **Network transport**: TCP, QUIC, or Unix domain sockets for local clusters?
+   TigerBeetle uses io_uring + custom protocol. Minkowski could start with TCP
+   and move to io_uring later.
+
+2. **Client interaction model**: do clients send mutation requests to the leader
+   (command pattern) or send `ReplicationBatch` directly? The command pattern is
+   simpler but adds a serialization hop.
+
+3. **Read staleness**: how stale can follower reads be? Options: linearizable
+   (forward reads to leader), bounded staleness (follower serves if within N
+   ops), eventual (any follower, any time).
+
+4. **Multi-world**: can one replica group host multiple Worlds? Useful for
+   game servers with multiple rooms/instances. Each World is an independent
+   state machine sharing the same consensus group.
+
+---
+
+## Stage 5: Horizontal Scaling (Sharding)
+
+**Status: Not started. Prerequisites: Stage 4 (each shard is an RSM).**
+
+**Goal**: Scale beyond one machine's memory and CPU.
+
+### The problem
+
+A single RSM group handles ~1 machine's worth of data and compute. When the
+world grows beyond that, we need to partition entities across machines. Each
+partition (shard) is its own RSM group with its own leader and followers.
+
+### The ECS advantage
+
+Entities are naturally partitionable:
+
+- Entity IDs are opaque 64-bit handles with no inherent ordering or locality
+- Components are per-entity — no cross-entity referential integrity
+- Archetypes are independent column groups — an archetype can live entirely on one shard
+
+This is structurally simpler than sharding a relational database where foreign
+keys create cross-shard dependencies.
+
+### Sharding strategy
+
+**Phase 1: Hash-based sharding by entity ID.**
+
+```
+shard_id = entity.index() % num_shards
+```
+
+Simple, uniform distribution, no hotspots. Each shard owns a disjoint subset of
+entity indices. Archetype structure is replicated across shards (schema is
+global, data is partitioned).
+
+**Phase 2: Range-based sharding by archetype.**
+
+Entities with the same archetype tend to be queried together. Group entities by
+archetype and assign archetype ranges to shards. This optimizes query locality —
+a query that scans one archetype hits one shard, not all shards.
+
+**Phase 3: Adaptive sharding.**
+
+Monitor query patterns and rebalance shards to minimize cross-shard queries.
+Entity migration between shards uses the same archetype migration machinery
+(spawn on target shard, despawn on source shard, update routing table).
+
+### Cross-shard operations
+
+This is where Amdahl's law bites.
+
+| Operation | Cross-shard cost |
+|---|---|
+| `get(entity)` | Route to owning shard — O(1) lookup in routing table |
+| `query::<(&Pos, &Vel)>()` | Fan out to all shards, merge results — O(shards) |
+| `join()` | Collect entity sets from all shards, intersect — expensive |
+| `spatial_query(within)` | Fan out to shards overlapping the spatial region |
+| `transact` (single entity) | Route to owning shard — no cross-shard coordination |
+| `transact` (multi-entity) | 2PC across owning shards — serialization point |
+
+**The serial fraction**: cross-shard transactions require coordination (2PC or
+deterministic scheduling). As cross-shard transaction rate increases, Amdahl's
+law limits speedup from adding shards. The break-even point depends on the
+workload's locality.
+
+### Key design decisions
+
+**Routing table is a first-class component.**
+A `ShardRouter` maps entity index ranges to shard IDs. All shards hold a copy
+(replicated via the consensus protocol). Entity migration updates the routing
+table atomically.
+
+**Queries are push-down, not pull-up.**
+A scatter-gather query sends the query plan to each shard. Each shard executes
+locally and returns results. The coordinator merges. This avoids shipping raw
+data across the network — only results travel.
+
+**Deterministic scheduling over 2PC.**
+Instead of two-phase commit for cross-shard transactions, use deterministic
+scheduling: all shards agree on the transaction order (via the consensus log),
+then each shard independently executes its portion. No coordination at execution
+time. Calvin/BOHM-style. This eliminates the serial coordination bottleneck of
+2PC at the cost of requiring all shards to process the full log (even entries
+they don't own, to maintain order). TigerBeetle uses this approach.
+
+### New components
+
+| Component | Purpose |
+|---|---|
+| `ShardRouter` | Entity → shard mapping with migration support |
+| `ShardCoordinator` | Scatter-gather query execution across shards |
+| `CrossShardPlanner` | Extends `QueryPlanner` with shard-aware cost model |
+| `EntityMigrator` | Move entities between shards (spawn+despawn+route update) |
+| `DeterministicScheduler` | Order cross-shard transactions via shared log |
+
+### Open questions
+
+1. **Shard-local indexes**: each shard maintains its own `BTreeIndex`/`HashIndex`
+   for local data. Cross-shard index queries require fan-out. Should there be a
+   global index tier?
+
+2. **Archetype schema agreement**: all shards must agree on component types and
+   archetype structure. How is schema evolution coordinated? (CodecRegistry
+   already has stable names — extend with version negotiation.)
+
+3. **Entity migration granularity**: migrate one entity at a time, or batch
+   migrate entire archetypes? Archetype-level migration is more efficient but
+   less flexible.
+
+4. **Spatial sharding**: for spatially-organized worlds (games, simulations),
+   shard by spatial region rather than entity ID. This optimizes spatial queries
+   but creates hotspots when entities cluster.
+
+---
+
+## Stage 6: Separate Storage and Compute
+
+**Status: Not started. Prerequisites: Stage 5 (sharding provides the need).**
+
+**Goal**: Scale storage and compute independently.
+
+### The problem
+
+In Stages 1–5, each node stores its data locally. Storage capacity is limited
+by local disk. Compute capacity is limited by local CPU. They scale together,
+but workloads rarely need both to scale equally. A read-heavy analytical
+workload needs more compute but not more storage. A large-world simulation
+needs more storage but not more compute per entity.
+
+### Architecture
+
+```
+ ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+ │   Compute    │  │   Compute    │  │   Compute    │
+ │   Node 0     │  │   Node 1     │  │   Node 2     │
+ │              │  │              │  │              │
+ │  World (L0)  │  │  World (L0)  │  │  World (L0)  │
+ │  LSM L1      │  │  LSM L1      │  │  LSM L1      │
+ │  (working    │  │  (working    │  │  (working    │
+ │   set cache) │  │   set cache) │  │   set cache) │
+ └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+        │                 │                 │
+        └────────┬────────┴────────┬────────┘
+                 │                 │
+        ┌────────▼─────────────────▼────────┐
+        │        Object Storage             │
+        │        (S3, MinIO, Tigris)        │
+        │                                   │
+        │  LSM L2/L3 sorted runs            │
+        │  WAL segments (archived)          │
+        │  No practical capacity limits     │
+        └───────────────────────────────────┘
+```
+
+### The catch
+
+Object storage has no practical limits on capacity. But you can't process
+transactions from object storage — latency is milliseconds per GET, and there's
+no random write. Transactions need microsecond-latency random access to the
+working set.
+
+This is the fundamental tension that Stage 7 resolves.
+
+### What changes from Stage 5
+
+**Compute nodes become stateless (almost).**
+A compute node holds:
+- L0: the live World (hot working set, in memory)
+- L1: recent dirty pages (local NVMe, acts as a write buffer)
+
+Everything else lives in object storage. If a compute node crashes, another
+node can resume by loading the working set from object storage + replaying the
+WAL tail.
+
+**LSM L2/L3 move to object storage.**
+Compacted sorted runs are uploaded to S3/MinIO. Compute nodes pull them on
+demand (cold start, entity migration, recovery). Once uploaded, local copies
+can be evicted.
+
+**WAL segments are archived to object storage.**
+After a WAL segment is fully replicated and its data is flushed to L1, the
+segment is uploaded to object storage for long-term retention. Local WAL
+retains only the tail needed for crash recovery.
+
+### Key design decisions
+
+**Object storage is append-only.**
+Sorted runs and WAL segments are immutable once written. Updates create new
+sorted runs; compaction merges old runs into new ones and deletes the old.
+This maps naturally to object storage's PUT/GET/DELETE semantics.
+
+**Compute node working set is demand-paged.**
+On cold start, a compute node loads the LSM manifest from object storage,
+then lazily fetches sorted run pages as queries touch them. Hot pages are
+cached in L1 (local NVMe). This is essentially a cooperative page cache
+with object storage as the backing store.
+
+**Schema and routing metadata live in a coordination service.**
+Component schemas, shard routing tables, and LSM manifests are small and
+rarely change. Store them in etcd/FoundationDB/the consensus log. Compute
+nodes subscribe to changes.
+
+### New components
+
+| Component | Purpose |
+|---|---|
+| `ObjectStore` | Abstraction over S3/MinIO/local-fs for sorted run storage |
+| `RemoteLsmManifest` | LSM manifest stored in object storage + coordination service |
+| `PageCache` | Demand-paged cache of sorted run pages from object storage |
+| `WalArchiver` | Uploads sealed WAL segments to object storage |
+| `ComputeNodeBootstrap` | Cold-start sequence: fetch manifest → load working set → replay WAL tail |
+
+### Open questions
+
+1. **Object storage latency hiding**: S3 GET latency is 50–200ms. Can we
+   prefetch pages speculatively based on query patterns? The query planner
+   knows which archetypes a query will touch — could it issue prefetch
+   requests during plan compilation?
+
+2. **Cost model**: object storage charges per GET/PUT. The compaction scheduler
+   must be aware of cost — too-frequent compaction wastes PUT budget, too-rare
+   compaction wastes GET budget (more levels to read through on recovery).
+
+3. **Multi-tenancy**: with compute separated from storage, multiple tenants
+   can share compute nodes with isolated storage namespaces. How does this
+   interact with the shard routing table?
+
+---
+
+## Stage 7: Diagonal Scaling
+
+**Status: Not started. Prerequisites: Stages 3–6.**
+
+**Goal**: Scale everything simultaneously with no architectural ceiling.
+
+### The synthesis
+
+Each previous stage solved one bottleneck but created another:
+
+| Stage | Solved | Created |
+|---|---|---|
+| 3 (LSM) | Snapshot cost proportional to mutations, not world size | Compaction I/O competes with transaction processing |
+| 4 (RSM) | Fault tolerance, durable state | Single-machine throughput ceiling |
+| 5 (Sharding) | Horizontal throughput scaling | Cross-shard coordination (Amdahl) |
+| 6 (Storage/Compute) | Independent scaling, unlimited storage | Object storage latency for working set |
+
+Stage 7 combines all four into a single architecture where:
+
+- **Object storage** provides unlimited capacity (Stage 6)
+- **LSM** provides fast local access to the working set (Stage 3)
+- **RSM** provides consistency and fault tolerance (Stage 4)
+- **Sharding** provides horizontal throughput (Stage 5)
+
+### Architecture
+
+```
+ ┌─────────────────────────────────────────────────────────────────┐
+ │                     Coordination Layer                          │
+ │  Shard routing │ Schema registry │ LSM manifests │ Consensus   │
+ └───────┬─────────────────┬─────────────────┬────────────────────┘
+         │                 │                 │
+ ┌───────▼───────┐ ┌───────▼───────┐ ┌───────▼───────┐
+ │  Shard 0 RSM  │ │  Shard 1 RSM  │ │  Shard N RSM  │
+ │               │ │               │ │               │
+ │  Leader       │ │  Leader       │ │  Leader       │
+ │  ┌─────────┐  │ │  ┌─────────┐  │ │  ┌─────────┐  │
+ │  │World(L0)│  │ │  │World(L0)│  │ │  │World(L0)│  │
+ │  │LSM L1   │  │ │  │LSM L1   │  │ │  │LSM L1   │  │
+ │  └────┬────┘  │ │  └────┬────┘  │ │  └────┬────┘  │
+ │       │       │ │       │       │ │       │       │
+ │  Follower(s)  │ │  Follower(s)  │ │  Follower(s)  │
+ └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
+         │                 │                 │
+         └────────┬────────┴────────┬────────┘
+                  │                 │
+         ┌────────▼─────────────────▼────────┐
+         │        Object Storage             │
+         │  L2/L3 sorted runs (per shard)    │
+         │  Archived WAL segments            │
+         │  LSM manifests (versioned)        │
+         └───────────────────────────────────┘
+```
+
+### How it works
+
+1. **A mutation arrives** at the shard's leader (routed via `ShardRouter`).
+
+2. **Leader replicates the log entry** to its followers via VR consensus.
+   Once a quorum acknowledges, the mutation is committed.
+
+3. **Leader and followers apply the mutation** to their in-memory World (L0).
+   Deterministic execution guarantees all replicas converge.
+
+4. **Dirty pages accumulate in L0.** When the dirty page budget is exceeded,
+   the flush writer writes dirty pages to L1 (local NVMe).
+
+5. **Compaction merges L1 → L2** (local NVMe → local NVMe). When L2 reaches
+   its size budget, **L2 → L3** compaction uploads sorted runs to object storage.
+
+6. **Old sorted runs in object storage are garbage-collected** after major
+   compaction produces a new baseline.
+
+7. **Queries within a shard** execute entirely from L0 (in-memory) — no disk I/O.
+   LSM levels are only read during recovery.
+
+8. **Cross-shard queries** scatter to shard leaders, execute locally, and
+   gather results at the coordinator. The query planner pushes predicates
+   and projections to each shard.
+
+9. **Shard rebalancing** migrates entity ranges between shards. The source
+   shard writes migrating entities to its log; the target shard's leader
+   applies them. The routing table updates atomically via the coordination
+   layer.
+
+10. **Node failure** triggers leader election within the RSM group. The new
+    leader has all committed log entries (VR guarantee). It rebuilds L0 from
+    its local L1 + WAL tail. If L1 is lost (disk failure), it pulls L2/L3
+    from object storage.
+
+### The diagonal
+
+"Diagonal scaling" means scaling both vertically (bigger machines, more memory,
+faster NVMe) and horizontally (more shards, more replicas) simultaneously,
+with object storage as the unbounded backing store. There is no architectural
+ceiling — each axis scales independently:
+
+- **More memory** → larger L0 working set → fewer L1 flushes
+- **Faster NVMe** → faster compaction → lower L1 read amplification
+- **More shards** → higher transaction throughput (up to Amdahl's limit)
+- **More replicas per shard** → higher read throughput, better fault tolerance
+- **Object storage** → unlimited total capacity, pay per GB
+
+### What Minkowski uniquely brings
+
+An ECS engine at Stage 7 has properties that a general-purpose database does not:
+
+1. **Column-oriented storage is native.** LSM sorted runs are already columnar
+   (BlobVec pages). No row-to-column conversion needed.
+
+2. **Entities are partition-friendly.** No foreign keys, no referential integrity
+   across entities. Sharding is structurally clean.
+
+3. **Query plans are push-down ready.** The existing `QueryPlanner` generates
+   execution plans that can be serialized and sent to remote shards.
+
+4. **Deterministic execution is already enforced.** The reducer determinism rule
+   is a cultural and tooling convention, not a runtime check. RSM requires this
+   to be an invariant, not a guideline — Stage 4 must add runtime verification
+   (e.g., hash the mutation output and compare across replicas).
+
+5. **External composition means clean boundaries.** `ReducerRegistry`,
+   `QueryPlanner`, `SpatialIndex` are all external to World. This maps naturally
+   to separate compute-layer services that compose over a shared storage layer.
+
+---
+
+## Sequencing and Dependencies
+
+```
+ Stage 1 ──▶ Stage 2 ──▶ Stage 3 ──▶ Stage 4 ──▶ Stage 5 ──▶ Stage 6 ──▶ Stage 7
+ The Log    Snapshots     LSM         RSM       Sharding    Storage/     Diagonal
+  (done)     (done)                                         Compute
+                           │                        │
+                           │            ┌───────────┘
+                           │            │
+                           ▼            ▼
+                     Stage 3 is    Stage 5 is
+                     prerequisite  prerequisite
+                     for Stage 4   for Stage 6
+                     (state        (sharding
+                     transfer)     creates the
+                                   need to
+                                   separate)
+```
+
+**Stage 3 (LSM) is the critical path.** It blocks Stage 4 (efficient state
+transfer for new replicas) and is the foundation for Stage 6 (object storage
+as LSM backing store). Start here.
+
+**Stages 4 and 5 can partially overlap.** The consensus protocol (Stage 4) can
+be developed and tested with a single shard. Sharding (Stage 5) adds the
+routing and coordination layer on top. But the cross-shard deterministic
+scheduling design should be done upfront — it constrains the consensus protocol.
+
+**Stage 6 is an incremental change to Stage 5.** Once shards have LSM storage,
+moving L2/L3 to object storage is a storage backend swap. The hard part is the
+demand-paged working set and cold-start sequence.
+
+**Stage 7 is not a separate implementation.** It's the emergent result of Stages
+3–6 working together. If each stage is designed with the full architecture in
+mind, Stage 7 is "just" integration and tuning.
+
+---
+
+## Effort Estimates
+
+These are order-of-magnitude estimates, not commitments.
+
+| Stage | Scope | Key risk |
+|---|---|---|
+| Stage 3 | New crate (`minkowski-lsm`), ~5-8 KLOC | Page-level dirty tracking in BlobVec without breaking SIMD alignment |
+| Stage 4 | New crate (`minkowski-consensus`), ~3-5 KLOC | VR protocol correctness (use TLA+ spec or Loom verification) |
+| Stage 5 | New crate (`minkowski-shard`), ~4-6 KLOC | Deterministic cross-shard scheduling without 2PC |
+| Stage 6 | Extend `minkowski-lsm` + new `minkowski-objstore`, ~3-4 KLOC | Object storage latency hiding for cold start |
+| Stage 7 | Integration + tuning, ~2-3 KLOC | Operational complexity (many moving parts) |
+
+---
+
+## References
+
+- [TigerBeetle: The Secret to Scaling Databases (7 Stages)](https://tigerbeetle.com/) — the framework
+- [Viewstamped Replication Revisited](https://pmg.csail.mit.edu/papers/vr-revisited.pdf) — consensus protocol
+- [Calvin: Fast Distributed Transactions for Partitioned Database Systems](http://cs.yale.edu/homes/thomson/publications/calvin-sigmod12.pdf) — deterministic scheduling
+- [LSM-based Storage Techniques: A Survey](https://arxiv.org/abs/1812.07527) — LSM tree design space
+- [The Design and Implementation of a Log-Structured Merge-Tree (LSM-Tree)](https://www.cs.umb.edu/~poneil/lsmtree.pdf) — original LSM paper
