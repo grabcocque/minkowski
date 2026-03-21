@@ -9,11 +9,12 @@
 
 1. [Stage 1: The Log](#stage-1-the-log) ✅
 2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (current)
-3. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage)
-4. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
-5. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
-6. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
-7. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
+3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator)
+4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage)
+5. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
+6. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
+7. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
+8. [Stage 7: Diagonal Scaling](#stage-7-diagonal-scaling)
 
 ---
 
@@ -99,9 +100,61 @@ The WAL and snapshots are properly integrated, not bolted on separately:
 
 ---
 
+## Stage 2.5: SlabPool as the Only Allocator
+
+**Status: Not started. Prerequisite for Stage 3.**
+
+**Goal**: Eliminate `SystemAllocator` — all BlobVec columns must be mmap-backed
+via `SlabPool`. This is a hard prerequisite for every subsequent stage.
+
+### Why this is necessary
+
+Every stage from 3 onwards assumes mmap-backed, page-aligned memory:
+
+| Stage | Assumption |
+|---|---|
+| 3 (LSM) | Dirty page tracking requires knowing page boundaries — `malloc`'d memory has no page structure |
+| 4 (RSM) | io_uring + O_DIRECT requires page-aligned buffers with `RLIMIT_MEMLOCK` |
+| 5 (Sharding) | Entity migration between shards copies page-aligned column slices |
+| 6 (Storage/Compute) | Demand-paged working set maps directly onto mmap pages |
+| 7 (Diagonal) | Object storage sorted runs are page-aligned for zero-copy load |
+
+Today, `WorldBuilder` defaults to `SystemAllocator` unless `memory_budget()` is
+called. This means most worlds in tests, examples, and user code use `malloc`'d
+memory. The `SlabPool` path is opt-in, not default.
+
+### What changes
+
+1. **Remove `SystemAllocator`** as a backing option for `BlobVec` columns.
+   All column storage goes through `SlabPool`.
+
+2. **`World::new()` allocates a default `SlabPool`** with a sensible default
+   budget (e.g., 256 MB). `WorldBuilder::memory_budget()` becomes a way to
+   tune the budget, not to opt into a different allocator.
+
+3. **Tests and examples** that currently use `World::new()` get `SlabPool`
+   automatically. Tests that need small worlds can use a small budget.
+
+4. **Remove the allocator abstraction** — one code path, one allocation model,
+   one set of invariants. This is a simplification, not a complication.
+
+### Migration risk
+
+- **Breaking change**: any user code that constructs `World::new()` will now
+  require `mmap` to succeed. Environments that restrict `mmap` (some containers,
+  WASM) need a plan. Options: (a) WASM gets a `malloc`-backed `SlabPool` shim,
+  (b) WASM is explicitly unsupported for persistent workloads.
+- **Default budget sizing**: too small and users hit `PoolExhausted` unexpectedly;
+  too large and the process reserves address space it never uses (virtual memory
+  is cheap, but `RLIMIT_MEMLOCK` is not).
+- **Miri compatibility**: Miri doesn't support `mmap` syscalls. The Miri test
+  suite (860 tests) will need a mock allocator or `cfg(miri)` fallback.
+
+---
+
 ## Stage 3: LSM Tree Storage
 
-**Status: Not started.**
+**Status: Not started. Prerequisites: Stage 2.5 (SlabPool-only allocation).**
 
 **Goal**: Incremental persistence. Only write what changed, not the entire world.
 
@@ -162,11 +215,8 @@ column-oriented access patterns and SIMD alignment.
 A "page" in the LSM is a contiguous range of rows within one archetype column.
 Dirty tracking is a bitset per page. Flush writes only dirty pages to L1.
 
-Note: BlobVec columns have 64-byte *alignment* (for SIMD), but are not
-page-aligned or mmap-backed by default — `WorldBuilder` falls back to
-`SystemAllocator` unless `memory_budget()` opts into `SlabPool`. Stage 3 will
-need new allocation/layout machinery to ensure columns are backed by
-page-aligned, mmap'd memory suitable for dirty-page tracking and O_DIRECT I/O.
+Stage 2.5 ensures all columns are mmap-backed via `SlabPool`, providing the
+page-aligned memory required for dirty-page tracking and O_DIRECT I/O.
 
 **WAL remains the source of truth for crash recovery.**
 The LSM is not a replacement for the WAL. The WAL captures the logical mutations
@@ -198,7 +248,7 @@ across levels. In Minkowski, the in-memory World IS the merged view.
 
 ### Dependencies on existing infrastructure
 
-- `SlabPool` (when opted into via `WorldBuilder::memory_budget`) → mmap-backed, page-aligned
+- `SlabPool` (mandatory after Stage 2.5) → mmap-backed, page-aligned
 - `BlobVec::changed_tick` (whole-column granularity) → drives dirty detection; needs page-level granularity for efficient flush
 - `CrcProof` → gates the zero-copy read path from mmap'd sorted runs
 - `CodecRegistry` → sorted runs use the same serialization as WAL/snapshots
@@ -293,15 +343,83 @@ commit index, they provide **bounded-staleness reads, not linearizable reads**.
 Linearizable reads require either routing to the leader or a read lease protocol.
 The staleness bound is configurable per query.
 
+**Unified I/O via io_uring (TigerBeetle pattern).**
+Following TigerBeetle's architecture, storage and network I/O should be
+unified into a single io_uring instance. A single `io_uring_enter` syscall
+can: write WAL frames to disk AND send replication packets to followers AND
+poll for client requests. This is not "use async I/O" — it's a fundamentally
+different architecture where storage writes and network sends are siblings in
+the same completion ring.
+
+Key properties:
+- **O_DIRECT + pre-allocated buffers**: bypass the kernel page cache, copy
+  data directly from network buffer → WAL file → state machine. Stage 2.5
+  ensures all columns are `SlabPool`/mmap-backed, but **pinning pages requires
+  `mlock`**, which is currently best-effort (`try_mlockall` falls back to
+  manual page-touch on failure). For io_uring O_DIRECT, pinned memory is
+  mandatory — Stage 4 must make `mlock` a hard requirement, not opt-in.
+  `RLIMIT_MEMLOCK` is only the kernel quota for how much can be locked; it
+  does not pin pages on its own.
+- **Zero-copy WAL write** (aspirational): today's `ReplicationBatch` is a
+  heap-backed `Vec<WalRecord>` that must be serialized via `to_bytes()` and
+  deserialized via `from_bytes()` — `apply_batch` accepts a parsed
+  `&ReplicationBatch`, not raw bytes. True zero-copy (network ring buffer →
+  WAL file → state machine with no decode step) requires a **new flat wire
+  format** where the on-wire representation IS the on-disk representation.
+  This is a Stage 4 deliverable, not an existing capability.
+- **Fixed-size, cache-aligned structures**: Minkowski already has this —
+  `BlobVec` is fixed-layout per component `Layout`, entity IDs are fixed
+  8 bytes, `SlabPool` pre-allocates all memory.
+
+**View changes do NOT drain the I/O ring.**
+This is a critical design constraint learned from TigerBeetle. When a view
+change (leader election) begins:
+
+1. The replica transitions state (e.g., `status=normal` → `status=view_change`)
+2. It **stops submitting new storage requests** for client transactions
+3. It **continues pumping the io_uring event loop** — processing completions
+   and submitting consensus protocol messages (StartViewChange, DoViewChange)
+4. Pending storage writes from the previous view remain in-flight within the
+   kernel/hardware
+
+When late completions arrive after the view change:
+- Check the completion's view ID against the current view
+- If the write is still valid in the new view, mark it as durable
+- If the view change truncated the log, safely discard the stale completion
+
+**Critical caveat: fencing stale DMA writes.**
+"Discarding the stale completion" only discards the *acknowledgement* — the
+bytes may have already hit the disk via DMA before the CQE arrived. If the
+new leader reuses the same WAL offset for a new log entry, the old-view write
+races with the new-view write at the storage level. TigerBeetle solves this
+with **generation-isolated WAL slots**: each slot's header contains the view
+number, and the new leader explicitly overwrites stale slots before reusing
+them. Minkowski's WAL must adopt the same pattern — each WAL frame header
+needs a view field, and recovery must validate the view of every frame against
+the known view history to detect torn writes from view transitions.
+
+The analogy to generational entity IDs still holds: a stale WAL frame is like
+a stale entity handle — the generation (view number in the frame header)
+catches it. But unlike entity handles (which are checked at read time), WAL
+frames are checked at *recovery* time, so the cost of a missed check is
+silent data corruption, not a runtime error.
+
+**Why this matters**: if view changes blocked on draining the ring, failover
+latency would be bounded by the slowest in-flight I/O. A "gray failure" — a
+disk that hasn't crashed but responds in 30 seconds — would hang the election
+for 30 seconds. By decoupling view changes from storage completions, failover
+is bounded by *network* latency (microseconds), not *storage* tail latency.
+
 ### New components
 
 | Component | Purpose |
 |---|---|
+| `IoRing` | Unified io_uring event loop for storage + network I/O (with kqueue/epoll fallback) |
 | `ReplicaGroup` | Manages the set of replicas, their states, and the consensus protocol |
-| `LogReplicator` | Sends `ReplicationBatch` entries from leader to followers |
+| `LogReplicator` | Sends `ReplicationBatch` entries from leader to followers via `IoRing` |
 | `ConsensusState` | VR protocol state: view number, op number, commit number, log |
 | `StateTransfer` | Sends LSM sorted runs to new/lagging replicas |
-| `LeaderElection` | VR view change protocol |
+| `LeaderElection` | VR view change protocol (non-blocking — does not drain I/O ring) |
 
 ### Dependencies on existing infrastructure
 
@@ -313,9 +431,10 @@ The staleness bound is configurable per query.
 
 ### Open questions
 
-1. **Network transport**: TCP, QUIC, or Unix domain sockets for local clusters?
-   TigerBeetle uses io_uring + custom protocol. Minkowski could start with TCP
-   and move to io_uring later.
+1. **io_uring bootstrapping**: io_uring requires Linux 5.6+. What's the
+   fallback for macOS/Windows development? Options: epoll fallback (TigerBeetle
+   uses kqueue on macOS), or require Linux for production with a simulated I/O
+   layer for dev/test.
 
 2. **Client interaction model**: do clients send mutation requests to the leader
    (command pattern) or send `ReplicationBatch` directly? The command pattern is
@@ -702,25 +821,30 @@ An ECS engine at Stage 7 has properties that a general-purpose database does not
 ## Sequencing and Dependencies
 
 ```
- Stage 1 ──▶ Stage 2 ──▶ Stage 3 ──▶ Stage 4 ──▶ Stage 5 ──▶ Stage 6 ──▶ Stage 7
- The Log    Snapshots     LSM         RSM       Sharding    Storage/     Diagonal
-  (done)     (done)                                         Compute
-                           │                        │
-                           │            ┌───────────┘
-                           │            │
-                           ▼            ▼
-                     Stage 3 is    Stage 5 is
-                     prerequisite  prerequisite
-                     for Stage 4   for Stage 6
-                     (state        (sharding
-                     transfer)     creates the
-                                   need to
-                                   separate)
+ Stage 1 ──▶ Stage 2 ──▶ Stage 2.5 ──▶ Stage 3 ──▶ Stage 4 ──▶ Stage 5 ──▶ Stage 6 ──▶ Stage 7
+ The Log    Snapshots   SlabPool-     LSM         RSM       Sharding    Storage/     Diagonal
+  (done)     (done)      only                                           Compute
+                                       │                        │
+                                       │            ┌───────────┘
+                                       │            │
+                                       ▼            ▼
+                                 Stage 3 is    Stage 5 is
+                                 prerequisite  prerequisite
+                                 for Stage 4   for Stage 6
+                                 (state        (sharding
+                                 transfer)     creates the
+                                               need to
+                                               separate)
 ```
+
+**Stage 2.5 (SlabPool-only) is the immediate next step.** It's a prerequisite
+for Stage 3 — LSM dirty-page tracking requires mmap-backed, page-aligned
+columns. This is a breaking change that removes `SystemAllocator`, so do it
+first while the user base is small.
 
 **Stage 3 (LSM) is the critical path.** It blocks Stage 4 (efficient state
 transfer for new replicas) and is the foundation for Stage 6 (object storage
-as LSM backing store). Start here.
+as LSM backing store).
 
 **Stages 4 and 5 can partially overlap.** The consensus protocol (Stage 4) can
 be developed and tested with a single shard. Sharding (Stage 5) adds the
