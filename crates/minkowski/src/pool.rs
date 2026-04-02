@@ -120,13 +120,13 @@ pub(crate) type SharedPool = Arc<dyn PoolAllocator>;
 #[cfg(loom)]
 pub(crate) type SharedPool = Arc<Box<dyn PoolAllocator>>;
 
-/// Try to create the default mmap-backed pool (256 MiB, demand-paged, no hugepages).
+/// Try to create the default mmap-backed pool (256 MiB, demand-paged).
 ///
 /// Returns `Err(PoolExhausted)` if the mmap allocation fails (e.g., restricted
 /// container environment).
 #[allow(dead_code)]
-pub(crate) fn try_default_pool() -> Result<SharedPool, PoolExhausted> {
-    let pool = SlabPool::new(DEFAULT_POOL_BUDGET, HugePages::Off, false)?;
+pub(crate) fn try_default_pool(hugepages: HugePages) -> Result<SharedPool, PoolExhausted> {
+    let pool = SlabPool::new(DEFAULT_POOL_BUDGET, hugepages, false)?;
     Ok(into_shared(pool))
 }
 
@@ -136,7 +136,8 @@ pub(crate) fn try_default_pool() -> Result<SharedPool, PoolExhausted> {
 /// caller can handle the error (e.g., `WorldBuilder::build()`).
 #[allow(dead_code)]
 pub(crate) fn default_pool() -> SharedPool {
-    try_default_pool().expect("failed to allocate default 256 MiB memory pool via mmap")
+    try_default_pool(HugePages::default())
+        .expect("failed to allocate default 256 MiB memory pool via mmap")
 }
 
 /// Wrap a concrete allocator into a `SharedPool`.

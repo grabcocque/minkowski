@@ -2040,7 +2040,7 @@ impl WorldBuilder {
                 let slab = SlabPool::new(bytes, self.hugepages, true)?;
                 crate::pool::into_shared(slab)
             }
-            None => crate::pool::try_default_pool()?,
+            None => crate::pool::try_default_pool(self.hugepages)?,
         };
         Ok(World::new_with_pool(pool))
     }
