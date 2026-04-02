@@ -140,12 +140,14 @@ impl Iterator for DirtyPageIter<'_> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining: u32 = self.current_word.count_ones()
-            + self.bits[self.word_idx.saturating_add(1)..]
-                .iter()
-                .map(|w| w.count_ones())
-                .sum::<u32>();
-        let r = remaining as usize;
+        let tail_ones: u32 = self
+            .bits
+            .get(self.word_idx.wrapping_add(1)..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|w| w.count_ones())
+            .sum();
+        let r = (self.current_word.count_ones() + tail_ones) as usize;
         (r, Some(r))
     }
 }
@@ -293,5 +295,27 @@ mod tests {
         t.mark_page(5);
         t.mark_page(5);
         assert_eq!(t.dirty_count(), 1);
+    }
+
+    #[test]
+    fn size_hint_empty_tracker() {
+        let t = DirtyPageTracker::new();
+        let iter = t.dirty_pages();
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    #[test]
+    fn size_hint_after_exhaustion() {
+        let mut t = DirtyPageTracker::new();
+        t.mark_page(0);
+        let mut iter = t.dirty_pages();
+        assert_eq!(iter.len(), 1);
+        assert_eq!(iter.next(), Some(0));
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        // Calling len/size_hint again after exhaustion must not panic.
+        assert_eq!(iter.len(), 0);
     }
 }
