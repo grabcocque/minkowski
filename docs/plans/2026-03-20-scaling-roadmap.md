@@ -239,7 +239,8 @@ across levels. In Minkowski, the in-memory World IS the merged view.
 
 | Component | Purpose |
 |---|---|
-| `DirtyPageTracker` | Per-column bitset tracking which pages were mutated since last flush |
+| `DirtyPageTracker` | Per-column bitset tracking which pages were mutated since last flush (**done** — `storage::dirty_pages`) |
+| `BlockedBloomFilter` | Cache-line-blocked bloom filter for recovery-time level lookups (see design below) |
 | `SortedRun` | Immutable file containing sorted archetype page images, with a sparse index for page lookup |
 | `FlushWriter` | Writes dirty pages from L0 → L1 as a new sorted run |
 | `Compactor` | Merges L1 sorted runs → L2, L2 → L3. Archetype-parallel. |
@@ -249,7 +250,7 @@ across levels. In Minkowski, the in-memory World IS the merged view.
 ### Dependencies on existing infrastructure
 
 - `SlabPool` (mandatory after Stage 2.5) → mmap-backed, page-aligned
-- `BlobVec::changed_tick` (whole-column granularity) → drives dirty detection; needs page-level granularity for efficient flush
+- `DirtyPageTracker` (**done**) → per-column page-level dirty bitset (256 rows/page), wired into all BlobVec mutation paths
 - `CrcProof` → gates the zero-copy read path from mmap'd sorted runs
 - `CodecRegistry` → sorted runs use the same serialization as WAL/snapshots
 
@@ -269,9 +270,52 @@ across levels. In Minkowski, the in-memory World IS the merged view.
    new one is dirty. Compaction must handle tombstones. Does the sorted run
    store tombstones explicitly, or is "page not present" sufficient?
 
-4. **Bloom filters**: traditional LSMs use bloom filters to avoid reading levels
+4. **Bloom filters**: ~~traditional LSMs use bloom filters to avoid reading levels
    that don't contain a key. Our "reads never touch L1+" property may make this
-   unnecessary for normal operation, but recovery-time reads would benefit.
+   unnecessary for normal operation, but recovery-time reads would benefit.~~
+   **Resolved**: `BlockedBloomFilter` promoted to a Stage 3 component. Recovery
+   reads (cold-start, replica catch-up) must probe L1/L2/L3 sorted runs to find
+   which level holds a given page — without a filter this is one I/O per level.
+   See design section below.
+
+### BlockedBloomFilter design
+
+A **Blocked Bloom Filter** (also called a Cache-line Bloom Filter) partitions the
+bit array into 64-byte blocks aligned to cache lines. Each key hashes to exactly
+one block, then sets/checks *k* bits within that block. This guarantees **one
+cache miss per probe** regardless of *k*, vs. up to *k* misses in a standard
+Bloom filter.
+
+**Block layout**: `#[repr(C, align(64))] struct Block { words: [u64; 8] }` — one
+512-bit block per cache line. 8 hash functions, one per u64 word (bit position
+0..63 within each word). SIMD-friendly: the compiler auto-vectorizes the 8-word
+AND+compare via AVX2/NEON with `target-cpu=native`.
+
+**Hash scheme** (Kirsch-Mitzenmacher double-hashing):
+- `h1 = splitmix64(key)` → block index (`h1 % num_blocks`)
+- `h2 = splitmix64(h1)` → 8 bit positions extracted as `(h2 >> (i*6)) & 0x3F`
+  for `i` in 0..8, one per word
+
+**Sizing**: ~10 bits per expected key → ~1% false-positive rate. For *N* keys:
+`num_blocks = ceil(10 * N / 512)`. With 8 hashes in a 512-bit block and ~51
+keys per block on average, theoretical FPR ≈ 0.84%.
+
+**Allocation**: statically allocated from `SlabPool` at filter construction.
+No runtime growth — the filter is sized once for the expected key count. Fits
+the pool's fixed-budget model and avoids allocation failures during hot paths.
+
+**SIMD optimization**: the `contains` hot path is a tight loop over 8 u64
+words — `block.words[i] & mask[i] == mask[i]` for all *i*. With
+`#[repr(align(64))]` and `target-cpu=native`, LLVM emits two 256-bit
+`vpand`+`vpcmpeq` pairs on AVX2 or equivalent NEON instructions on aarch64.
+Short-circuit on first mismatch in the scalar fallback.
+
+**Integration points**:
+- One filter per sorted run (attached to `SortedRun`)
+- Filter keys are `(ArchetypeId, page_index)` pairs packed as u64
+- `LsmRecovery` probes filters top-down (L1 → L2 → L3) to skip levels
+- Filters are serialized inline in the sorted run footer (small: ~1.25 bytes/key)
+- `Compactor` rebuilds filters when merging runs (bulk insert, no incremental)
 
 ---
 
