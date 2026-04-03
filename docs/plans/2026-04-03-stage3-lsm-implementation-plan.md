@@ -73,7 +73,7 @@ Get the format right first; optimize later.
 │  - sparse_index_offset: u64                  │
 │  - bloom_filter_offset: u64 (0 = absent)     │
 │  - total_crc32: u32 (full-file checksum)     │
-│  - reserved: [u8; 40]                        │
+│  - reserved: [u8; 44]                        │
 └──────────────────────────────────────────────┘
 ```
 
