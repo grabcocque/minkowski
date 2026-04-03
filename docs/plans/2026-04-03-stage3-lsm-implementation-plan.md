@@ -58,7 +58,7 @@ Get the format right first; optimize later.
 │  - sequence_lo: u64 (WAL sequence range)     │
 │  - sequence_hi: u64                          │
 │  - crc32: u32 (header checksum)              │
-│  - reserved: [u8; 12]                        │
+│  - reserved: [u8; 20]                        │
 ├──────────────────────────────────────────────┤
 │  Page images (sorted by archetype_id, then   │
 │  page_index within archetype)                │
