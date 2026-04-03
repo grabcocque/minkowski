@@ -291,17 +291,19 @@ Bloom filter.
 0..63 within each word). SIMD-friendly: the compiler auto-vectorizes the 8-word
 AND+compare via AVX2/NEON with `target-cpu=native`.
 
-**Hash scheme** (enhanced Kirsch-Mitzenmacher double-hashing):
-- `h1 = splitmix64(key)` → block index (`h1 % num_blocks`)
-- `h2 = splitmix64(h1)` → base offset for bit position generation
-- Bit position for word `i`: `g_i = h2 + i·h2 + i·(i+1)/2` (mod 64)
-  for `i` in 0..8, one per word
+**Hash scheme** (enhanced double-hashing with per-word entropy):
+- `h1 = splitmix64(key ^ seed)` → block index (`h1 % num_blocks`)
+- `h2 = splitmix64(h1)` → bit positions for words 0–7
+- `h3 = splitmix64(h2)` → independent perturbation for per-word mixing
+- Bit position for word `i`: `bit_i = ((h2 >> (i*6)) ^ (h3 >> ((7-i)*6))) & 0x3F`
 
-The quadratic correction term `i·(i+1)/2` (triangular numbers: 0, 1, 3, 6,
-10, 15, 21, 28) breaks the linearity of standard double hashing, eliminating
-secondary clustering where keys with similar h1/h2 values follow identical
-probe sequences. This is the same enhanced scheme used by Google Guava and
-Apache Lucene. The extra addition is negligible cost vs. memory access.
+Each word's bit position is derived from two independent 6-bit slices — one
+from `h2` at offset `i*6` and one from `h3` at the mirror offset `(7-i)*6`.
+XOR-combining them doubles the effective entropy per position (12 bits reduced
+to 6) and ensures every word can reach all 64 bit positions uniformly. This
+avoids the pitfall of standard enhanced double hashing (`g_i = h1 + i·h2 +
+i·(i+1)/2 mod m`) which, when applied mod 64 per word, collapses all entropy
+to `h2 % 64` and restricts reachable positions for words with even multipliers.
 
 **Sizing**: ~10 bits per expected key → ~1% false-positive rate. For *N* keys:
 `num_blocks = ceil(10 * N / 512)`. With 8 hashes in a 512-bit block and ~51
