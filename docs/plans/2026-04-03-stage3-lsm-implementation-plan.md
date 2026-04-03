@@ -277,7 +277,11 @@ pub struct BlockedBloomFilter {
 }
 ```
 
-- **Hash**: Kirsch-Mitzenmacher double-hashing via `splitmix64`
+- **Hash**: Enhanced Kirsch-Mitzenmacher double-hashing via `splitmix64`.
+  `h1 = splitmix64(key)` selects the block; `h2 = splitmix64(h1)` generates
+  bit positions via `g_i = h2 + i·h2 + i·(i+1)/2` (mod 64). The quadratic
+  correction term `i·(i+1)/2` breaks the linearity of standard double hashing,
+  eliminating secondary clustering (same scheme as Google Guava / Apache Lucene).
 - **Key**: `(ArchetypeId, page_index)` packed as `u64`
 - **Sizing**: 10 bits/key → ~0.84% FPR
 - **SIMD**: `#[repr(align(64))]` enables AVX2 `vpand`+`vpcmpeq` auto-vectorization
