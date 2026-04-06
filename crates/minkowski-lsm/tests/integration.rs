@@ -62,6 +62,7 @@ fn round_trip_single_archetype() {
     for entry in schema.entries() {
         let page = reader
             .get_page(0, entry.slot, 0)
+            .expect("get_page should not error")
             .expect("page must exist for slot");
         assert_eq!(page.header.row_count, 5);
 
@@ -87,6 +88,7 @@ fn round_trip_single_archetype() {
     // Check entity page.
     let entity_page = reader
         .get_page(0, ENTITY_SLOT, 0)
+        .expect("get_page should not error")
         .expect("entity page must exist");
     assert_eq!(entity_page.header.row_count, 5);
 
@@ -113,7 +115,10 @@ fn round_trip_partial_page() {
     assert_eq!(schema.len(), 1);
 
     let slot = schema.slot_for(std::any::type_name::<Pos>()).unwrap();
-    let page = reader.get_page(0, slot, 0).expect("page must exist");
+    let page = reader
+        .get_page(0, slot, 0)
+        .expect("get_page should not error")
+        .expect("page must exist");
 
     // Verify row count.
     assert_eq!(page.header.row_count, 100);
@@ -194,7 +199,7 @@ fn multi_archetype_flush() {
     // Scan all possible arch_ids for entity pages.
     let mut found_arch_ids: Vec<u16> = Vec::new();
     for arch_id in 0..world.archetype_count() as u16 {
-        if reader.get_page(arch_id, ENTITY_SLOT, 0).is_some() {
+        if reader.get_page(arch_id, ENTITY_SLOT, 0).unwrap().is_some() {
             found_arch_ids.push(arch_id);
         }
     }
@@ -271,16 +276,24 @@ fn crc_corruption_detected() {
             // File opened — validate all page CRCs; at least one must fail.
             let mut found_corruption = false;
             for entry in reader.schema().entries() {
-                if let Some(page) = reader.get_page(0, entry.slot, 0)
-                    && reader.validate_page_crc(&page).is_err()
-                {
-                    found_corruption = true;
+                match reader.get_page(0, entry.slot, 0) {
+                    Ok(Some(page)) if reader.validate_page_crc(&page).is_err() => {
+                        found_corruption = true;
+                    }
+                    Err(_) => {
+                        found_corruption = true;
+                    }
+                    _ => {}
                 }
             }
-            if let Some(entity_page) = reader.get_page(0, ENTITY_SLOT, 0)
-                && reader.validate_page_crc(&entity_page).is_err()
-            {
-                found_corruption = true;
+            match reader.get_page(0, ENTITY_SLOT, 0) {
+                Ok(Some(entity_page)) if reader.validate_page_crc(&entity_page).is_err() => {
+                    found_corruption = true;
+                }
+                Err(_) => {
+                    found_corruption = true;
+                }
+                _ => {}
             }
             assert!(
                 found_corruption,
@@ -354,6 +367,7 @@ fn sparse_index_finds_all_pages() {
     for page_index in 0..expected_pages {
         let page = reader
             .get_page(0, pos_slot, page_index as u16)
+            .unwrap_or_else(|e| panic!("get_page error: {e}"))
             .unwrap_or_else(|| panic!("component page {page_index} must exist"));
 
         let expected_rows = if page_index < expected_pages - 1 {
@@ -373,6 +387,7 @@ fn sparse_index_finds_all_pages() {
     for page_index in 0..expected_pages {
         let page = reader
             .get_page(0, ENTITY_SLOT, page_index as u16)
+            .unwrap_or_else(|e| panic!("get_page error: {e}"))
             .unwrap_or_else(|| panic!("entity page {page_index} must exist"));
         reader.validate_page_crc(&page).unwrap();
     }
@@ -381,6 +396,7 @@ fn sparse_index_finds_all_pages() {
     assert!(
         reader
             .get_page(0, pos_slot, expected_pages as u16)
+            .unwrap()
             .is_none(),
         "no page beyond the expected count"
     );
@@ -400,6 +416,7 @@ fn entity_pages_match_world() {
 
     let entity_page = reader
         .get_page(0, ENTITY_SLOT, 0)
+        .expect("get_page should not error")
         .expect("entity page must exist");
     assert_eq!(entity_page.header.row_count, 20);
 
@@ -416,4 +433,44 @@ fn entity_pages_match_world() {
             "entity bits mismatch at index {i}"
         );
     }
+}
+
+#[test]
+fn zst_component_round_trip() {
+    #[derive(Clone, Copy)]
+    struct Marker;
+
+    let mut world = World::new();
+    for _ in 0..5 {
+        world.spawn((Marker,));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = flush(&world, (0, 0), dir.path()).unwrap().unwrap();
+    let reader = SortedRunReader::open(&path).unwrap();
+
+    // Schema should have one entry for the ZST component.
+    assert_eq!(reader.schema().len(), 1);
+    let entry = &reader.schema().entries()[0];
+    assert_eq!(entry.item_size, 0, "ZST component should have item_size 0");
+
+    // ZST page should exist with row_count=5 but empty data region.
+    let page = reader
+        .get_page(0, entry.slot, 0)
+        .expect("get_page should not error")
+        .expect("ZST page must exist");
+    assert_eq!(page.header.row_count, 5);
+    assert!(
+        page.data.is_empty(),
+        "ZST page data should be empty (0 * PAGE_SIZE = 0 bytes)"
+    );
+
+    // Entity page should also exist.
+    let entity_page = reader
+        .get_page(0, ENTITY_SLOT, 0)
+        .expect("get_page should not error")
+        .expect("entity page must exist");
+    assert_eq!(entity_page.header.row_count, 5);
+
+    reader.validate_page_crc(&page).unwrap();
+    reader.validate_page_crc(&entity_page).unwrap();
 }

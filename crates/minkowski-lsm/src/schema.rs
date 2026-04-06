@@ -28,7 +28,7 @@ impl SchemaSection {
     /// Sorts by name lexicographically and assigns sequential slot indices
     /// starting from 0.  The entity pseudo-column (`ENTITY_SLOT = 0xFFFF`) is
     /// NOT included — callers must handle it separately.
-    pub fn from_components(components: &[(String, Layout)]) -> Self {
+    pub fn from_components(components: &[(String, Layout)]) -> Result<Self, LsmError> {
         // Deduplicate by name (take the first layout seen for a given name).
         let mut seen: Vec<(String, Layout)> = Vec::with_capacity(components.len());
         for (name, layout) in components {
@@ -44,12 +44,18 @@ impl SchemaSection {
         let mut name_to_slot = HashMap::with_capacity(seen.len());
 
         for (slot_idx, (name, layout)) in seen.into_iter().enumerate() {
-            let slot = slot_idx as u16;
+            let slot = u16::try_from(slot_idx).map_err(|_| {
+                LsmError::Format(format!(
+                    "too many components: slot index {slot_idx} exceeds u16"
+                ))
+            })?;
             // Slots must not collide with the reserved entity pseudo-column.
-            assert!(
-                slot != ENTITY_SLOT,
-                "too many components: slot index overflowed into ENTITY_SLOT (0xFFFF)"
-            );
+            if slot == ENTITY_SLOT {
+                return Err(LsmError::Format(
+                    "too many components: slot index overflowed into ENTITY_SLOT (0xFFFF)"
+                        .to_owned(),
+                ));
+            }
             name_to_slot.insert(name.clone(), slot);
             entries.push(SchemaEntry {
                 slot,
@@ -59,10 +65,10 @@ impl SchemaSection {
             });
         }
 
-        Self {
+        Ok(Self {
             entries,
             name_to_slot,
-        }
+        })
     }
 
     /// Look up slot index by component name.
@@ -110,11 +116,11 @@ impl SchemaSection {
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
             let name_len = name_bytes.len();
-            assert!(
-                u16::try_from(name_len).is_ok(),
-                "component name too long: {} bytes",
-                name_len
-            );
+            if u16::try_from(name_len).is_err() {
+                return Err(LsmError::Format(format!(
+                    "component name too long: {name_len} bytes exceeds u16"
+                )));
+            }
 
             writer.write_all(&entry.slot.to_le_bytes())?;
             writer.write_all(&(name_len as u16).to_le_bytes())?;
@@ -218,6 +224,38 @@ impl SchemaSection {
             });
         }
 
+        // Validate invariants on parsed entries.
+        for (i, entry) in entries.iter().enumerate() {
+            // Slot values must match their index position.
+            if entry.slot != i as u16 {
+                return Err(LsmError::Format(format!(
+                    "schema entry {i}: slot {} does not match index position",
+                    entry.slot
+                )));
+            }
+            // item_align must be a power of two (or zero for ZST).
+            if entry.item_align != 0 && !entry.item_align.is_power_of_two() {
+                return Err(LsmError::Format(format!(
+                    "schema entry {i}: item_align {} is not a power of two",
+                    entry.item_align
+                )));
+            }
+        }
+
+        // Check for duplicate names.
+        {
+            let mut seen_names: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(entries.len());
+            for (i, entry) in entries.iter().enumerate() {
+                if !seen_names.insert(&entry.name) {
+                    return Err(LsmError::Format(format!(
+                        "schema entry {i}: duplicate name {:?}",
+                        entry.name
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             entries,
             name_to_slot,
@@ -246,7 +284,7 @@ mod tests {
                 )
             })
             .collect();
-        SchemaSection::from_components(&components)
+        SchemaSection::from_components(&components).unwrap()
     }
 
     #[test]
@@ -297,7 +335,7 @@ mod tests {
 
     #[test]
     fn empty_schema() {
-        let schema = SchemaSection::from_components(&[]);
+        let schema = SchemaSection::from_components(&[]).unwrap();
         assert!(schema.is_empty());
         assert_eq!(schema.len(), 0);
 
@@ -325,7 +363,7 @@ mod tests {
                     (name, layout_of::<u64>())
                 })
                 .collect();
-            let schema = SchemaSection::from_components(&specs);
+            let schema = SchemaSection::from_components(&specs).unwrap();
 
             let mut buf = Vec::new();
             let written = schema.write_to(&mut buf).unwrap();

@@ -23,8 +23,8 @@ const _: () = assert!(std::mem::size_of::<Footer>() == 64);
 
 /// Fixed-size file header written at byte offset 0.
 ///
-/// The header is protected by `header_crc32`, computed over the first 60 bytes
-/// (i.e., everything before the CRC field itself and the reserved tail).
+/// The header is protected by `header_crc32`, computed over the first 40 bytes
+/// (i.e., everything before the CRC field itself: 8 + 4 + 4 + 8 + 8 + 8 = 40).
 #[repr(C)]
 pub struct Header {
     /// Must equal [`MAGIC`].
@@ -39,7 +39,7 @@ pub struct Header {
     pub sequence_lo: u64,
     /// Upper 64 bits of the WAL sequence range covered by this run.
     pub sequence_hi: u64,
-    /// CRC32 of the preceding 60 bytes of this header.
+    /// CRC32 of the preceding 40 bytes of this header.
     pub header_crc32: u32,
     /// Reserved for future use; must be zero on write.
     pub reserved: [u8; 20],

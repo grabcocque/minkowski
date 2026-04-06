@@ -9,6 +9,11 @@ use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
 
+/// Convert a `usize` to `u16`, returning `LsmError::Format` on overflow.
+fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
+    u16::try_from(value).map_err(|_| LsmError::Format(format!("{label} {value} exceeds u16")))
+}
+
 /// Flush dirty pages from the World to a new sorted run file.
 ///
 /// Returns `Ok(Some(path))` if dirty pages were written, `Ok(None)` if there
@@ -62,7 +67,7 @@ pub fn flush(
         })
         .collect();
 
-    let schema = SchemaSection::from_components(&components);
+    let schema = SchemaSection::from_components(&components)?;
 
     // Build comp_id → component name lookup for slot resolution.
     let comp_id_to_name: HashMap<usize, &str> = seen_comp_ids
@@ -90,6 +95,24 @@ pub fn flush(
         .create(true)
         .truncate(true)
         .open(&tmp_path)?;
+
+    // Drop guard to clean up the temp file on error.
+    struct TmpGuard<'a> {
+        path: &'a Path,
+        disarmed: bool,
+    }
+    impl Drop for TmpGuard<'_> {
+        fn drop(&mut self) {
+            if !self.disarmed {
+                let _ = fs::remove_file(self.path);
+            }
+        }
+    }
+    let mut guard = TmpGuard {
+        path: &tmp_path,
+        disarmed: false,
+    };
+
     let mut w = BufWriter::new(file);
 
     // (a) Header — write with crc32 = 0, patch later.
@@ -135,15 +158,24 @@ pub fn flush(
             slot,
         });
     }
+    // Validate all indices fit in u16 before sorting.
+    for job in &component_jobs {
+        to_u16(job.arch_idx, "arch_idx")?;
+        to_u16(job.page_index, "page_index")?;
+    }
     component_jobs.sort_by_key(|j| (j.arch_idx as u16, j.slot, j.page_index as u16));
 
     for job in &component_jobs {
+        let arch_id = to_u16(job.arch_idx, "arch_idx")?;
+        let page_idx = to_u16(job.page_index, "page_index")?;
+
         let arch_len = world.archetype_len(job.arch_idx);
         let start_row = job.page_index * PAGE_SIZE;
         let row_count = PAGE_SIZE.min(arch_len.saturating_sub(start_row));
         if row_count == 0 {
             continue;
         }
+        let row_count_u16 = to_u16(row_count, "row_count")?;
 
         let item_size = schema
             .entry_for_slot(job.slot)
@@ -159,10 +191,10 @@ pub fn flush(
         let file_offset = w.stream_position()?;
 
         let ph = PageHeader {
-            arch_id: job.arch_idx as u16,
+            arch_id,
             slot: job.slot,
-            page_index: job.page_index as u16,
-            row_count: row_count as u16,
+            page_index: page_idx,
+            row_count: row_count_u16,
             page_crc32: page_crc,
             _padding: 0,
         };
@@ -177,9 +209,9 @@ pub fn flush(
         }
 
         index_entries.push(IndexEntry {
-            arch_id: job.arch_idx as u16,
+            arch_id,
             slot: job.slot,
-            page_index: job.page_index as u16,
+            page_index: page_idx,
             _pad: 0,
             file_offset,
         });
@@ -193,15 +225,24 @@ pub fn flush(
             entity_jobs.push((arch_idx, page_index));
         }
     }
+    // Validate all entity job indices fit in u16 before sorting.
+    for &(arch_idx, page_index) in &entity_jobs {
+        to_u16(arch_idx, "arch_idx")?;
+        to_u16(page_index, "page_index")?;
+    }
     entity_jobs.sort_by_key(|&(arch_idx, page_index)| (arch_idx as u16, page_index as u16));
 
     for &(arch_idx, page_index) in &entity_jobs {
+        let arch_id = to_u16(arch_idx, "arch_idx")?;
+        let page_idx = to_u16(page_index, "page_index")?;
+
         let entities = world.archetype_entities(arch_idx);
         let start_row = page_index * PAGE_SIZE;
         let row_count = PAGE_SIZE.min(entities.len().saturating_sub(start_row));
         if row_count == 0 {
             continue;
         }
+        let row_count_u16 = to_u16(row_count, "row_count")?;
 
         let page_entities = &entities[start_row..start_row + row_count];
 
@@ -215,10 +256,10 @@ pub fn flush(
         let file_offset = w.stream_position()?;
 
         let ph = PageHeader {
-            arch_id: arch_idx as u16,
+            arch_id,
             slot: ENTITY_SLOT,
-            page_index: page_index as u16,
-            row_count: row_count as u16,
+            page_index: page_idx,
+            row_count: row_count_u16,
             page_crc32: page_crc,
             _padding: 0,
         };
@@ -233,9 +274,9 @@ pub fn flush(
         }
 
         index_entries.push(IndexEntry {
-            arch_id: arch_idx as u16,
+            arch_id,
             slot: ENTITY_SLOT,
-            page_index: page_index as u16,
+            page_index: page_idx,
             _pad: 0,
             file_offset,
         });
@@ -315,6 +356,12 @@ pub fn flush(
     // ── 6. Atomic rename ────────────────────────────────────────────────────
     fs::rename(&tmp_path, &final_path)?;
 
+    // Sync the directory to ensure the rename is durable.
+    let dir = fs::File::open(output_dir)?;
+    dir.sync_all()?;
+
+    guard.disarmed = true;
+
     Ok(Some(final_path))
 }
 
@@ -336,14 +383,14 @@ mod tests {
     use minkowski::World;
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Vel {
         dx: f32,
         dy: f32,

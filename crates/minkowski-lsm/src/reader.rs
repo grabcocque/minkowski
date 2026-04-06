@@ -11,6 +11,8 @@ pub struct PageRef<'a> {
     pub header: PageHeader,
     /// Raw page data bytes (full `PAGE_SIZE * item_size`, zero-padded).
     pub data: &'a [u8],
+    /// Absolute byte offset of this page's header within the file.
+    pub file_offset: u64,
 }
 
 // ── Internal mmap abstraction ───────────────────────────────────────────────
@@ -104,6 +106,22 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
             .expect("64 bytes"),
     );
 
+    // 5b. Validate total CRC (covers entire file with total_crc32 field zeroed).
+    // total_crc32 is at footer_start + 32 (4 * u64 = 32 bytes into footer).
+    let total_crc32_offset = footer_start + 32;
+    {
+        let mut check_buf = buf.to_vec();
+        check_buf[total_crc32_offset..total_crc32_offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let computed_total = crc32fast::hash(&check_buf);
+        if footer.total_crc32 != computed_total {
+            return Err(LsmError::Crc {
+                offset: total_crc32_offset as u64,
+                expected: footer.total_crc32,
+                actual: computed_total,
+            });
+        }
+    }
+
     // 6. Read schema section.
     let schema_start = footer.schema_offset as usize;
     if schema_start > buf.len() {
@@ -159,13 +177,22 @@ impl SortedRunReader {
 
     /// Look up a page by `(arch_id, slot, page_index)`.
     ///
-    /// Returns `None` if the page is not in this sorted run.
-    pub fn get_page(&self, arch_id: u16, slot: u16, page_index: u16) -> Option<PageRef<'_>> {
+    /// Returns `Ok(None)` if the page is not in this sorted run's index.
+    /// Returns `Err(LsmError::Format(...))` if the page is indexed but the
+    /// file data is corrupt or out of bounds.
+    pub fn get_page(
+        &self,
+        arch_id: u16,
+        slot: u16,
+        page_index: u16,
+    ) -> Result<Option<PageRef<'_>>, LsmError> {
         let key = (arch_id, slot, page_index);
-        let pos = self
+        let Ok(pos) = self
             .index
             .binary_search_by_key(&key, |e| (e.arch_id, e.slot, e.page_index))
-            .ok()?;
+        else {
+            return Ok(None);
+        };
 
         let entry = &self.index[pos];
         let buf = self.data.as_slice();
@@ -173,28 +200,48 @@ impl SortedRunReader {
         let header_size = std::mem::size_of::<PageHeader>();
 
         // Bounds-check header.
-        if offset
-            .checked_add(header_size)
-            .is_none_or(|end| end > buf.len())
-        {
-            return None;
+        let header_end = offset.checked_add(header_size).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): header offset overflow"
+            ))
+        })?;
+        if header_end > buf.len() {
+            return Err(LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): header at offset {offset} extends beyond file"
+            )));
         }
-        let header_bytes: &[u8; 16] = buf[offset..offset + header_size]
-            .try_into()
-            .expect("16 bytes");
+        let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
         let header = PageHeader::from_bytes(header_bytes);
 
         // Compute and bounds-check data.
-        let item_size = self.item_size_for_slot(slot);
-        let data_len = PAGE_SIZE.checked_mul(item_size)?;
-        let data_start = offset.checked_add(header_size)?;
-        let data_end = data_start.checked_add(data_len)?;
+        let item_size = self.item_size_for_slot(slot)?;
+        let data_len = PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data length overflow"
+            ))
+        })?;
+        let data_start = offset.checked_add(header_size).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data start overflow"
+            ))
+        })?;
+        let data_end = data_start.checked_add(data_len).ok_or_else(|| {
+            LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data end overflow"
+            ))
+        })?;
         if data_end > buf.len() {
-            return None;
+            return Err(LsmError::Format(format!(
+                "page ({arch_id}, {slot}, {page_index}): data region [{data_start}..{data_end}] extends beyond file"
+            )));
         }
         let data = &buf[data_start..data_end];
 
-        Some(PageRef { header, data })
+        Ok(Some(PageRef {
+            header,
+            data,
+            file_offset: entry.file_offset,
+        }))
     }
 
     /// Validate the CRC of a specific page.
@@ -202,13 +249,13 @@ impl SortedRunReader {
     /// The CRC covers `row_count * item_size` bytes (the actual data, not
     /// zero-padding).
     pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<(), LsmError> {
-        let item_size = self.item_size_for_slot(page.header.slot);
+        let item_size = self.item_size_for_slot(page.header.slot)?;
         let actual_len = page.header.row_count as usize * item_size;
         let computed = crc32fast::hash(&page.data[..actual_len]);
 
         if computed != page.header.page_crc32 {
             return Err(LsmError::Crc {
-                offset: 0,
+                offset: page.file_offset,
                 expected: page.header.page_crc32,
                 actual: computed,
             });
@@ -239,14 +286,14 @@ impl SortedRunReader {
     // ── Private helpers ─────────────────────────────────────────────────────
 
     /// Item size in bytes for a given slot.
-    fn item_size_for_slot(&self, slot: u16) -> usize {
+    fn item_size_for_slot(&self, slot: u16) -> Result<usize, LsmError> {
         if slot == ENTITY_SLOT {
-            std::mem::size_of::<u64>()
+            Ok(std::mem::size_of::<u64>())
         } else {
             self.schema
                 .entry_for_slot(slot)
-                .expect("slot must exist in schema")
-                .item_size as usize
+                .map(|e| e.item_size as usize)
+                .ok_or_else(|| LsmError::Format(format!("unknown slot {slot} not found in schema")))
         }
     }
 
@@ -277,14 +324,14 @@ mod tests {
     use minkowski::World;
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Pos {
         x: f32,
         y: f32,
     }
 
     #[derive(Clone, Copy)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Vel {
         dx: f32,
         dy: f32,
@@ -325,6 +372,7 @@ mod tests {
         let entry = &reader.index[0];
         let page = reader
             .get_page(entry.arch_id, entry.slot, entry.page_index)
+            .unwrap()
             .expect("page should exist");
 
         assert!(page.header.row_count > 0);
@@ -337,7 +385,7 @@ mod tests {
         let reader = SortedRunReader::open(&path).unwrap();
 
         // Use an arch_id that cannot exist.
-        let result = reader.get_page(255, 255, 255);
+        let result = reader.get_page(255, 255, 255).unwrap();
         assert!(result.is_none());
     }
 
@@ -350,6 +398,7 @@ mod tests {
         for entry in &reader.index {
             let page = reader
                 .get_page(entry.arch_id, entry.slot, entry.page_index)
+                .unwrap()
                 .unwrap();
             reader.validate_page_crc(&page).unwrap();
         }
@@ -398,6 +447,7 @@ mod tests {
         for entry in &reader.index {
             let page = reader
                 .get_page(entry.arch_id, entry.slot, entry.page_index)
+                .expect("get_page should not error")
                 .expect("every indexed page must be findable");
             reader
                 .validate_page_crc(&page)
