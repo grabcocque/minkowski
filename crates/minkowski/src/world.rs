@@ -1933,6 +1933,38 @@ impl World {
         self.archetypes.archetypes[arch_idx].clear_dirty_pages();
     }
 
+    /// Returns a raw byte slice covering rows `[start_row, start_row + row_count)` in the
+    /// column for `comp_id` within archetype `arch_idx`.
+    ///
+    /// Returns `None` if the component is not present in the archetype or if
+    /// the row range exceeds the column length.
+    /// Zero-sized components return an empty slice.
+    pub fn column_page_bytes(
+        &self,
+        arch_idx: usize,
+        comp_id: ComponentId,
+        start_row: usize,
+        row_count: usize,
+    ) -> Option<&[u8]> {
+        let arch = &self.archetypes.archetypes[arch_idx];
+        let col_idx = arch.column_index(comp_id)?;
+        let col = &arch.columns[col_idx];
+        let end_row = start_row.checked_add(row_count)?;
+        if end_row > col.len() {
+            return None;
+        }
+        let item_size = col.item_layout.size();
+        if item_size == 0 {
+            return Some(&[]);
+        }
+        let offset = start_row.checked_mul(item_size)?;
+        let len = row_count.checked_mul(item_size)?;
+        // Safety: `col.data_ptr()` is valid for `col.len() * item_size` bytes.
+        // The range check above guarantees `offset + len <= col.len() * item_size`.
+        // The lifetime of the returned slice is tied to `&self`.
+        Some(unsafe { std::slice::from_raw_parts(col.data_ptr().add(offset), len) })
+    }
+
     /// Component name (from `std::any::type_name`). Returns None if unregistered.
     pub fn component_name(&self, id: ComponentId) -> Option<&'static str> {
         if id < self.components.len() {
@@ -3962,6 +3994,53 @@ mod tests {
         let _e = world.spawn((Pos { x: 1.0, y: 2.0 },));
         let vel_id = world.register_component::<Vel>();
         assert!(world.column_dirty_pages(0, vel_id).is_none());
+    }
+
+    #[test]
+    fn column_page_bytes_returns_correct_data() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.spawn((Pos { x: 3.0, y: 4.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        let bytes = world.column_page_bytes(0, pos_id, 0, 2).unwrap();
+        assert_eq!(bytes.len(), 2 * std::mem::size_of::<Pos>());
+        // Verify actual data
+        let pos0: Pos = unsafe { std::ptr::read(bytes.as_ptr() as *const Pos) };
+        assert_eq!(pos0.x, 1.0);
+        assert_eq!(pos0.y, 2.0);
+    }
+
+    #[test]
+    fn column_page_bytes_out_of_range_returns_none() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let pos_id = world.component_id::<Pos>().unwrap();
+        assert!(world.column_page_bytes(0, pos_id, 0, 2).is_none()); // only 1 row
+    }
+
+    #[test]
+    fn column_page_bytes_missing_component_returns_none() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        let vel_id = world.register_component::<Vel>();
+        assert!(world.column_page_bytes(0, vel_id, 0, 1).is_none());
+    }
+
+    #[test]
+    fn column_page_bytes_partial_range() {
+        let mut world = World::new();
+        for i in 0..10 {
+            world.spawn((Pos {
+                x: i as f32,
+                y: 0.0,
+            },));
+        }
+        let pos_id = world.component_id::<Pos>().unwrap();
+        // Read rows 3..6
+        let bytes = world.column_page_bytes(0, pos_id, 3, 3).unwrap();
+        assert_eq!(bytes.len(), 3 * std::mem::size_of::<Pos>());
+        let pos3: Pos = unsafe { std::ptr::read(bytes.as_ptr() as *const Pos) };
+        assert_eq!(pos3.x, 3.0);
     }
 }
 

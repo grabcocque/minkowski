@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/minkowski", "crates/minkowski-derive", "crates/minkowski-persist", "crates/minkowski-observe", "crates/minkowski-py", "crates/minkowski-bench", "examples"]
+members = ["crates/minkowski", "crates/minkowski-derive", "crates/minkowski-persist", "crates/minkowski-observe", "crates/minkowski-py", "crates/minkowski-bench", "crates/minkowski-lsm", "examples"]
 exclude = ["fuzz"]
 
 [workspace.lints.rust]
