@@ -98,6 +98,15 @@ impl BlobVec {
         self.capacity
     }
 
+    /// Returns a raw pointer to the first byte of the allocation.
+    ///
+    /// For zero-sized components, returns a dangling pointer — callers must
+    /// guard on `item_layout.size() == 0` before performing pointer arithmetic.
+    #[inline]
+    pub(crate) fn data_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+
     /// Ensures the column has capacity for at least `additional` more elements.
     /// If the column already has enough spare capacity, this is a no-op.
     pub(crate) fn reserve(&mut self, additional: usize) {
