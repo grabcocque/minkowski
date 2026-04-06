@@ -285,6 +285,9 @@ mod tests {
         assert_eq!(recovered.page_index, 15);
         assert_eq!(recovered.row_count, 256);
         assert_eq!(recovered.page_crc32, 0x1234_5678);
-        assert_eq!(recovered._padding, 0);
+        #[allow(clippy::used_underscore_binding)]
+        {
+            assert_eq!(recovered._padding, 0);
+        }
     }
 }
