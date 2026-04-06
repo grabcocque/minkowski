@@ -1,0 +1,1 @@
+// LSM error types — placeholder
