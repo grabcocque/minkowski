@@ -7,8 +7,8 @@ use crate::schema::SchemaSection;
 
 /// A reference to a page within a sorted run.
 pub struct PageRef<'a> {
-    /// Header describing the page metadata.
-    pub header: &'a PageHeader,
+    /// Header describing the page metadata (owned copy, read from file).
+    pub header: PageHeader,
     /// Raw page data bytes (full `PAGE_SIZE * item_size`, zero-padded).
     pub data: &'a [u8],
 }
@@ -105,7 +105,13 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
     );
 
     // 6. Read schema section.
-    let schema_data = &buf[footer.schema_offset as usize..];
+    let schema_start = footer.schema_offset as usize;
+    if schema_start > buf.len() {
+        return Err(LsmError::Format(
+            "schema offset extends beyond file".to_owned(),
+        ));
+    }
+    let schema_data = &buf[schema_start..];
     let schema = SchemaSection::read_from(schema_data, schema_count)?;
 
     // 7. Parse sparse index.
@@ -125,7 +131,7 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
         let entry_bytes: &[u8; 16] = buf[entry_start..entry_start + 16]
             .try_into()
             .expect("16 bytes");
-        index.push(*IndexEntry::from_bytes(entry_bytes));
+        index.push(IndexEntry::from_bytes(entry_bytes));
     }
 
     Ok(ParsedMetadata {
@@ -164,17 +170,29 @@ impl SortedRunReader {
         let entry = &self.index[pos];
         let buf = self.data.as_slice();
         let offset = entry.file_offset as usize;
+        let header_size = std::mem::size_of::<PageHeader>();
 
-        // Read PageHeader.
-        let header_bytes: &[u8; 16] = buf[offset..offset + 16].try_into().expect("16 bytes");
+        // Bounds-check header.
+        if offset
+            .checked_add(header_size)
+            .is_none_or(|end| end > buf.len())
+        {
+            return None;
+        }
+        let header_bytes: &[u8; 16] = buf[offset..offset + header_size]
+            .try_into()
+            .expect("16 bytes");
         let header = PageHeader::from_bytes(header_bytes);
 
-        // Compute data length.
+        // Compute and bounds-check data.
         let item_size = self.item_size_for_slot(slot);
-        let data_len = PAGE_SIZE * item_size;
-
-        let data_start = offset + std::mem::size_of::<PageHeader>();
-        let data = &buf[data_start..data_start + data_len];
+        let data_len = PAGE_SIZE.checked_mul(item_size)?;
+        let data_start = offset.checked_add(header_size)?;
+        let data_end = data_start.checked_add(data_len)?;
+        if data_end > buf.len() {
+            return None;
+        }
+        let data = &buf[data_start..data_end];
 
         Some(PageRef { header, data })
     }

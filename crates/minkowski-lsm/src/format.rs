@@ -56,16 +56,11 @@ impl Header {
         unsafe { &*(self as *const Self as *const [u8; 64]) }
     }
 
-    /// Interpret a 64-byte slice as a `Header` reference.
-    ///
-    /// # Safety
-    /// The caller must ensure `bytes` is properly aligned for `Header`.
-    /// For unaligned reads (e.g., from a file buffer), copy into an aligned
-    /// value first or use the `as_bytes` + `clone`-by-value pattern.
-    pub fn from_bytes(bytes: &[u8; 64]) -> &Self {
-        // SAFETY: Header is #[repr(C)]; any 64-byte bit pattern is a valid
-        // representation (individual field semantics are validated separately).
-        unsafe { &*(bytes.as_ptr() as *const Self) }
+    /// Read a `Header` from a 64-byte slice. Handles unaligned input safely.
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        // SAFETY: Header is #[repr(C)] and any 64-byte bit pattern is a valid
+        // representation. read_unaligned handles arbitrary alignment.
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
 }
 
@@ -99,10 +94,9 @@ impl PageHeader {
         unsafe { &*(self as *const Self as *const [u8; 16]) }
     }
 
-    /// Interpret a 16-byte slice as a `PageHeader` reference.
-    pub fn from_bytes(bytes: &[u8; 16]) -> &Self {
-        // SAFETY: PageHeader is #[repr(C)]; any 16-byte bit pattern is valid.
-        unsafe { &*(bytes.as_ptr() as *const Self) }
+    /// Read a `PageHeader` from a 16-byte slice. Handles unaligned input safely.
+    pub fn from_bytes(bytes: &[u8; 16]) -> Self {
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
 }
 
@@ -134,10 +128,9 @@ impl IndexEntry {
         unsafe { &*(self as *const Self as *const [u8; 16]) }
     }
 
-    /// Interpret a 16-byte slice as an `IndexEntry` reference.
-    pub fn from_bytes(bytes: &[u8; 16]) -> &Self {
-        // SAFETY: IndexEntry is #[repr(C)]; any 16-byte bit pattern is valid.
-        unsafe { &*(bytes.as_ptr() as *const Self) }
+    /// Read an `IndexEntry` from a 16-byte slice. Handles unaligned input safely.
+    pub fn from_bytes(bytes: &[u8; 16]) -> Self {
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
 
     /// The sort key used for binary search.
@@ -194,10 +187,9 @@ impl Footer {
         unsafe { &*(self as *const Self as *const [u8; 64]) }
     }
 
-    /// Interpret a 64-byte slice as a `Footer` reference.
-    pub fn from_bytes(bytes: &[u8; 64]) -> &Self {
-        // SAFETY: Footer is #[repr(C)]; any 64-byte bit pattern is valid.
-        unsafe { &*(bytes.as_ptr() as *const Self) }
+    /// Read a `Footer` from a 64-byte slice. Handles unaligned input safely.
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
 }
 

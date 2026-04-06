@@ -1949,15 +1949,16 @@ impl World {
         let arch = &self.archetypes.archetypes[arch_idx];
         let col_idx = arch.column_index(comp_id)?;
         let col = &arch.columns[col_idx];
-        if start_row + row_count > col.len() {
+        let end_row = start_row.checked_add(row_count)?;
+        if end_row > col.len() {
             return None;
         }
         let item_size = col.item_layout.size();
         if item_size == 0 {
             return Some(&[]);
         }
-        let offset = start_row * item_size;
-        let len = row_count * item_size;
+        let offset = start_row.checked_mul(item_size)?;
+        let len = row_count.checked_mul(item_size)?;
         // Safety: `col.data_ptr()` is valid for `col.len() * item_size` bytes.
         // The range check above guarantees `offset + len <= col.len() * item_size`.
         // The lifetime of the returned slice is tied to `&self`.
