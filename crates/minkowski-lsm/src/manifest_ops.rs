@@ -10,6 +10,7 @@ use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::manifest_log::{ManifestEntry, ManifestLog};
 use crate::reader::SortedRunReader;
+use crate::types::{Level, SeqNo};
 use crate::writer::flush;
 
 /// Flush dirty pages and record the new sorted run in the manifest.
@@ -31,26 +32,25 @@ pub fn flush_and_record(
     let file_size = fs::metadata(&path)?.len();
     let archetype_coverage = reader.archetype_ids();
 
-    let meta = SortedRunMeta {
-        path: path.clone(),
-        level: 0,
-        sequence_range: reader.sequence_range(),
+    let meta = SortedRunMeta::new(
+        path.clone(),
+        reader.sequence_range(),
         archetype_coverage,
-        page_count: reader.page_count(),
-        size_bytes: file_size,
-    };
+        reader.page_count(),
+        file_size,
+    )?;
 
     // Persist to log first, then update in-memory state.
     // A single atomic entry ensures a crash can never leave the manifest with
     // a new run recorded but the sequence pointer still at its old value.
     log.append(&ManifestEntry::AddRunAndSequence {
-        level: 0,
+        level: Level::L0,
         meta: meta.clone(),
-        next_sequence: sequence_range.1,
+        next_sequence: SeqNo(sequence_range.1),
     })?;
 
-    manifest.add_run(0, meta);
-    manifest.set_next_sequence(sequence_range.1);
+    manifest.add_run(Level::L0, meta);
+    manifest.set_next_sequence(SeqNo(sequence_range.1));
 
     Ok(Some(path))
 }
@@ -98,6 +98,7 @@ pub fn cleanup_orphans(dir: &Path, manifest: &LsmManifest) -> Result<usize, LsmE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Level, SeqNo, SeqRange};
 
     #[derive(Clone, Copy)]
     #[expect(dead_code)]
@@ -124,8 +125,8 @@ mod tests {
             flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
         assert!(result.is_some());
         assert_eq!(manifest.total_runs(), 1);
-        assert_eq!(manifest.next_sequence(), 10);
-        assert_eq!(manifest.runs_at_level(0).len(), 1);
+        assert_eq!(manifest.next_sequence(), SeqNo(10));
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 1);
     }
 
     #[test]
@@ -158,15 +159,15 @@ mod tests {
         // Manifest only knows about 0-10.run.
         let mut manifest = LsmManifest::new();
         manifest.add_run(
-            0,
-            SortedRunMeta {
-                path: dir.path().join("0-10.run"),
-                level: 0,
-                sequence_range: (0, 10),
-                archetype_coverage: vec![0],
-                page_count: 1,
-                size_bytes: 4,
-            },
+            Level::L0,
+            SortedRunMeta::new(
+                dir.path().join("0-10.run"),
+                SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+                vec![0],
+                1,
+                4,
+            )
+            .unwrap(),
         );
 
         let deleted = cleanup_orphans(dir.path(), &manifest).unwrap();

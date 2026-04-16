@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
+use crate::types::{SeqNo, SeqRange};
 
 /// A reference to a page within a sorted run.
 pub struct PageRef<'a> {
@@ -57,7 +58,7 @@ pub struct SortedRunReader {
     data: MappedData,
     schema: SchemaSection,
     index: Vec<IndexEntry>,
-    sequence_range: (u64, u64),
+    sequence_range: SeqRange,
     page_count: u64,
 }
 
@@ -68,7 +69,7 @@ const MIN_FILE_SIZE: usize = 128;
 struct ParsedMetadata {
     schema: SchemaSection,
     index: Vec<IndexEntry>,
-    sequence_range: (u64, u64),
+    sequence_range: SeqRange,
     page_count: u64,
 }
 
@@ -112,7 +113,13 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
     }
 
     let schema_count = header.schema_count;
-    let sequence_range = (header.sequence_lo, header.sequence_hi);
+    let sequence_range = SeqRange::new(SeqNo(header.sequence_lo), SeqNo(header.sequence_hi))
+        .map_err(|_| {
+            LsmError::Format(format!(
+                "header sequence range invalid: lo={} > hi={}",
+                header.sequence_lo, header.sequence_hi
+            ))
+        })?;
     let page_count = header.page_count;
 
     // 5. Read footer (last 64 bytes).
@@ -286,7 +293,7 @@ impl SortedRunReader {
     }
 
     /// WAL sequence range covered by this sorted run.
-    pub fn sequence_range(&self) -> (u64, u64) {
+    pub fn sequence_range(&self) -> SeqRange {
         self.sequence_range
     }
 
@@ -381,7 +388,10 @@ mod tests {
         let (_dir, path, _world) = flush_world_with_pos(5);
         let reader = SortedRunReader::open(&path).unwrap();
 
-        assert_eq!(reader.sequence_range(), (10, 20));
+        assert_eq!(
+            reader.sequence_range(),
+            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap()
+        );
         assert_eq!(reader.schema().len(), 1); // Pos only
         assert!(reader.page_count() > 0);
         assert!(reader.index_len() > 0);
@@ -463,6 +473,52 @@ mod tests {
         let mut deduped = ids.clone();
         deduped.dedup();
         assert_eq!(ids, deduped);
+    }
+
+    #[test]
+    fn open_rejects_header_with_lo_greater_than_hi() {
+        let (_dir, path, _world) = flush_world_with_pos(3);
+
+        // Corrupt sequence_lo / sequence_hi so that lo > hi, then fix up
+        // both CRCs so the file passes magic, version, and CRC checks but
+        // fails the SeqRange::new validation inside validate_and_parse.
+        //
+        // Header layout (all fields little-endian):
+        //   bytes  0..8  : magic
+        //   bytes  8..12 : version
+        //   bytes 12..16 : schema_count
+        //   bytes 16..24 : page_count
+        //   bytes 24..32 : sequence_lo  ← overwrite to 9999
+        //   bytes 32..40 : sequence_hi  ← overwrite to 1 (so lo > hi)
+        //   bytes 40..44 : header_crc32  (covers bytes 0..40)
+        //   bytes 44..64 : reserved
+        let mut data = std::fs::read(&path).unwrap();
+
+        // Write lo = 9999, hi = 1 — clearly lo > hi.
+        data[24..32].copy_from_slice(&9999u64.to_le_bytes());
+        data[32..40].copy_from_slice(&1u64.to_le_bytes());
+
+        // Recompute header CRC (covers bytes 0..40).
+        let new_header_crc = crc32fast::hash(&data[..40]);
+        data[40..44].copy_from_slice(&new_header_crc.to_le_bytes());
+
+        // Recompute total CRC (entire file with total_crc32 field zeroed).
+        // Footer is the last 64 bytes; total_crc32 is at footer_offset + 32.
+        let file_len = data.len();
+        let total_crc32_offset = (file_len - 64) + 32;
+        data[total_crc32_offset..total_crc32_offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let new_total_crc = crc32fast::hash(&data);
+        data[total_crc32_offset..total_crc32_offset + 4]
+            .copy_from_slice(&new_total_crc.to_le_bytes());
+
+        std::fs::write(&path, &data).unwrap();
+
+        let result = SortedRunReader::open(&path);
+        assert!(
+            matches!(result, Err(LsmError::Format(_))),
+            "expected Format error for header with lo > hi, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]
