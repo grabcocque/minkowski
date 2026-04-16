@@ -5,4 +5,5 @@ pub mod manifest_log;
 pub mod manifest_ops;
 pub mod reader;
 pub mod schema;
+pub mod types;
 pub mod writer;
