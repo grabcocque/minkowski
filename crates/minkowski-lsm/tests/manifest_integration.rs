@@ -2,10 +2,11 @@
 
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 
 use minkowski::World;
 use minkowski_lsm::manifest::LsmManifest;
-use minkowski_lsm::manifest_log::ManifestLog;
+use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
 
 #[derive(Clone, Copy)]
@@ -116,6 +117,112 @@ fn corrupt_tail_partial_recovery() {
     let recovered = ManifestLog::replay(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 2);
     assert_eq!(recovered.next_sequence(), 20);
+}
+
+/// Truncate the log to every byte prefix 0..=file_len and replay each time.
+///
+/// For an append-only CRC-framed log, this is the canonical crash-coverage
+/// test: any prefix must replay into a valid manifest, and extending the
+/// prefix can only add information (monotonicity). Covers mid-header and
+/// mid-payload truncation — the `read_exact` path that previously propagated
+/// `UnexpectedEof` as fatal is exercised at every frame boundary.
+#[test]
+fn replay_converges_at_every_truncation_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let mut manifest = LsmManifest::new();
+    let mut log = ManifestLog::create(&log_path).unwrap();
+
+    let mut world = World::new();
+    for i in 0..3u64 {
+        world.spawn((Pos {
+            x: i as f32,
+            y: 0.0,
+        },));
+        let lo = i * 10;
+        let hi = lo + 10;
+        flush_and_record(&world, (lo, hi), &mut manifest, &mut log, dir.path()).unwrap();
+        world.clear_all_dirty_pages();
+    }
+
+    let full_bytes = fs::read(&log_path).unwrap();
+    assert!(!full_bytes.is_empty(), "log must have content");
+
+    let mut prev_total_runs = 0usize;
+    let mut prev_next_seq = 0u64;
+
+    for truncate_len in 0..=full_bytes.len() {
+        let truncated_path = dir.path().join(format!("truncated_{truncate_len:05}.log"));
+        fs::write(&truncated_path, &full_bytes[..truncate_len]).unwrap();
+
+        let replayed = ManifestLog::replay(&truncated_path)
+            .unwrap_or_else(|e| panic!("replay failed at truncate_len={truncate_len}: {e:?}"));
+
+        assert!(
+            replayed.total_runs() <= 3,
+            "truncate_len={truncate_len}: total_runs={} > 3",
+            replayed.total_runs()
+        );
+
+        // Monotonicity: extending the prefix never loses state.
+        assert!(
+            replayed.total_runs() >= prev_total_runs,
+            "truncate_len={truncate_len}: total_runs rewound {prev_total_runs} → {}",
+            replayed.total_runs()
+        );
+        assert!(
+            replayed.next_sequence() >= prev_next_seq,
+            "truncate_len={truncate_len}: next_sequence rewound {prev_next_seq} → {}",
+            replayed.next_sequence()
+        );
+        prev_total_runs = replayed.total_runs();
+        prev_next_seq = replayed.next_sequence();
+    }
+
+    assert_eq!(prev_total_runs, 3, "full replay must recover all 3 runs");
+    assert_eq!(prev_next_seq, 30, "full replay must recover final sequence");
+}
+
+/// Replay must truncate the log when `apply_entry` fails, not silently skip
+/// the bad entry. Previously `let _ = promote_run(...)` ate the error; the
+/// fix makes replay treat the rest of the log as tail garbage.
+#[test]
+fn replay_truncates_log_on_promote_of_missing_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let mut manifest = LsmManifest::new();
+    let mut log = ManifestLog::create(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    // Real flush: produces a genuine AddRunAndSequence entry.
+    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+
+    // Inject a PromoteRun that references a path the manifest doesn't know.
+    // Models a corrupted log or an out-of-order mutation.
+    log.append(&ManifestEntry::PromoteRun {
+        from_level: 0,
+        to_level: 1,
+        path: PathBuf::from("ghost.run"),
+    })
+    .unwrap();
+    // Anything after the bad entry must be discarded on replay.
+    log.append(&ManifestEntry::SetSequence { next_sequence: 999 })
+        .unwrap();
+    drop(log);
+
+    let recovered = ManifestLog::replay(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the first flush should survive replay"
+    );
+    assert!(
+        recovered.next_sequence() < 999,
+        "SetSequence past the bad PromoteRun must not apply"
+    );
+    // The surviving AddRunAndSequence set next_sequence to 10.
+    assert_eq!(recovered.next_sequence(), 10);
 }
 
 // ── Cleanup ─────────────────────────────────────────────────────────────────

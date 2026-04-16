@@ -74,9 +74,9 @@ pub fn cleanup_orphans(dir: &Path, manifest: &LsmManifest) -> Result<usize, LsmE
 
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        // Use string matching (not Path::extension) because we need to
-        // distinguish ".run" from ".run.tmp" — both have "run" or "tmp"
-        // as the extension.
+        // `.run.tmp` is a compound suffix; `Path::extension()` only returns
+        // the final segment (`"tmp"`), so matching both cases via extension
+        // would need two passes. Suffix matching handles it inline.
         #[allow(clippy::case_sensitive_file_extension_comparisons)]
         let should_delete = if name.ends_with(".run.tmp") {
             true

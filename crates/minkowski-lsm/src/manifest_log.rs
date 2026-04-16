@@ -81,7 +81,16 @@ fn read_frame(file: &File, pos: u64) -> Result<Option<(Vec<u8>, u64)>, LsmError>
     }
 
     let mut payload = vec![0u8; len];
-    f.read_exact(&mut payload)?;
+    match f.read_exact(&mut payload) {
+        Ok(()) => {}
+        // A truncated payload (header fsynced, payload page never reached disk)
+        // is a torn write, not an I/O error. Reclassify so the replay loop
+        // treats it as tail corruption and truncates cleanly.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(LsmError::Format("truncated frame payload".to_owned()));
+        }
+        Err(e) => return Err(LsmError::Io(e)),
+    }
 
     let computed_crc = crc32fast::hash(&payload);
     if stored_crc != computed_crc {
@@ -108,8 +117,25 @@ fn encode_path(buf: &mut Vec<u8>, path: &Path) -> Result<(), LsmError> {
         .to_str()
         .ok_or_else(|| LsmError::Format("non-UTF-8 path".to_owned()))?;
     let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| LsmError::Format(format!("path length {} exceeds u16", bytes.len())))?;
+    buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Encode an archetype coverage list with a checked u16 count prefix.
+fn encode_coverage(buf: &mut Vec<u8>, coverage: &[u16]) -> Result<(), LsmError> {
+    let count = u16::try_from(coverage.len()).map_err(|_| {
+        LsmError::Format(format!(
+            "archetype coverage count {} exceeds u16",
+            coverage.len()
+        ))
+    })?;
+    buf.extend_from_slice(&count.to_le_bytes());
+    for &arch_id in coverage {
+        buf.extend_from_slice(&arch_id.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -155,11 +181,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             encode_path(&mut buf, &meta.path)?;
             buf.extend_from_slice(&meta.sequence_range.0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range.1.to_le_bytes());
-            let count = meta.archetype_coverage.len() as u16;
-            buf.extend_from_slice(&count.to_le_bytes());
-            for &arch_id in &meta.archetype_coverage {
-                buf.extend_from_slice(&arch_id.to_le_bytes());
-            }
+            encode_coverage(&mut buf, &meta.archetype_coverage)?;
             buf.extend_from_slice(&meta.page_count.to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
         }
@@ -192,11 +214,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             encode_path(&mut buf, &meta.path)?;
             buf.extend_from_slice(&meta.sequence_range.0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range.1.to_le_bytes());
-            let count = meta.archetype_coverage.len() as u16;
-            buf.extend_from_slice(&count.to_le_bytes());
-            for &arch_id in &meta.archetype_coverage {
-                buf.extend_from_slice(&arch_id.to_le_bytes());
-            }
+            encode_coverage(&mut buf, &meta.archetype_coverage)?;
             buf.extend_from_slice(&meta.page_count.to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes.to_le_bytes());
             buf.extend_from_slice(&next_sequence.to_le_bytes());
@@ -313,7 +331,7 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
 
 // ── ManifestLog ─────────────────────────────────────────────────────────────
 
-fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) {
+fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), LsmError> {
     match entry {
         ManifestEntry::AddRun { level, meta } => manifest.add_run(*level, meta.clone()),
         ManifestEntry::RemoveRun { level, path } => {
@@ -324,7 +342,10 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) {
             to_level,
             path,
         } => {
-            let _ = manifest.promote_run(*from_level, *to_level, path);
+            // A failed promote indicates log corruption — the source run is
+            // missing. Propagate so the replay loop treats the rest of the
+            // log as tail garbage rather than silently diverging.
+            manifest.promote_run(*from_level, *to_level, path)?;
         }
         ManifestEntry::SetSequence { next_sequence } => {
             manifest.set_next_sequence(*next_sequence);
@@ -338,6 +359,7 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) {
             manifest.set_next_sequence(*next_sequence);
         }
     }
+    Ok(())
 }
 
 /// Persistent append-only log of manifest mutations.
@@ -386,9 +408,10 @@ impl ManifestLog {
 
     /// Replay the log to reconstruct a manifest.
     ///
-    /// Tolerates corrupt tail frames (torn writes from crash) by truncating
-    /// the file to the last valid frame and returning what was recovered.
-    /// Returns an empty manifest if the file doesn't exist.
+    /// Tolerates corrupt tail frames (CRC mismatch, decode failure, or failed
+    /// semantic apply) by truncating the file to the last valid frame and
+    /// fsyncing. I/O errors are propagated. Returns an empty manifest if the
+    /// file doesn't exist.
     pub fn replay(path: &Path) -> Result<LsmManifest, LsmError> {
         if !path.exists() {
             return Ok(LsmManifest::new());
@@ -398,24 +421,27 @@ impl ManifestLog {
         let mut pos: u64 = 0;
 
         loop {
-            match read_frame(&file, pos) {
-                Ok(Some((payload, next_pos))) => match decode_entry(&payload) {
-                    Ok(entry) => {
-                        apply_entry(&mut manifest, &entry);
-                        pos = next_pos;
-                    }
-                    Err(_) => {
-                        truncate_at(path, pos)?;
-                        break;
-                    }
-                },
-                Ok(None) => break, // clean EOF
+            let (payload, next_pos) = match read_frame(&file, pos) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
                 Err(LsmError::Crc { .. } | LsmError::Format(_)) => {
                     truncate_at(path, pos)?;
                     break;
                 }
-                Err(e) => return Err(e), // I/O error — propagate
+                Err(e) => return Err(e),
+            };
+
+            // Decode + apply errors both mean the frame is semantically bad;
+            // treat everything from `pos` onward as torn tail.
+            let Ok(entry) = decode_entry(&payload) else {
+                truncate_at(path, pos)?;
+                break;
+            };
+            if apply_entry(&mut manifest, &entry).is_err() {
+                truncate_at(path, pos)?;
+                break;
             }
+            pos = next_pos;
         }
 
         Ok(manifest)
