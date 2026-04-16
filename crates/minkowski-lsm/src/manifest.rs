@@ -49,7 +49,7 @@ impl SortedRunMeta {
     /// - `archetype_coverage` is strictly sorted ascending (sorted + deduped).
     /// - `page_count` is non-zero.
     ///
-    /// `seq_range` is already validated by `SeqRange::new`. `size_bytes` is
+    /// `sequence_range` is already validated by `SeqRange::new`. `size_bytes` is
     /// not validated (redundant with `page_count`; a valid run file always
     /// has a non-empty header).
     pub fn new(
@@ -117,14 +117,17 @@ impl LsmManifest {
         Ok(())
     }
 
+    /// Record the next sequence number to assign on flush.
     pub fn set_next_sequence(&mut self, seq: SeqNo) {
         self.next_sequence = seq.0;
     }
 
+    /// The next sequence number to assign on the next flush.
     pub fn next_sequence(&self) -> SeqNo {
         SeqNo(self.next_sequence)
     }
 
+    /// All sorted runs currently tracked at the given level.
     pub fn runs_at_level(&self, level: Level) -> &[SortedRunMeta] {
         &self.levels[level.as_index()]
     }

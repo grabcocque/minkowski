@@ -189,8 +189,7 @@ fn replay_converges_at_every_truncation_prefix() {
 }
 
 /// Replay must truncate the log when `apply_entry` fails, not silently skip
-/// the bad entry. Previously `let _ = promote_run(...)` ate the error; the
-/// fix makes replay treat the rest of the log as tail garbage.
+/// the bad entry.
 #[test]
 fn replay_truncates_log_on_promote_of_missing_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -372,6 +371,69 @@ fn replay_truncates_log_on_invalid_level_byte() {
     assert_eq!(
         len_after_replay, len_after_first_frame,
         "replay truncated the invalid-level frame"
+    );
+}
+
+/// Regression: a frame whose `SeqRange::new` call fails (seq_lo > seq_hi)
+/// must be treated as tail garbage, not propagated as a fatal error.
+/// Completes the three-error regression symmetry alongside
+/// `replay_truncates_log_on_unsorted_coverage` and
+/// `replay_truncates_log_on_invalid_level_byte`.
+#[test]
+fn replay_truncates_log_on_inverted_seq_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let mut manifest = LsmManifest::new();
+    let mut log = ManifestLog::create(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    // One real flush, produces a valid AddRunAndSequence frame.
+    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+
+    let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
+
+    // Manually craft an AddRun frame with seq_lo=20 > seq_hi=10, which
+    // makes SeqRange::new fail inside decode_entry → LsmError::Format.
+    // Bypass SortedRunMeta::new by encoding the bytes directly.
+    let mut payload = Vec::new();
+    // TAG_ADD_RUN = 0x01
+    payload.push(0x01);
+    payload.push(0); // level (L0)
+    // path: "bad.run"
+    let path_bytes = b"bad.run";
+    payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(path_bytes);
+    payload.extend_from_slice(&20u64.to_le_bytes()); // seq_lo  (intentionally > seq_hi)
+    payload.extend_from_slice(&10u64.to_le_bytes()); // seq_hi
+    // archetype_coverage: [0] — valid (just one entry)
+    payload.extend_from_slice(&1u16.to_le_bytes()); // count
+    payload.extend_from_slice(&0u16.to_le_bytes()); // arch_id
+    payload.extend_from_slice(&1u64.to_le_bytes()); // page_count
+    payload.extend_from_slice(&1024u64.to_le_bytes()); // size_bytes
+
+    // Frame format: [len: u32 LE][crc32: u32 LE][payload]
+    let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+    let len = payload.len() as u32;
+    let crc = crc32fast::hash(&payload);
+    f.write_all(&len.to_le_bytes()).unwrap();
+    f.write_all(&crc.to_le_bytes()).unwrap();
+    f.write_all(&payload).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    // Replay must truncate back to end of first valid frame.
+    let recovered = ManifestLog::replay(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the valid first flush survives"
+    );
+
+    let len_after_replay = fs::metadata(&log_path).unwrap().len();
+    assert_eq!(
+        len_after_replay, len_after_first_frame,
+        "replay truncated the bad frame"
     );
 }
 

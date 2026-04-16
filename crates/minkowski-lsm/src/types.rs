@@ -33,15 +33,15 @@ impl fmt::Display for SeqNo {
 
 /// A half-open sequence range `[lo, hi)`.
 ///
-/// Construction enforces `lo <= hi`. `hi == lo` represents an empty
-/// range (syntactically allowed, not currently produced by any code path).
+/// Construction enforces `lo <= hi`. `hi == lo` represents an empty range.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct SeqRange {
-    pub(crate) lo: SeqNo,
-    pub(crate) hi: SeqNo,
+    lo: SeqNo,
+    hi: SeqNo,
 }
 
 impl SeqRange {
+    /// Build a half-open range. Returns `Err(LsmError::Format)` if `lo > hi`.
     pub fn new(lo: SeqNo, hi: SeqNo) -> Result<Self, LsmError> {
         if lo > hi {
             return Err(LsmError::Format(format!("SeqRange: lo ({lo}) > hi ({hi})")));
@@ -73,6 +73,7 @@ impl Level {
     pub const L2: Level = Level(2);
     pub const L3: Level = Level(3);
 
+    /// Construct a level index. Returns `None` if `level >= NUM_LEVELS`.
     pub fn new(level: u8) -> Option<Self> {
         if (level as usize) < NUM_LEVELS {
             Some(Self(level))
@@ -81,10 +82,12 @@ impl Level {
         }
     }
 
+    /// The underlying level byte (always `< NUM_LEVELS`).
     pub fn as_u8(self) -> u8 {
         self.0
     }
 
+    /// Convert to a `usize` for indexing `[T; NUM_LEVELS]` arrays.
     pub fn as_index(self) -> usize {
         self.0 as usize
     }
@@ -120,15 +123,15 @@ mod tests {
     #[test]
     fn seqrange_accepts_lo_equal_to_hi() {
         let r = SeqRange::new(SeqNo(5), SeqNo(5)).unwrap();
-        assert_eq!(r.lo, SeqNo(5));
-        assert_eq!(r.hi, SeqNo(5));
+        assert_eq!(r.lo(), SeqNo(5));
+        assert_eq!(r.hi(), SeqNo(5));
     }
 
     #[test]
     fn seqrange_accepts_lo_less_than_hi() {
         let r = SeqRange::new(SeqNo(0), SeqNo(10)).unwrap();
-        assert_eq!(r.lo, SeqNo(0));
-        assert_eq!(r.hi, SeqNo(10));
+        assert_eq!(r.lo(), SeqNo(0));
+        assert_eq!(r.hi(), SeqNo(10));
     }
 
     #[test]
