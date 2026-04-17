@@ -242,7 +242,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
-            buf.extend_from_slice(&meta.page_count().to_le_bytes());
+            buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
         }
         ManifestEntry::RemoveRun { level, path } => {
@@ -275,7 +275,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
-            buf.extend_from_slice(&meta.page_count().to_le_bytes());
+            buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
             buf.extend_from_slice(&next_sequence.0.to_le_bytes());
         }

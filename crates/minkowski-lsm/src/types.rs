@@ -1,6 +1,7 @@
 //! Invariant-carrying newtype primitives shared across the manifest.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use crate::error::LsmError;
 use crate::manifest::NUM_LEVELS;
@@ -99,6 +100,31 @@ impl fmt::Display for Level {
     }
 }
 
+/// A page count — guaranteed non-zero at construction.
+///
+/// Layout-compatible with `u64` via `std::num::NonZeroU64`, so
+/// `Option<PageCount>` has the same size as `u64` (niche optimization).
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct PageCount(NonZeroU64);
+
+impl PageCount {
+    /// Construct a page count. Returns `None` if `value` is zero.
+    pub fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    /// Extract the underlying `u64`.
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for PageCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +186,30 @@ mod tests {
         let l = Level::L2;
         assert_eq!(l.as_u8(), 2);
         assert_eq!(l.as_index(), 2);
+    }
+
+    #[test]
+    fn pagecount_rejects_zero() {
+        assert!(PageCount::new(0).is_none());
+    }
+
+    #[test]
+    fn pagecount_accepts_one() {
+        let pc = PageCount::new(1).unwrap();
+        assert_eq!(pc.get(), 1);
+    }
+
+    #[test]
+    fn pagecount_accepts_large_values() {
+        let pc = PageCount::new(u64::MAX).unwrap();
+        assert_eq!(pc.get(), u64::MAX);
+    }
+
+    #[test]
+    fn pagecount_roundtrip() {
+        let pc = PageCount::new(42).unwrap();
+        let raw: u64 = pc.get();
+        let restored = PageCount::new(raw).unwrap();
+        assert_eq!(pc, restored);
     }
 }
