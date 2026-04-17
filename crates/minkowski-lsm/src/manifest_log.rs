@@ -1,8 +1,11 @@
 //! Persistent append-only log of manifest mutations.
 //!
-//! Each entry is framed as `[len: u32 LE][crc32: u32 LE][payload]` — the same
-//! 8-byte header format used by the WAL, reimplemented here to avoid a
-//! dependency on `minkowski-persist`.
+//! File layout:
+//! - Bytes 0..8: file header `[magic: b"MKMF"; 4][version: u8; 1][reserved: 0u8; 3]`.
+//! - Bytes 8..: zero or more frames, each `[len: u32 LE][crc32: u32 LE][payload]`.
+//!
+//! The frame format matches the WAL's (reimplemented here to avoid a
+//! dependency on `minkowski-persist`). The file header is manifest-specific.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -11,6 +14,62 @@ use std::path::{Path, PathBuf};
 use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::types::{Level, SeqNo, SeqRange};
+
+// ── File header ─────────────────────────────────────────────────────────────
+
+/// 4-byte magic: "M", "K", "M", "F" — Minkowski Manifest.
+const MAGIC_BYTES: [u8; 4] = *b"MKMF";
+
+const CURRENT_VERSION: u8 = 0x01;
+
+/// Total header size in bytes: 4 magic + 1 version + 3 reserved.
+const HEADER_SIZE: u64 = 8;
+
+/// Write the manifest log header at offset 0.
+///
+/// Layout: `[magic: 4][version: 1][reserved: 3]`. Reserved bytes are
+/// written as zero and ignored on read.
+fn write_header(file: &mut File) -> Result<(), LsmError> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&MAGIC_BYTES)?;
+    file.write_all(&[CURRENT_VERSION])?;
+    file.write_all(&[0u8; 3])?;
+    Ok(())
+}
+
+/// Read and validate the manifest log header.
+///
+/// Returns `LsmError::Format` with a descriptive message on:
+/// - File shorter than 8 bytes
+/// - Magic bytes don't match `MKMF`
+/// - Version byte doesn't match `CURRENT_VERSION`
+///
+/// Reserved bytes are not validated (forward-compat).
+fn validate_header(file: &mut File) -> Result<(), LsmError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 8];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(LsmError::Format(
+                "not a manifest log: file too short for header".to_owned(),
+            ));
+        }
+        Err(e) => return Err(LsmError::Io(e)),
+    }
+    if header[0..4] != MAGIC_BYTES {
+        return Err(LsmError::Format(
+            "not a manifest log: bad magic (delete manifest.log to rebuild from WAL)".to_owned(),
+        ));
+    }
+    let version = header[4];
+    if version != CURRENT_VERSION {
+        return Err(LsmError::Format(format!(
+            "unsupported manifest version {version}"
+        )));
+    }
+    Ok(())
+}
 
 // ── Entry type ──────────────────────────────────────────────────────────────
 
@@ -343,7 +402,17 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), 
     match entry {
         ManifestEntry::AddRun { level, meta } => manifest.add_run(*level, meta.clone()),
         ManifestEntry::RemoveRun { level, path } => {
-            manifest.remove_run(*level, path);
+            // A RemoveRun for a path the manifest doesn't know means log
+            // corruption — the corresponding AddRun was lost, or entries
+            // are out of order. Propagate so replay treats the rest as
+            // tail garbage. Same policy as PromoteRun above.
+            if manifest.remove_run(*level, path).is_none() {
+                return Err(LsmError::Format(format!(
+                    "RemoveRun: run {} not found at level {}",
+                    path.display(),
+                    level
+                )));
+            }
         }
         ManifestEntry::PromoteRun {
             from_level,
@@ -370,10 +439,43 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), 
     Ok(())
 }
 
+/// Replay the frame sequence starting at `start` in the given file.
+/// Truncates on torn-tail / decode / apply errors, as the existing
+/// recovery contract requires. Returns the recovered manifest and the
+/// post-truncation position (end of the valid frame region).
+fn replay_frames(file: &File, path: &Path, start: u64) -> Result<(LsmManifest, u64), LsmError> {
+    let mut manifest = LsmManifest::new();
+    let mut pos: u64 = start;
+
+    loop {
+        let (payload, next_pos) = match read_frame(file, pos) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(LsmError::Crc { .. } | LsmError::Format(_)) => {
+                truncate_at(path, pos)?;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let Ok(entry) = decode_entry(&payload) else {
+            truncate_at(path, pos)?;
+            break;
+        };
+        if apply_entry(&mut manifest, &entry).is_err() {
+            truncate_at(path, pos)?;
+            break;
+        }
+        pos = next_pos;
+    }
+
+    Ok((manifest, pos))
+}
+
 /// Persistent append-only log of manifest mutations.
 ///
 /// Each entry is framed with a CRC32 checksum for integrity. On crash
-/// recovery, [`replay`](Self::replay) reconstructs the manifest from the log,
+/// recovery, [`recover`](Self::recover) reconstructs the manifest from the log,
 /// tolerating a corrupt tail frame (torn write).
 pub struct ManifestLog {
     file: File,
@@ -381,30 +483,6 @@ pub struct ManifestLog {
 }
 
 impl ManifestLog {
-    /// Create a new empty manifest log, truncating any existing file.
-    pub fn create(path: &Path) -> Result<Self, LsmError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(path)?;
-        Ok(Self { file, write_pos: 0 })
-    }
-
-    /// Open an existing manifest log, positioning at the end for appending.
-    /// Creates the file if it doesn't exist.
-    pub fn open_or_create(path: &Path) -> Result<Self, LsmError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .read(true)
-            .open(path)?;
-        let write_pos = file.metadata()?.len();
-        Ok(Self { file, write_pos })
-    }
-
     /// Append an entry to the log, fsyncing for durability.
     pub fn append(&mut self, entry: &ManifestEntry) -> Result<(), LsmError> {
         let payload = encode_entry(entry)?;
@@ -414,45 +492,39 @@ impl ManifestLog {
         Ok(())
     }
 
-    /// Replay the log to reconstruct a manifest.
+    /// Load an existing manifest log or initialize a new empty one.
     ///
-    /// Tolerates corrupt tail frames (CRC mismatch, decode failure, or failed
-    /// semantic apply) by truncating the file to the last valid frame and
-    /// fsyncing. I/O errors are propagated. Returns an empty manifest if the
-    /// file doesn't exist.
-    pub fn replay(path: &Path) -> Result<LsmManifest, LsmError> {
+    /// If `path` does not exist: creates it, writes the header, fsyncs.
+    /// Returns `(LsmManifest::new(), log_handle)` ready to append.
+    ///
+    /// If `path` exists: reads the 8-byte header and validates magic +
+    /// version (rejecting unknown formats with `LsmError::Format`),
+    /// replays frames from offset 8 onward (truncating torn tails), and
+    /// returns `(recovered_manifest, log_handle)` with `write_pos` at
+    /// end of valid data.
+    pub fn recover(path: &Path) -> Result<(LsmManifest, Self), LsmError> {
         if !path.exists() {
-            return Ok(LsmManifest::new());
-        }
-        let file = File::open(path)?;
-        let mut manifest = LsmManifest::new();
-        let mut pos: u64 = 0;
-
-        loop {
-            let (payload, next_pos) = match read_frame(&file, pos) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(LsmError::Crc { .. } | LsmError::Format(_)) => {
-                    truncate_at(path, pos)?;
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
-
-            // Decode + apply errors both mean the frame is semantically bad;
-            // treat everything from `pos` onward as torn tail.
-            let Ok(entry) = decode_entry(&payload) else {
-                truncate_at(path, pos)?;
-                break;
-            };
-            if apply_entry(&mut manifest, &entry).is_err() {
-                truncate_at(path, pos)?;
-                break;
-            }
-            pos = next_pos;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(false)
+                .open(path)?;
+            write_header(&mut file)?;
+            file.sync_all()?;
+            return Ok((
+                LsmManifest::new(),
+                Self {
+                    file,
+                    write_pos: HEADER_SIZE,
+                },
+            ));
         }
 
-        Ok(manifest)
+        let mut file = OpenOptions::new().write(true).read(true).open(path)?;
+        validate_header(&mut file)?;
+        let (manifest, write_pos) = replay_frames(&file, path, HEADER_SIZE)?;
+        Ok((manifest, Self { file, write_pos }))
     }
 
     /// Explicit fsync.
@@ -553,15 +625,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         log.append(&ManifestEntry::AddRunAndSequence {
             level: Level::L0,
             meta: test_meta("atomic.run"),
             next_sequence: SeqNo(42),
         })
         .unwrap();
+        drop(log);
 
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 1);
         assert_eq!(manifest.next_sequence(), SeqNo(42));
         assert_eq!(
@@ -629,7 +702,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
         // File doesn't exist → empty manifest.
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
         assert_eq!(manifest.next_sequence(), SeqNo(0));
     }
@@ -639,7 +712,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         for i in 0..3 {
             let meta = test_meta(&format!("{i}.run"));
             log.append(&ManifestEntry::AddRun {
@@ -648,8 +721,9 @@ mod tests {
             })
             .unwrap();
         }
+        drop(log);
 
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 3);
         assert_eq!(manifest.runs_at_level(Level::L0).len(), 3);
     }
@@ -659,7 +733,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.log");
 
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         let meta = test_meta("ephemeral.run");
         log.append(&ManifestEntry::AddRun {
             level: Level::L0,
@@ -671,8 +745,9 @@ mod tests {
             path: meta.path().to_path_buf(),
         })
         .unwrap();
+        drop(log);
 
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 0);
     }
 
@@ -682,7 +757,7 @@ mod tests {
         let path = dir.path().join("manifest.log");
 
         // Write 2 good entries.
-        let mut log = ManifestLog::create(&path).unwrap();
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
         log.append(&ManifestEntry::AddRun {
             level: Level::L0,
             meta: test_meta("a.run"),
@@ -693,6 +768,7 @@ mod tests {
             meta: test_meta("b.run"),
         })
         .unwrap();
+        drop(log);
 
         // Append garbage (simulates torn write).
         {
@@ -701,12 +777,11 @@ mod tests {
         }
 
         // Replay should recover the 2 good entries.
-        let manifest = ManifestLog::replay(&path).unwrap();
+        let (manifest, mut log2) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest.total_runs(), 2);
 
-        // File should be truncated to remove garbage.
+        // File should be truncated to remove garbage; write_pos should be at end of valid data.
         let file_len = fs::metadata(&path).unwrap().len();
-        let mut log2 = ManifestLog::open_or_create(&path).unwrap();
         assert_eq!(log2.write_pos, file_len);
 
         // Should be able to append after recovery.
@@ -715,8 +790,164 @@ mod tests {
             meta: test_meta("c.run"),
         })
         .unwrap();
+        drop(log2);
 
-        let manifest2 = ManifestLog::replay(&path).unwrap();
+        let (manifest2, _) = ManifestLog::recover(&path).unwrap();
         assert_eq!(manifest2.total_runs(), 3);
+    }
+
+    #[test]
+    fn write_header_emits_expected_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        let mut file = File::create(&path).unwrap();
+        write_header(&mut file).unwrap();
+        drop(file);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[0..4], b"MKMF");
+        assert_eq!(bytes[4], 0x01);
+        assert_eq!(&bytes[5..8], &[0u8; 3]);
+    }
+
+    #[test]
+    fn validate_header_accepts_valid_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        write_header(&mut file).unwrap();
+        validate_header(&mut file).unwrap();
+    }
+
+    #[test]
+    fn validate_header_rejects_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        fs::write(&path, b"XXXX\x01\x00\x00\x00").unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("bad magic"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_header_rejects_unsupported_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        fs::write(&path, b"MKMF\xFF\x00\x00\x00").unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("unsupported manifest version"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_header_rejects_file_too_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        fs::write(&path, b"MKMF").unwrap(); // only 4 bytes
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("too short"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn recover_creates_file_with_header_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.log");
+        assert!(!path.exists());
+
+        let (manifest, _log) = ManifestLog::recover(&path).unwrap();
+        assert_eq!(manifest.total_runs(), 0);
+        assert_eq!(manifest.next_sequence(), SeqNo(0));
+
+        assert!(path.exists());
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[0..4], b"MKMF");
+        assert_eq!(bytes[4], 0x01);
+    }
+
+    #[test]
+    fn recover_accepts_valid_header_with_no_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.log");
+        // Pre-create with just a header.
+        {
+            let mut file = File::create(&path).unwrap();
+            write_header(&mut file).unwrap();
+            file.sync_all().unwrap();
+        }
+        let (manifest, log) = ManifestLog::recover(&path).unwrap();
+        assert_eq!(manifest.total_runs(), 0);
+        assert_eq!(log.write_pos, 8);
+    }
+
+    #[test]
+    fn recover_rejects_file_with_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.log");
+        fs::write(&path, b"XXXXv1\x00\x00\x00").unwrap();
+        let err = ManifestLog::recover(&path).err().unwrap();
+        assert!(matches!(err, LsmError::Format(_)));
+    }
+
+    #[test]
+    fn recover_rejects_file_with_unsupported_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v99.log");
+        fs::write(&path, b"MKMF\x63\x00\x00\x00").unwrap();
+        let err = ManifestLog::recover(&path).err().unwrap();
+        assert!(matches!(err, LsmError::Format(_)));
+    }
+
+    #[test]
+    fn recover_replays_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated.log");
+
+        // Write a header using the helper directly.
+        {
+            let mut file = File::create(&path).unwrap();
+            write_header(&mut file).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Reopen via recover, append an entry, reopen again.
+        let (_, mut log) = ManifestLog::recover(&path).unwrap();
+        log.append(&ManifestEntry::SetSequence {
+            next_sequence: SeqNo(42),
+        })
+        .unwrap();
+        drop(log);
+
+        let (manifest, _log) = ManifestLog::recover(&path).unwrap();
+        assert_eq!(manifest.next_sequence(), SeqNo(42));
     }
 }

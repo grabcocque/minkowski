@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use minkowski::World;
-use minkowski_lsm::manifest::LsmManifest;
+use minkowski_lsm::error::LsmError;
 use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
 use minkowski_lsm::types::{Level, SeqNo};
@@ -30,8 +30,7 @@ struct Vel {
 fn three_flushes_then_replay() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
 
@@ -72,20 +71,20 @@ fn three_flushes_then_replay() {
     assert!(p3.exists());
 
     // Replay the log from scratch — should reconstruct identical state.
-    let replayed = ManifestLog::replay(&log_path).unwrap();
-    assert_eq!(replayed.total_runs(), 3);
-    assert_eq!(replayed.next_sequence(), SeqNo(30));
-    assert_eq!(replayed.runs_at_level(Level::L0).len(), 3);
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(recovered.total_runs(), 3);
+    assert_eq!(recovered.next_sequence(), SeqNo(30));
+    assert_eq!(recovered.runs_at_level(Level::L0).len(), 3);
 
     // Verify run metadata matches.
-    for (original, recovered) in manifest
+    for (original, replayed) in manifest
         .runs_at_level(Level::L0)
         .iter()
-        .zip(replayed.runs_at_level(Level::L0).iter())
+        .zip(recovered.runs_at_level(Level::L0).iter())
     {
-        assert_eq!(original.path(), recovered.path());
-        assert_eq!(original.sequence_range(), recovered.sequence_range());
-        assert_eq!(original.page_count(), recovered.page_count());
+        assert_eq!(original.path(), replayed.path());
+        assert_eq!(original.sequence_range(), replayed.sequence_range());
+        assert_eq!(original.page_count(), replayed.page_count());
     }
 }
 
@@ -95,8 +94,7 @@ fn three_flushes_then_replay() {
 fn corrupt_tail_partial_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -115,7 +113,7 @@ fn corrupt_tail_partial_recovery() {
     }
 
     // Replay should recover the 2 good entries (each flush writes one atomic AddRunAndSequence entry).
-    let recovered = ManifestLog::replay(&log_path).unwrap();
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(recovered.total_runs(), 2);
     assert_eq!(recovered.next_sequence(), SeqNo(20));
 }
@@ -131,8 +129,7 @@ fn corrupt_tail_partial_recovery() {
 fn replay_converges_at_every_truncation_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     for i in 0..3u64 {
@@ -156,8 +153,22 @@ fn replay_converges_at_every_truncation_prefix() {
         let truncated_path = dir.path().join(format!("truncated_{truncate_len:05}.log"));
         fs::write(&truncated_path, &full_bytes[..truncate_len]).unwrap();
 
-        let replayed = ManifestLog::replay(&truncated_path)
-            .unwrap_or_else(|e| panic!("replay failed at truncate_len={truncate_len}: {e:?}"));
+        if truncate_len < 8 {
+            // Header missing or truncated: recover must return a
+            // Format error; no manifest is produced.
+            let err = ManifestLog::recover(&truncated_path).err().unwrap();
+            assert!(
+                matches!(err, LsmError::Format(_)),
+                "truncate_len={truncate_len}: expected Format, got {err:?}"
+            );
+            continue;
+        }
+
+        // truncate_len == 8: valid header, no frames — first Ok case,
+        // returns empty manifest. Subsequent iterations accumulate runs
+        // as frame boundaries are crossed.
+        let (replayed, _) = ManifestLog::recover(&truncated_path)
+            .unwrap_or_else(|e| panic!("recover failed at truncate_len={truncate_len}: {e:?}"));
 
         assert!(
             replayed.total_runs() <= 3,
@@ -168,12 +179,12 @@ fn replay_converges_at_every_truncation_prefix() {
         // Monotonicity: extending the prefix never loses state.
         assert!(
             replayed.total_runs() >= prev_total_runs,
-            "truncate_len={truncate_len}: total_runs rewound {prev_total_runs} → {}",
+            "truncate_len={truncate_len}: total_runs rewound {prev_total_runs} -> {}",
             replayed.total_runs()
         );
         assert!(
             replayed.next_sequence() >= prev_next_seq,
-            "truncate_len={truncate_len}: next_sequence rewound {prev_next_seq} → {}",
+            "truncate_len={truncate_len}: next_sequence rewound {prev_next_seq:?} -> {:?}",
             replayed.next_sequence()
         );
         prev_total_runs = replayed.total_runs();
@@ -194,8 +205,7 @@ fn replay_converges_at_every_truncation_prefix() {
 fn replay_truncates_log_on_promote_of_missing_run() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
@@ -217,7 +227,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     .unwrap();
     drop(log);
 
-    let recovered = ManifestLog::replay(&log_path).unwrap();
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(
         recovered.total_runs(),
         1,
@@ -237,8 +247,7 @@ fn replay_truncates_log_on_promote_of_missing_run() {
 fn cleanup_removes_orphans_and_tmp() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -269,8 +278,7 @@ fn cleanup_removes_orphans_and_tmp() {
 fn replay_truncates_log_on_unsorted_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
@@ -310,7 +318,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     drop(f);
 
     // Replay must truncate back to end of first valid frame.
-    let recovered = ManifestLog::replay(&log_path).unwrap();
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(
         recovered.total_runs(),
         1,
@@ -332,8 +340,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
 fn replay_truncates_log_on_invalid_level_byte() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
@@ -360,7 +367,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
     f.sync_all().unwrap();
     drop(f);
 
-    let recovered = ManifestLog::replay(&log_path).unwrap();
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(
         recovered.total_runs(),
         1,
@@ -383,8 +390,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
 fn replay_truncates_log_on_inverted_seq_range() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
@@ -423,7 +429,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     drop(f);
 
     // Replay must truncate back to end of first valid frame.
-    let recovered = ManifestLog::replay(&log_path).unwrap();
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(
         recovered.total_runs(),
         1,
@@ -437,14 +443,129 @@ fn replay_truncates_log_on_inverted_seq_range() {
     );
 }
 
+/// Regression: a RemoveRun frame referencing a path the manifest doesn't
+/// know is log corruption. apply_entry must propagate the error so replay
+/// treats the rest of the log as tail garbage — same policy as PromoteRun.
+#[test]
+fn replay_truncates_log_on_remove_of_missing_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    // One real flush — produces a valid AddRunAndSequence entry.
+    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+
+    // Inject a RemoveRun referencing a path the manifest doesn't know.
+    log.append(&ManifestEntry::RemoveRun {
+        level: Level::L0,
+        path: PathBuf::from("ghost.run"),
+    })
+    .unwrap();
+    // Anything after the bad entry must be discarded on replay.
+    log.append(&ManifestEntry::SetSequence {
+        next_sequence: SeqNo(999),
+    })
+    .unwrap();
+    drop(log);
+
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the valid first flush should survive"
+    );
+    // The trailing SetSequence must not have been applied.
+    assert!(
+        recovered.next_sequence() < SeqNo(999),
+        "SetSequence past the bad RemoveRun must not apply"
+    );
+    assert_eq!(recovered.next_sequence(), SeqNo(10));
+}
+
+// ── recover() lifecycle and rejection regressions ───────────────────────────
+
+/// A recover -> flush -> recover round trip reconstructs identical state.
+/// Exercises the full lifecycle: open, write frames, close, reopen,
+/// verify per-run metadata matches.
+#[test]
+fn recover_then_flush_then_recover_roundtrips_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+
+    // Fresh recover creates the file.
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(manifest.total_runs(), 0);
+
+    // Two flushes produce two AddRunAndSequence frames.
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    world.clear_all_dirty_pages();
+    world.spawn((Pos { x: 2.0, y: 0.0 },));
+    flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path()).unwrap();
+    drop(log);
+
+    // Second recover replays both entries.
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(recovered.total_runs(), 2);
+    assert_eq!(recovered.next_sequence(), SeqNo(20));
+
+    // Metadata round-trips faithfully.
+    for (orig, rec) in manifest
+        .runs_at_level(Level::L0)
+        .iter()
+        .zip(recovered.runs_at_level(Level::L0).iter())
+    {
+        assert_eq!(orig.path(), rec.path());
+        assert_eq!(orig.sequence_range(), rec.sequence_range());
+    }
+}
+
+/// A file without the 8-byte magic+version header must be rejected
+/// with a Format error. Documents the strict-reject compatibility
+/// policy for legacy headerless logs.
+#[test]
+fn recover_rejects_file_without_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("legacy.log");
+
+    // Write raw bytes that look like a frame length prefix (not a
+    // header) — what a legacy headerless log would look like byte-for-byte.
+    fs::write(&log_path, [0x20, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x12]).unwrap();
+
+    let err = ManifestLog::recover(&log_path).err().unwrap();
+    assert!(
+        matches!(err, LsmError::Format(ref msg) if msg.contains("bad magic")),
+        "expected bad-magic Format error, got {err:?}"
+    );
+}
+
+/// A file with valid magic but an unrecognized version byte must be
+/// rejected (forward-compat gate: an older binary reading a newer file
+/// must fail loudly, not silently decode garbage).
+#[test]
+fn recover_rejects_file_with_unsupported_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("future.log");
+
+    fs::write(&log_path, b"MKMF\x63\x00\x00\x00").unwrap(); // version 0x63
+
+    let err = ManifestLog::recover(&log_path).err().unwrap();
+    assert!(
+        matches!(err, LsmError::Format(ref msg) if msg.contains("unsupported manifest version")),
+        "expected version-mismatch Format error, got {err:?}"
+    );
+}
+
 // ── Clean world ─────────────────────────────────────────────────────────────
 
 #[test]
 fn flush_and_record_clean_world_no_change() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("manifest.log");
-    let mut manifest = LsmManifest::new();
-    let mut log = ManifestLog::create(&log_path).unwrap();
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 2.0 },));
@@ -455,7 +576,7 @@ fn flush_and_record_clean_world_no_change() {
     assert_eq!(manifest.total_runs(), 0);
     assert_eq!(manifest.next_sequence(), SeqNo(0));
 
-    // Log should be empty — replay produces empty manifest.
-    let replayed = ManifestLog::replay(&log_path).unwrap();
+    // Log should be empty — recover produces empty manifest.
+    let (replayed, _) = ManifestLog::recover(&log_path).unwrap();
     assert_eq!(replayed.total_runs(), 0);
 }
