@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use minkowski::World;
 use minkowski_lsm::error::LsmError;
-use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
+use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, TAG_ADD_RUN, TAG_REMOVE_RUN};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
 use minkowski_lsm::types::{Level, SeqNo, SeqRange};
 
@@ -351,8 +351,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     // Bypass SortedRunMeta::new (can't call it — would error) by encoding
     // the bytes directly. Wire layout per manifest_log.rs::encode_entry.
     let mut payload = Vec::new();
-    // TAG_ADD_RUN = 0x01 (see manifest_log.rs::encode_entry AddRun branch)
-    payload.push(0x01);
+    payload.push(TAG_ADD_RUN);
     payload.push(0); // level
     // path: "x.run"
     let path_bytes = b"x.run";
@@ -418,8 +417,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
     // Craft a REMOVE_RUN frame with level=255 (invalid; NUM_LEVELS is 4).
     // REMOVE_RUN is the simplest level-bearing entry to fabricate.
     let mut payload = Vec::new();
-    // TAG_REMOVE_RUN = 0x02 (see manifest_log.rs::encode_entry RemoveRun branch)
-    payload.push(0x02);
+    payload.push(TAG_REMOVE_RUN);
     payload.push(255); // invalid level byte
     let path_bytes = b"ghost.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -477,8 +475,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     // makes SeqRange::new fail inside decode_entry → LsmError::Format.
     // Bypass SortedRunMeta::new by encoding the bytes directly.
     let mut payload = Vec::new();
-    // TAG_ADD_RUN = 0x01
-    payload.push(0x01);
+    payload.push(TAG_ADD_RUN);
     payload.push(0); // level (L0)
     // path: "bad.run"
     let path_bytes = b"bad.run";
@@ -652,6 +649,49 @@ fn recover_rejects_file_with_unsupported_version() {
         matches!(err, LsmError::Format(ref msg) if msg.contains("unsupported manifest version")),
         "expected version-mismatch Format error, got {err:?}"
     );
+}
+
+// ── Forward-compat and idempotency ──────────────────────────────────────────
+
+/// Reserved bytes in the header are documented as "ignored on read" for
+/// forward-compat with future flags. Pin that behavior: a header with
+/// non-zero reserved bytes followed by a valid frame must successfully
+/// recover.
+#[test]
+fn recover_ignores_nonzero_reserved_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("reserved.log");
+
+    // Write a v1 header with non-zero reserved bytes (bytes 5-7).
+    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+
+    // Recover should succeed on an otherwise-empty log.
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(recovered.total_runs(), 0);
+    assert_eq!(recovered.next_sequence(), SeqNo(0));
+}
+
+/// Calling recover() twice on the same path with no intervening writes
+/// must produce identical state. Guards against a bug where re-opening
+/// mutates the header or resets write_pos.
+#[test]
+fn recover_is_idempotent_with_no_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("idempotent.log");
+
+    // First recover creates the file.
+    let (manifest_a, log_a) = ManifestLog::recover(&log_path).unwrap();
+    let bytes_after_first = fs::read(&log_path).unwrap();
+    drop(log_a);
+
+    // Second recover on the same path — no flushes between.
+    let (manifest_b, log_b) = ManifestLog::recover(&log_path).unwrap();
+    let bytes_after_second = fs::read(&log_path).unwrap();
+    drop(log_b);
+
+    assert_eq!(manifest_a.total_runs(), manifest_b.total_runs());
+    assert_eq!(manifest_a.next_sequence(), manifest_b.next_sequence());
+    assert_eq!(bytes_after_first, bytes_after_second);
 }
 
 // ── Clean world ─────────────────────────────────────────────────────────────

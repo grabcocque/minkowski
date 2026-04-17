@@ -166,11 +166,11 @@ fn read_frame(file: &File, pos: u64) -> Result<Option<(Vec<u8>, u64)>, LsmError>
 
 // ── Entry codec ─────────────────────────────────────────────────────────────
 
-const TAG_ADD_RUN: u8 = 0x01;
-const TAG_REMOVE_RUN: u8 = 0x02;
-const TAG_PROMOTE_RUN: u8 = 0x03;
-const TAG_SET_SEQUENCE: u8 = 0x04;
-const TAG_ADD_RUN_AND_SEQUENCE: u8 = 0x05;
+pub const TAG_ADD_RUN: u8 = 0x01;
+pub const TAG_REMOVE_RUN: u8 = 0x02;
+pub const TAG_PROMOTE_RUN: u8 = 0x03;
+pub const TAG_SET_SEQUENCE: u8 = 0x04;
+pub const TAG_ADD_RUN_AND_SEQUENCE: u8 = 0x05;
 
 fn encode_path(buf: &mut Vec<u8>, path: &Path) -> Result<(), LsmError> {
     let s = path
@@ -614,6 +614,19 @@ mod tests {
             level: Level::L0,
             meta,
             next_sequence: SeqNo(99),
+        };
+        let payload = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn encode_decode_add_run_and_sequence_at_l3() {
+        let meta = test_meta("l3.run");
+        let entry = ManifestEntry::AddRunAndSequence {
+            level: Level::L3,
+            meta,
+            next_sequence: SeqNo(42),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();

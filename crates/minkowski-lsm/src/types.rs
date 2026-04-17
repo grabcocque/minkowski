@@ -129,6 +129,14 @@ impl fmt::Display for PageCount {
 mod tests {
     use super::*;
 
+    // Tombstone tests: SeqNo must NOT implement Add/Sub/AddAssign/SubAssign.
+    // "sequence numbers are identities, not sizes."
+    use static_assertions::assert_not_impl_all;
+    use std::ops::{Add, AddAssign, Sub, SubAssign};
+
+    assert_not_impl_all!(SeqNo: Add<SeqNo>, Sub<SeqNo>, AddAssign<SeqNo>, SubAssign<SeqNo>);
+    assert_not_impl_all!(SeqNo: Add<u64>, Sub<u64>, AddAssign<u64>, SubAssign<u64>);
+
     #[test]
     fn seqno_display_matches_inner_u64() {
         assert_eq!(SeqNo(42).to_string(), "42");

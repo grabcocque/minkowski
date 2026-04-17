@@ -12,4 +12,5 @@ crc32fast = "1"
 memmap2 = "0.9"
 
 [dev-dependencies]
+static_assertions = "1"
 tempfile = "3"
