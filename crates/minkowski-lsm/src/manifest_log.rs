@@ -399,7 +399,17 @@ fn apply_entry(manifest: &mut LsmManifest, entry: &ManifestEntry) -> Result<(), 
     match entry {
         ManifestEntry::AddRun { level, meta } => manifest.add_run(*level, meta.clone()),
         ManifestEntry::RemoveRun { level, path } => {
-            manifest.remove_run(*level, path);
+            // A RemoveRun for a path the manifest doesn't know means log
+            // corruption — the corresponding AddRun was lost, or entries
+            // are out of order. Propagate so replay treats the rest as
+            // tail garbage. Same policy as PromoteRun above.
+            if manifest.remove_run(*level, path).is_none() {
+                return Err(LsmError::Format(format!(
+                    "RemoveRun: run {} not found at level {}",
+                    path.display(),
+                    level
+                )));
+            }
         }
         ManifestEntry::PromoteRun {
             from_level,

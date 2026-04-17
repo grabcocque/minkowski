@@ -443,6 +443,47 @@ fn replay_truncates_log_on_inverted_seq_range() {
     );
 }
 
+/// Regression: a RemoveRun frame referencing a path the manifest doesn't
+/// know is log corruption. apply_entry must propagate the error so replay
+/// treats the rest of the log as tail garbage — same policy as PromoteRun.
+#[test]
+fn replay_truncates_log_on_remove_of_missing_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    // One real flush — produces a valid AddRunAndSequence entry.
+    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+
+    // Inject a RemoveRun referencing a path the manifest doesn't know.
+    log.append(&ManifestEntry::RemoveRun {
+        level: Level::L0,
+        path: PathBuf::from("ghost.run"),
+    })
+    .unwrap();
+    // Anything after the bad entry must be discarded on replay.
+    log.append(&ManifestEntry::SetSequence {
+        next_sequence: SeqNo(999),
+    })
+    .unwrap();
+    drop(log);
+
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the valid first flush should survive"
+    );
+    // The trailing SetSequence must not have been applied.
+    assert!(
+        recovered.next_sequence() < SeqNo(999),
+        "SetSequence past the bad RemoveRun must not apply"
+    );
+    assert_eq!(recovered.next_sequence(), SeqNo(10));
+}
+
 // ── Clean world ─────────────────────────────────────────────────────────────
 
 #[test]
