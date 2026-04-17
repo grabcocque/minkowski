@@ -17,7 +17,7 @@ pub struct LsmManifest {
 pub struct SortedRunMeta {
     path: PathBuf,
     sequence_range: SeqRange,
-    archetype_coverage: Vec<u16>,
+    archetype_coverage: Box<[u16]>, // was: Vec<u16>
     page_count: PageCount,
     size_bytes: u64,
 }
@@ -69,7 +69,7 @@ impl SortedRunMeta {
         Ok(Self {
             path,
             sequence_range,
-            archetype_coverage,
+            archetype_coverage: archetype_coverage.into_boxed_slice(),
             page_count,
             size_bytes,
         })
