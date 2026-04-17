@@ -484,6 +484,81 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     assert_eq!(recovered.next_sequence(), SeqNo(10));
 }
 
+// ── recover() lifecycle and rejection regressions ───────────────────────────
+
+/// A recover -> flush -> recover round trip reconstructs identical state.
+/// Exercises the full lifecycle through the new unified entry point.
+#[test]
+fn recover_then_flush_then_recover_roundtrips_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+
+    // Fresh recover creates the file.
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(manifest.total_runs(), 0);
+
+    // Two flushes produce two AddRunAndSequence frames.
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    world.clear_all_dirty_pages();
+    world.spawn((Pos { x: 2.0, y: 0.0 },));
+    flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path()).unwrap();
+    drop(log);
+
+    // Second recover replays both entries.
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(recovered.total_runs(), 2);
+    assert_eq!(recovered.next_sequence(), SeqNo(20));
+
+    // Metadata round-trips faithfully.
+    for (orig, rec) in manifest
+        .runs_at_level(Level::L0)
+        .iter()
+        .zip(recovered.runs_at_level(Level::L0).iter())
+    {
+        assert_eq!(orig.path(), rec.path());
+        assert_eq!(orig.sequence_range(), rec.sequence_range());
+    }
+}
+
+/// Opening a file that wasn't produced by PR-B1-or-later code (no 8-byte
+/// header at offset 0) must fail fast with a Format error. Explicitly
+/// documents the strict-reject compatibility decision.
+#[test]
+fn recover_rejects_file_without_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("legacy.log");
+
+    // Write raw bytes starting with what looks like a frame length prefix
+    // (not a header). This is what a pre-PR-B1 manifest log would look
+    // like byte-for-byte.
+    fs::write(&log_path, [0x20, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x12]).unwrap();
+
+    let err = ManifestLog::recover(&log_path).err().unwrap();
+    assert!(
+        matches!(err, LsmError::Format(ref msg) if msg.contains("bad magic")),
+        "expected bad-magic Format error, got {err:?}"
+    );
+}
+
+/// A file with valid magic but an unrecognized version byte must be
+/// rejected (forward-compat gate: an older binary reading a newer file
+/// must fail loudly, not silently decode garbage).
+#[test]
+fn recover_rejects_file_with_unsupported_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("future.log");
+
+    fs::write(&log_path, b"MKMF\x63\x00\x00\x00").unwrap(); // version 0x63
+
+    let err = ManifestLog::recover(&log_path).err().unwrap();
+    assert!(
+        matches!(err, LsmError::Format(ref msg) if msg.contains("unsupported manifest version")),
+        "expected version-mismatch Format error, got {err:?}"
+    );
+}
+
 // ── Clean world ─────────────────────────────────────────────────────────────
 
 #[test]
