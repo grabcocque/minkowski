@@ -379,7 +379,13 @@ mod tests {
             },));
         }
         let dir = tempfile::tempdir().unwrap();
-        let path = flush(&world, (10, 20), dir.path()).unwrap().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
         (dir, path, world)
     }
 
@@ -463,7 +469,13 @@ mod tests {
         world.spawn((Vel { dx: 1.0, dy: 0.0 },));
 
         let dir = tempfile::tempdir().unwrap();
-        let path = flush(&world, (0, 0), dir.path()).unwrap().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
         let reader = SortedRunReader::open(&path).unwrap();
 
         let ids = reader.archetype_ids();
@@ -538,7 +550,13 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let path = flush(&world, (0, 100), dir.path()).unwrap().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(100)).unwrap(),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
         let reader = SortedRunReader::open(&path).unwrap();
 
         // Verify schema has 2 component entries.

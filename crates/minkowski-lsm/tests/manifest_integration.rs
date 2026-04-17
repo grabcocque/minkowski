@@ -8,7 +8,7 @@ use minkowski::World;
 use minkowski_lsm::error::LsmError;
 use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
-use minkowski_lsm::types::{Level, SeqNo};
+use minkowski_lsm::types::{Level, SeqNo, SeqRange};
 
 #[derive(Clone, Copy)]
 #[expect(dead_code)]
@@ -41,9 +41,15 @@ fn three_flushes_then_replay() {
             y: 0.0,
         },));
     }
-    let p1 = flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path())
-        .unwrap()
-        .unwrap();
+    let p1 = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
     world.clear_all_dirty_pages();
 
     // Flush 2: spawn more.
@@ -53,16 +59,28 @@ fn three_flushes_then_replay() {
             y: 1.0,
         },));
     }
-    let p2 = flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path())
-        .unwrap()
-        .unwrap();
+    let p2 = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
     world.clear_all_dirty_pages();
 
     // Flush 3: spawn with a different archetype.
     world.spawn((Vel { dx: 1.0, dy: 2.0 },));
-    let p3 = flush_and_record(&world, (20, 30), &mut manifest, &mut log, dir.path())
-        .unwrap()
-        .unwrap();
+    let p3 = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(20), SeqNo(30)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
 
     assert_eq!(manifest.total_runs(), 3);
     assert_eq!(manifest.next_sequence(), SeqNo(30));
@@ -100,11 +118,25 @@ fn corrupt_tail_partial_recovery() {
     world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // Two good flushes.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     world.clear_all_dirty_pages();
 
     world.spawn((Pos { x: 3.0, y: 4.0 },));
-    flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Append garbage to simulate a torn write.
     {
@@ -139,7 +171,14 @@ fn replay_converges_at_every_truncation_prefix() {
         },));
         let lo = i * 10;
         let hi = lo + 10;
-        flush_and_record(&world, (lo, hi), &mut manifest, &mut log, dir.path()).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo(lo), SeqNo(hi)).unwrap(),
+            &mut manifest,
+            &mut log,
+            dir.path(),
+        )
+        .unwrap();
         world.clear_all_dirty_pages();
     }
 
@@ -210,7 +249,14 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // Real flush: produces a genuine AddRunAndSequence entry.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Inject a PromoteRun that references a path the manifest doesn't know.
     // Models a corrupted log or an out-of-order mutation.
@@ -253,7 +299,14 @@ fn cleanup_removes_orphans_and_tmp() {
     world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // One real flush.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Create orphan files.
     fs::write(dir.path().join("999-1000.run"), b"orphan").unwrap();
@@ -283,7 +336,14 @@ fn replay_truncates_log_on_unsorted_coverage() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush, produces a valid AddRunAndSequence frame.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
@@ -344,7 +404,14 @@ fn replay_truncates_log_on_invalid_level_byte() {
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
@@ -395,7 +462,14 @@ fn replay_truncates_log_on_inverted_seq_range() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush, produces a valid AddRunAndSequence frame.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
@@ -455,7 +529,14 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush — produces a valid AddRunAndSequence entry.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Inject a RemoveRun referencing a path the manifest doesn't know.
     log.append(&ManifestEntry::RemoveRun {
@@ -501,10 +582,24 @@ fn recover_then_flush_then_recover_roundtrips_state() {
     // Two flushes produce two AddRunAndSequence frames.
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     world.clear_all_dirty_pages();
     world.spawn((Pos { x: 2.0, y: 0.0 },));
-    flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     drop(log);
 
     // Second recover replays both entries.
@@ -571,7 +666,14 @@ fn flush_and_record_clean_world_no_change() {
     world.spawn((Pos { x: 1.0, y: 2.0 },));
     world.clear_all_dirty_pages();
 
-    let result = flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    let result = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     assert!(result.is_none());
     assert_eq!(manifest.total_runs(), 0);
     assert_eq!(manifest.next_sequence(), SeqNo(0));

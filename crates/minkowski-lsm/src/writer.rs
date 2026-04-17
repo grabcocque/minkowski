@@ -8,6 +8,7 @@ use minkowski::World;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
+use crate::types::SeqRange;
 
 /// Convert a `usize` to `u16`, returning `LsmError::Format` on overflow.
 fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
@@ -23,7 +24,7 @@ fn to_u16(value: usize, label: &str) -> Result<u16, LsmError> {
 /// the header for recovery to know where to start WAL replay.
 pub fn flush(
     world: &World,
-    sequence_range: (u64, u64),
+    sequence_range: SeqRange,
     output_dir: &Path,
 ) -> Result<Option<PathBuf>, LsmError> {
     // ── 1. Collect dirty page set ───────────────────────────────────────────
@@ -83,7 +84,8 @@ pub fn flush(
         .collect();
 
     // ── 4. Write to temp file ───────────────────────────────────────────────
-    let (seq_lo, seq_hi) = sequence_range;
+    let seq_lo = sequence_range.lo().0;
+    let seq_hi = sequence_range.hi().0;
     let tmp_name = format!("{seq_lo}-{seq_hi}.run.tmp");
     let final_name = format!("{seq_lo}-{seq_hi}.run");
     let tmp_path = output_dir.join(&tmp_name);
@@ -380,6 +382,7 @@ fn write_zeros(w: &mut impl Write, n: usize) -> Result<(), LsmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{SeqNo, SeqRange};
     use minkowski::World;
 
     #[derive(Clone, Copy)]
@@ -402,7 +405,12 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         world.clear_all_dirty_pages();
         let dir = tempfile::tempdir().unwrap();
-        let result = flush(&world, (0, 0), dir.path()).unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -412,7 +420,12 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         // Pages are dirty from spawn.
         let dir = tempfile::tempdir().unwrap();
-        let result = flush(&world, (1, 5), dir.path()).unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo(1), SeqNo(5)).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
         assert!(result.is_some());
         let path = result.unwrap();
         assert!(path.exists());
@@ -424,7 +437,12 @@ mod tests {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         let dir = tempfile::tempdir().unwrap();
-        let result = flush(&world, (10, 20), dir.path()).unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
         let path = result.unwrap();
         let data = std::fs::read(&path).unwrap();
         assert_eq!(&data[..8], &MAGIC);
@@ -436,7 +454,12 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 2.0 }, Vel { dx: 0.5, dy: -0.5 }));
         world.spawn((Pos { x: 3.0, y: 4.0 }, Vel { dx: 1.0, dy: 1.0 }));
         let dir = tempfile::tempdir().unwrap();
-        let result = flush(&world, (0, 10), dir.path()).unwrap();
+        let result = flush(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
         assert!(result.is_some());
         let path = result.unwrap();
         let data = std::fs::read(&path).unwrap();
@@ -456,7 +479,13 @@ mod tests {
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 2.0 },));
         let dir = tempfile::tempdir().unwrap();
-        let path = flush(&world, (0, 1), dir.path()).unwrap().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(1)).unwrap(),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
         let data = std::fs::read(&path).unwrap();
 
         let stored_crc = u32::from_le_bytes(data[40..44].try_into().unwrap());
