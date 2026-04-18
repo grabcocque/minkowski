@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::LsmError;
-use crate::types::{Level, SeqNo, SeqRange};
+use crate::types::{Level, PageCount, SeqNo, SeqRange};
 
 /// Number of LSM levels (L0 through L3).
 pub const NUM_LEVELS: usize = 4;
@@ -17,8 +17,8 @@ pub struct LsmManifest {
 pub struct SortedRunMeta {
     path: PathBuf,
     sequence_range: SeqRange,
-    archetype_coverage: Vec<u16>,
-    page_count: u64,
+    archetype_coverage: Box<[u16]>,
+    page_count: PageCount,
     size_bytes: u64,
 }
 
@@ -35,7 +35,7 @@ impl SortedRunMeta {
         &self.archetype_coverage
     }
 
-    pub fn page_count(&self) -> u64 {
+    pub fn page_count(&self) -> PageCount {
         self.page_count
     }
 
@@ -64,13 +64,12 @@ impl SortedRunMeta {
                 "archetype_coverage is not strictly sorted".to_owned(),
             ));
         }
-        if page_count == 0 {
-            return Err(LsmError::Format("page_count must be non-zero".to_owned()));
-        }
+        let page_count = PageCount::new(page_count)
+            .ok_or_else(|| LsmError::Format("page_count must be non-zero".to_owned()))?;
         Ok(Self {
             path,
             sequence_range,
-            archetype_coverage,
+            archetype_coverage: archetype_coverage.into_boxed_slice(),
             page_count,
             size_bytes,
         })
@@ -262,7 +261,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta.sequence_range().lo(), SeqNo(0));
-        assert_eq!(meta.page_count(), 1);
+        assert_eq!(meta.page_count().get(), 1);
     }
 
     #[test]

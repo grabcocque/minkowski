@@ -1,6 +1,7 @@
 //! Invariant-carrying newtype primitives shared across the manifest.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use crate::error::LsmError;
 use crate::manifest::NUM_LEVELS;
@@ -99,9 +100,46 @@ impl fmt::Display for Level {
     }
 }
 
+/// A page count — guaranteed non-zero at construction.
+///
+/// Layout-compatible with `u64` via `std::num::NonZeroU64`, so
+/// `Option<PageCount>` has the same size as `u64` (niche optimization).
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct PageCount(NonZeroU64);
+
+impl PageCount {
+    /// Returns `None` if `value` is zero.
+    pub fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for PageCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Tombstone tests: SeqNo must NOT implement Add/Sub/AddAssign/SubAssign.
+    use static_assertions::{assert_eq_size, assert_not_impl_all};
+    use std::ops::{Add, AddAssign, Sub, SubAssign};
+
+    assert_not_impl_all!(SeqNo: Add<SeqNo>, Sub<SeqNo>, AddAssign<SeqNo>, SubAssign<SeqNo>);
+    assert_not_impl_all!(SeqNo: Add<u64>, Sub<u64>, AddAssign<u64>, SubAssign<u64>);
+
+    // Pin the PageCount layout claims documented on the type:
+    // - PageCount itself is 8 bytes (same as u64).
+    // - Option<PageCount> is 8 bytes via NonZeroU64's niche.
+    assert_eq_size!(PageCount, u64);
+    assert_eq_size!(Option<PageCount>, u64);
 
     #[test]
     fn seqno_display_matches_inner_u64() {
@@ -160,5 +198,30 @@ mod tests {
         let l = Level::L2;
         assert_eq!(l.as_u8(), 2);
         assert_eq!(l.as_index(), 2);
+    }
+
+    #[test]
+    fn pagecount_rejects_zero() {
+        assert!(PageCount::new(0).is_none());
+    }
+
+    #[test]
+    fn pagecount_accepts_one() {
+        let pc = PageCount::new(1).unwrap();
+        assert_eq!(pc.get(), 1);
+    }
+
+    #[test]
+    fn pagecount_accepts_large_values() {
+        let pc = PageCount::new(u64::MAX).unwrap();
+        assert_eq!(pc.get(), u64::MAX);
+    }
+
+    #[test]
+    fn pagecount_roundtrip() {
+        let pc = PageCount::new(42).unwrap();
+        let raw: u64 = pc.get();
+        let restored = PageCount::new(raw).unwrap();
+        assert_eq!(pc, restored);
     }
 }

@@ -5,6 +5,7 @@ use minkowski_lsm::error::LsmError;
 use minkowski_lsm::format::{ENTITY_SLOT, PAGE_SIZE};
 use minkowski_lsm::reader::SortedRunReader;
 use minkowski_lsm::schema::SchemaEntry;
+use minkowski_lsm::types::{SeqNo, SeqRange};
 use minkowski_lsm::writer::flush;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,9 +29,13 @@ struct Health(u32);
 /// The tempdir must be kept alive for the duration of the test.
 fn flush_and_open(world: &World) -> (tempfile::TempDir, SortedRunReader) {
     let dir = tempfile::tempdir().unwrap();
-    let path = flush(world, (0, 100), dir.path())
-        .unwrap()
-        .expect("flush should produce a file");
+    let path = flush(
+        world,
+        SeqRange::new(SeqNo(0), SeqNo(100)).unwrap(),
+        dir.path(),
+    )
+    .unwrap()
+    .expect("flush should produce a file");
     let reader = SortedRunReader::open(&path).unwrap();
     (dir, reader)
 }
@@ -218,7 +223,12 @@ fn no_dirty_pages_no_file() {
     world.clear_all_dirty_pages();
 
     let dir = tempfile::tempdir().unwrap();
-    let result = flush(&world, (0, 0), dir.path()).unwrap();
+    let result = flush(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+        dir.path(),
+    )
+    .unwrap();
     assert!(
         result.is_none(),
         "flush should return None when no dirty pages"
@@ -248,7 +258,13 @@ fn crc_corruption_detected() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let path = flush(&world, (0, 50), dir.path()).unwrap().unwrap();
+    let path = flush(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(50)).unwrap(),
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
 
     // Open the reader first to find a valid page's file_offset, then corrupt a
     // byte well inside that page's data region.  We use offset 256, which is
@@ -314,7 +330,13 @@ fn header_crc_corruption_detected() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let path = flush(&world, (0, 10), dir.path()).unwrap().unwrap();
+    let path = flush(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
 
     // Corrupt byte 20, which falls in the `page_count` field of the file
     // header (bytes 8-11: version, 12-15: schema_count, 16-23: page_count).
@@ -500,7 +522,13 @@ fn zst_component_round_trip() {
         world.spawn((Marker,));
     }
     let dir = tempfile::tempdir().unwrap();
-    let path = flush(&world, (0, 0), dir.path()).unwrap().unwrap();
+    let path = flush(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(0)).unwrap(),
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
     let reader = SortedRunReader::open(&path).unwrap();
 
     // Schema should have one entry for the ZST component.

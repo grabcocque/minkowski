@@ -166,11 +166,11 @@ fn read_frame(file: &File, pos: u64) -> Result<Option<(Vec<u8>, u64)>, LsmError>
 
 // ── Entry codec ─────────────────────────────────────────────────────────────
 
-const TAG_ADD_RUN: u8 = 0x01;
-const TAG_REMOVE_RUN: u8 = 0x02;
-const TAG_PROMOTE_RUN: u8 = 0x03;
-const TAG_SET_SEQUENCE: u8 = 0x04;
-const TAG_ADD_RUN_AND_SEQUENCE: u8 = 0x05;
+pub const TAG_ADD_RUN: u8 = 0x01;
+pub const TAG_REMOVE_RUN: u8 = 0x02;
+pub const TAG_PROMOTE_RUN: u8 = 0x03;
+pub const TAG_SET_SEQUENCE: u8 = 0x04;
+pub const TAG_ADD_RUN_AND_SEQUENCE: u8 = 0x05;
 
 fn encode_path(buf: &mut Vec<u8>, path: &Path) -> Result<(), LsmError> {
     let s = path
@@ -242,7 +242,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
-            buf.extend_from_slice(&meta.page_count().to_le_bytes());
+            buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
         }
         ManifestEntry::RemoveRun { level, path } => {
@@ -275,7 +275,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.sequence_range().lo().0.to_le_bytes());
             buf.extend_from_slice(&meta.sequence_range().hi().0.to_le_bytes());
             encode_coverage(&mut buf, meta.archetype_coverage())?;
-            buf.extend_from_slice(&meta.page_count().to_le_bytes());
+            buf.extend_from_slice(&meta.page_count().get().to_le_bytes());
             buf.extend_from_slice(&meta.size_bytes().to_le_bytes());
             buf.extend_from_slice(&next_sequence.0.to_le_bytes());
         }
@@ -598,6 +598,18 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_promote_run_at_l3_boundary() {
+        let entry = ManifestEntry::PromoteRun {
+            from_level: Level::L3,
+            to_level: Level::L0,
+            path: PathBuf::from("demoted.run"),
+        };
+        let payload = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
     fn encode_decode_set_sequence() {
         let entry = ManifestEntry::SetSequence {
             next_sequence: SeqNo(12345),
@@ -614,6 +626,19 @@ mod tests {
             level: Level::L0,
             meta,
             next_sequence: SeqNo(99),
+        };
+        let payload = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn encode_decode_add_run_and_sequence_at_l3() {
+        let meta = test_meta("l3.run");
+        let entry = ManifestEntry::AddRunAndSequence {
+            level: Level::L3,
+            meta,
+            next_sequence: SeqNo(42),
         };
         let payload = encode_entry(&entry).unwrap();
         let decoded = decode_entry(&payload).unwrap();

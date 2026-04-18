@@ -10,7 +10,7 @@ use crate::error::LsmError;
 use crate::manifest::{LsmManifest, SortedRunMeta};
 use crate::manifest_log::{ManifestEntry, ManifestLog};
 use crate::reader::SortedRunReader;
-use crate::types::{Level, SeqNo};
+use crate::types::{Level, SeqRange};
 use crate::writer::flush;
 
 /// Flush dirty pages and record the new sorted run in the manifest.
@@ -18,7 +18,7 @@ use crate::writer::flush;
 /// Returns `Ok(Some(path))` if a run was written, `Ok(None)` if no dirty pages.
 pub fn flush_and_record(
     world: &World,
-    sequence_range: (u64, u64),
+    sequence_range: SeqRange,
     manifest: &mut LsmManifest,
     log: &mut ManifestLog,
     output_dir: &Path,
@@ -46,11 +46,11 @@ pub fn flush_and_record(
     log.append(&ManifestEntry::AddRunAndSequence {
         level: Level::L0,
         meta: meta.clone(),
-        next_sequence: SeqNo(sequence_range.1),
+        next_sequence: sequence_range.hi(),
     })?;
 
     manifest.add_run(Level::L0, meta);
-    manifest.set_next_sequence(SeqNo(sequence_range.1));
+    manifest.set_next_sequence(sequence_range.hi());
 
     Ok(Some(path))
 }
@@ -120,8 +120,14 @@ mod tests {
         let log_path = dir.path().join("manifest.log");
         let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
-        let result =
-            flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+        let result = flush_and_record(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+            &mut manifest,
+            &mut log,
+            dir.path(),
+        )
+        .unwrap();
         assert!(result.is_some());
         assert_eq!(manifest.total_runs(), 1);
         assert_eq!(manifest.next_sequence(), SeqNo(10));
@@ -138,8 +144,14 @@ mod tests {
         let log_path = dir.path().join("manifest.log");
         let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
 
-        let result =
-            flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+        let result = flush_and_record(
+            &world,
+            SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+            &mut manifest,
+            &mut log,
+            dir.path(),
+        )
+        .unwrap();
         assert!(result.is_none());
         assert_eq!(manifest.total_runs(), 0);
     }

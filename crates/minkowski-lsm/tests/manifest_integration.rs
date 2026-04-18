@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use minkowski::World;
 use minkowski_lsm::error::LsmError;
-use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog};
+use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, TAG_ADD_RUN, TAG_REMOVE_RUN};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
-use minkowski_lsm::types::{Level, SeqNo};
+use minkowski_lsm::types::{Level, SeqNo, SeqRange};
 
 #[derive(Clone, Copy)]
 #[expect(dead_code)]
@@ -41,9 +41,15 @@ fn three_flushes_then_replay() {
             y: 0.0,
         },));
     }
-    let p1 = flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path())
-        .unwrap()
-        .unwrap();
+    let p1 = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
     world.clear_all_dirty_pages();
 
     // Flush 2: spawn more.
@@ -53,16 +59,28 @@ fn three_flushes_then_replay() {
             y: 1.0,
         },));
     }
-    let p2 = flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path())
-        .unwrap()
-        .unwrap();
+    let p2 = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
     world.clear_all_dirty_pages();
 
     // Flush 3: spawn with a different archetype.
     world.spawn((Vel { dx: 1.0, dy: 2.0 },));
-    let p3 = flush_and_record(&world, (20, 30), &mut manifest, &mut log, dir.path())
-        .unwrap()
-        .unwrap();
+    let p3 = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(20), SeqNo(30)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap()
+    .unwrap();
 
     assert_eq!(manifest.total_runs(), 3);
     assert_eq!(manifest.next_sequence(), SeqNo(30));
@@ -100,11 +118,25 @@ fn corrupt_tail_partial_recovery() {
     world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // Two good flushes.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     world.clear_all_dirty_pages();
 
     world.spawn((Pos { x: 3.0, y: 4.0 },));
-    flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Append garbage to simulate a torn write.
     {
@@ -139,7 +171,14 @@ fn replay_converges_at_every_truncation_prefix() {
         },));
         let lo = i * 10;
         let hi = lo + 10;
-        flush_and_record(&world, (lo, hi), &mut manifest, &mut log, dir.path()).unwrap();
+        flush_and_record(
+            &world,
+            SeqRange::new(SeqNo(lo), SeqNo(hi)).unwrap(),
+            &mut manifest,
+            &mut log,
+            dir.path(),
+        )
+        .unwrap();
         world.clear_all_dirty_pages();
     }
 
@@ -210,7 +249,14 @@ fn replay_truncates_log_on_promote_of_missing_run() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // Real flush: produces a genuine AddRunAndSequence entry.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Inject a PromoteRun that references a path the manifest doesn't know.
     // Models a corrupted log or an out-of-order mutation.
@@ -253,7 +299,14 @@ fn cleanup_removes_orphans_and_tmp() {
     world.spawn((Pos { x: 1.0, y: 2.0 },));
 
     // One real flush.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Create orphan files.
     fs::write(dir.path().join("999-1000.run"), b"orphan").unwrap();
@@ -283,7 +336,14 @@ fn replay_truncates_log_on_unsorted_coverage() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush, produces a valid AddRunAndSequence frame.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
@@ -291,8 +351,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     // Bypass SortedRunMeta::new (can't call it — would error) by encoding
     // the bytes directly. Wire layout per manifest_log.rs::encode_entry.
     let mut payload = Vec::new();
-    // TAG_ADD_RUN = 0x01 (see manifest_log.rs::encode_entry AddRun branch)
-    payload.push(0x01);
+    payload.push(TAG_ADD_RUN);
     payload.push(0); // level
     // path: "x.run"
     let path_bytes = b"x.run";
@@ -344,15 +403,21 @@ fn replay_truncates_log_on_invalid_level_byte() {
 
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
     // Craft a REMOVE_RUN frame with level=255 (invalid; NUM_LEVELS is 4).
     // REMOVE_RUN is the simplest level-bearing entry to fabricate.
     let mut payload = Vec::new();
-    // TAG_REMOVE_RUN = 0x02 (see manifest_log.rs::encode_entry RemoveRun branch)
-    payload.push(0x02);
+    payload.push(TAG_REMOVE_RUN);
     payload.push(255); // invalid level byte
     let path_bytes = b"ghost.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -395,7 +460,14 @@ fn replay_truncates_log_on_inverted_seq_range() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush, produces a valid AddRunAndSequence frame.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
@@ -403,8 +475,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     // makes SeqRange::new fail inside decode_entry → LsmError::Format.
     // Bypass SortedRunMeta::new by encoding the bytes directly.
     let mut payload = Vec::new();
-    // TAG_ADD_RUN = 0x01
-    payload.push(0x01);
+    payload.push(TAG_ADD_RUN);
     payload.push(0); // level (L0)
     // path: "bad.run"
     let path_bytes = b"bad.run";
@@ -455,7 +526,14 @@ fn replay_truncates_log_on_remove_of_missing_run() {
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
     // One real flush — produces a valid AddRunAndSequence entry.
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
 
     // Inject a RemoveRun referencing a path the manifest doesn't know.
     log.append(&ManifestEntry::RemoveRun {
@@ -501,10 +579,24 @@ fn recover_then_flush_then_recover_roundtrips_state() {
     // Two flushes produce two AddRunAndSequence frames.
     let mut world = World::new();
     world.spawn((Pos { x: 1.0, y: 0.0 },));
-    flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     world.clear_all_dirty_pages();
     world.spawn((Pos { x: 2.0, y: 0.0 },));
-    flush_and_record(&world, (10, 20), &mut manifest, &mut log, dir.path()).unwrap();
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(10), SeqNo(20)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     drop(log);
 
     // Second recover replays both entries.
@@ -559,6 +651,49 @@ fn recover_rejects_file_with_unsupported_version() {
     );
 }
 
+// ── Forward-compat and idempotency ──────────────────────────────────────────
+
+/// Reserved bytes in the header are documented as "ignored on read" for
+/// forward-compat with future flags. Pin that behavior: a header with
+/// non-zero reserved bytes followed by a valid frame must successfully
+/// recover.
+#[test]
+fn recover_ignores_nonzero_reserved_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("reserved.log");
+
+    // Write a v1 header with non-zero reserved bytes (bytes 5-7).
+    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+
+    // Recover should succeed on an otherwise-empty log.
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(recovered.total_runs(), 0);
+    assert_eq!(recovered.next_sequence(), SeqNo(0));
+}
+
+/// Calling recover() twice on the same path with no intervening writes
+/// must produce identical state. Guards against a bug where re-opening
+/// mutates the header or resets write_pos.
+#[test]
+fn recover_is_idempotent_with_no_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("idempotent.log");
+
+    // First recover creates the file.
+    let (manifest_a, log_a) = ManifestLog::recover(&log_path).unwrap();
+    let bytes_after_first = fs::read(&log_path).unwrap();
+    drop(log_a);
+
+    // Second recover on the same path — no flushes between.
+    let (manifest_b, log_b) = ManifestLog::recover(&log_path).unwrap();
+    let bytes_after_second = fs::read(&log_path).unwrap();
+    drop(log_b);
+
+    assert_eq!(manifest_a.total_runs(), manifest_b.total_runs());
+    assert_eq!(manifest_a.next_sequence(), manifest_b.next_sequence());
+    assert_eq!(bytes_after_first, bytes_after_second);
+}
+
 // ── Clean world ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -571,7 +706,14 @@ fn flush_and_record_clean_world_no_change() {
     world.spawn((Pos { x: 1.0, y: 2.0 },));
     world.clear_all_dirty_pages();
 
-    let result = flush_and_record(&world, (0, 10), &mut manifest, &mut log, dir.path()).unwrap();
+    let result = flush_and_record(
+        &world,
+        SeqRange::new(SeqNo(0), SeqNo(10)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
     assert!(result.is_none());
     assert_eq!(manifest.total_runs(), 0);
     assert_eq!(manifest.next_sequence(), SeqNo(0));
