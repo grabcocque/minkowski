@@ -3,8 +3,8 @@ use parking_lot::Mutex;
 use minkowski::{Access, EnumChangeSet, Transact, TransactError, Tx, World, WorldMismatch};
 
 use crate::checkpoint::CheckpointHandler;
-use crate::codec::CodecRegistry;
 use crate::wal::Wal;
+use minkowski_lsm::codec::CodecRegistry;
 
 /// Wraps any [`Transact`] strategy to guarantee WAL logging on commit.
 ///
@@ -132,9 +132,9 @@ impl<S: Transact> Transact for Durable<S> {
 mod tests {
     use super::*;
     use crate::checkpoint::CheckpointHandler;
-    use crate::codec::CodecRegistry;
     use crate::wal::{Wal, WalConfig};
     use minkowski::{Optimistic, Pessimistic};
+    use minkowski_lsm::codec::CodecRegistry;
     use rkyv::{Archive, Deserialize, Serialize};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};

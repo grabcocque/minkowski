@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, MutationRef, World};
 
-use crate::codec::{CodecError, CodecRegistry, CrcProof};
 use crate::record::{ComponentSchema, SerializedMutation, WalEntry, WalSchema};
+use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 
 // WAL segment format (v2):
 //   [segment_magic: 4 bytes "MKW2"]
@@ -1158,7 +1158,7 @@ impl WalCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::CodecRegistry;
+    use minkowski_lsm::codec::CodecRegistry;
     use rkyv::{Archive, Deserialize, Serialize};
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]

@@ -1,6 +1,5 @@
 pub mod blob;
 pub mod checkpoint;
-pub mod codec;
 pub mod durable;
 pub mod index;
 pub mod record;
@@ -10,9 +9,9 @@ pub mod wal;
 
 pub use blob::{BlobRef, BlobStore};
 pub use checkpoint::{AutoCheckpoint, CheckpointHandler};
-pub use codec::{CodecError, CodecRegistry};
 pub use durable::Durable;
 pub use index::{IndexPersistError, PersistentIndex, load_btree_index, load_hash_index};
+pub use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 pub use record::*;
 pub use replication::{ReplicationError, apply_batch};
 pub use snapshot::{Snapshot, SnapshotError};

@@ -13,9 +13,9 @@ use std::collections::HashMap;
 
 use minkowski::{ComponentId, World};
 
-use crate::codec::{CodecError, CodecRegistry};
 use crate::record::ReplicationBatch;
 use crate::wal::{WalError, apply_record};
+use minkowski_lsm::codec::{CodecError, CodecRegistry};
 
 /// Errors from transport-agnostic replication operations.
 ///
@@ -86,10 +86,10 @@ pub fn apply_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::CodecRegistry;
     use crate::record::{ComponentSchema, SerializedMutation, WalRecord, WalSchema};
     use crate::wal::{Wal, WalConfig, WalCursor, WalError};
     use minkowski::{EnumChangeSet, World};
+    use minkowski_lsm::codec::CodecRegistry;
 
     #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, PartialEq, Debug)]
     struct Pos {
