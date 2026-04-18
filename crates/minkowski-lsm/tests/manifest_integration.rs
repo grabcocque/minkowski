@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use minkowski::World;
 use minkowski_lsm::error::LsmError;
-use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, TAG_ADD_RUN, TAG_REMOVE_RUN};
+use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, ManifestTag};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
 use minkowski_lsm::types::{Level, SeqNo, SeqRange};
 
@@ -351,7 +351,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     // Bypass SortedRunMeta::new (can't call it — would error) by encoding
     // the bytes directly. Wire layout per manifest_log.rs::encode_entry.
     let mut payload = Vec::new();
-    payload.push(TAG_ADD_RUN);
+    payload.push(ManifestTag::AddRun as u8);
     payload.push(0); // level
     // path: "x.run"
     let path_bytes = b"x.run";
@@ -417,7 +417,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
     // Craft a REMOVE_RUN frame with level=255 (invalid; NUM_LEVELS is 4).
     // REMOVE_RUN is the simplest level-bearing entry to fabricate.
     let mut payload = Vec::new();
-    payload.push(TAG_REMOVE_RUN);
+    payload.push(ManifestTag::RemoveRun as u8);
     payload.push(255); // invalid level byte
     let path_bytes = b"ghost.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -475,7 +475,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     // makes SeqRange::new fail inside decode_entry → LsmError::Format.
     // Bypass SortedRunMeta::new by encoding the bytes directly.
     let mut payload = Vec::new();
-    payload.push(TAG_ADD_RUN);
+    payload.push(ManifestTag::AddRun as u8);
     payload.push(0); // level (L0)
     // path: "bad.run"
     let path_bytes = b"bad.run";
@@ -545,7 +545,7 @@ fn replay_truncates_log_on_zero_page_count() {
     //   [coverage_count: u16 LE][coverage: u16 × count LE]
     //   [page_count: u64 LE][size_bytes: u64 LE]
     let mut payload = Vec::new();
-    payload.push(TAG_ADD_RUN);
+    payload.push(ManifestTag::AddRun as u8);
     payload.push(0); // level = 0
     let path_bytes = b"zero.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());

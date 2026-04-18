@@ -166,11 +166,35 @@ fn read_frame(file: &File, pos: u64) -> Result<Option<(Vec<u8>, u64)>, LsmError>
 
 // ── Entry codec ─────────────────────────────────────────────────────────────
 
-pub const TAG_ADD_RUN: u8 = 0x01;
-pub const TAG_REMOVE_RUN: u8 = 0x02;
-pub const TAG_PROMOTE_RUN: u8 = 0x03;
-pub const TAG_SET_SEQUENCE: u8 = 0x04;
-pub const TAG_ADD_RUN_AND_SEQUENCE: u8 = 0x05;
+/// Tag byte identifying a `ManifestEntry` variant on disk.
+///
+/// `#[repr(u8)]` pins the discriminant values so the enum is layout-compatible
+/// with the existing wire format. Encode casts via `as u8`; decode parses via
+/// `TryFrom<u8>`, which returns `LsmError::Format` on unknown bytes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum ManifestTag {
+    AddRun = 0x01,
+    RemoveRun = 0x02,
+    PromoteRun = 0x03,
+    SetSequence = 0x04,
+    AddRunAndSequence = 0x05,
+}
+
+impl TryFrom<u8> for ManifestTag {
+    type Error = LsmError;
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        match byte {
+            0x01 => Ok(Self::AddRun),
+            0x02 => Ok(Self::RemoveRun),
+            0x03 => Ok(Self::PromoteRun),
+            0x04 => Ok(Self::SetSequence),
+            0x05 => Ok(Self::AddRunAndSequence),
+            other => Err(LsmError::Format(format!("unknown entry tag: {other:#04x}"))),
+        }
+    }
+}
 
 fn encode_path(buf: &mut Vec<u8>, path: &Path) -> Result<(), LsmError> {
     let s = path
@@ -236,7 +260,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
     let mut buf = Vec::new();
     match entry {
         ManifestEntry::AddRun { level, meta } => {
-            buf.push(TAG_ADD_RUN);
+            buf.push(ManifestTag::AddRun as u8);
             buf.push(level.as_u8());
             encode_path(&mut buf, meta.path())?;
             buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
@@ -246,7 +270,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             buf.extend_from_slice(&meta.size_bytes().get().to_le_bytes());
         }
         ManifestEntry::RemoveRun { level, path } => {
-            buf.push(TAG_REMOVE_RUN);
+            buf.push(ManifestTag::RemoveRun as u8);
             buf.push(level.as_u8());
             encode_path(&mut buf, path)?;
         }
@@ -255,13 +279,13 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             to_level,
             path,
         } => {
-            buf.push(TAG_PROMOTE_RUN);
+            buf.push(ManifestTag::PromoteRun as u8);
             buf.push(from_level.as_u8());
             buf.push(to_level.as_u8());
             encode_path(&mut buf, path)?;
         }
         ManifestEntry::SetSequence { next_sequence } => {
-            buf.push(TAG_SET_SEQUENCE);
+            buf.push(ManifestTag::SetSequence as u8);
             buf.extend_from_slice(&next_sequence.get().to_le_bytes());
         }
         ManifestEntry::AddRunAndSequence {
@@ -269,7 +293,7 @@ fn encode_entry(entry: &ManifestEntry) -> Result<Vec<u8>, LsmError> {
             meta,
             next_sequence,
         } => {
-            buf.push(TAG_ADD_RUN_AND_SEQUENCE);
+            buf.push(ManifestTag::AddRunAndSequence as u8);
             buf.push(level.as_u8());
             encode_path(&mut buf, meta.path())?;
             buf.extend_from_slice(&meta.sequence_range().lo().get().to_le_bytes());
@@ -287,11 +311,11 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
     if data.is_empty() {
         return Err(LsmError::Format("empty entry".to_owned()));
     }
-    let tag = data[0];
+    let tag = ManifestTag::try_from(data[0])?;
     let mut offset = 1;
 
     match tag {
-        TAG_ADD_RUN => {
+        ManifestTag::AddRun => {
             if offset >= data.len() {
                 return Err(LsmError::Format("truncated AddRun".to_owned()));
             }
@@ -323,7 +347,7 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             )?;
             Ok(ManifestEntry::AddRun { level, meta })
         }
-        TAG_REMOVE_RUN => {
+        ManifestTag::RemoveRun => {
             if offset >= data.len() {
                 return Err(LsmError::Format("truncated RemoveRun".to_owned()));
             }
@@ -334,7 +358,7 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
             let path = decode_path(data, &mut offset)?;
             Ok(ManifestEntry::RemoveRun { level, path })
         }
-        TAG_PROMOTE_RUN => {
+        ManifestTag::PromoteRun => {
             if offset + 2 > data.len() {
                 return Err(LsmError::Format("truncated PromoteRun".to_owned()));
             }
@@ -353,11 +377,11 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
                 path,
             })
         }
-        TAG_SET_SEQUENCE => {
+        ManifestTag::SetSequence => {
             let next_sequence = SeqNo::from(read_u64_le(data, &mut offset)?);
             Ok(ManifestEntry::SetSequence { next_sequence })
         }
-        TAG_ADD_RUN_AND_SEQUENCE => {
+        ManifestTag::AddRunAndSequence => {
             if offset >= data.len() {
                 return Err(LsmError::Format("truncated AddRunAndSequence".to_owned()));
             }
@@ -394,7 +418,6 @@ fn decode_entry(data: &[u8]) -> Result<ManifestEntry, LsmError> {
                 next_sequence,
             })
         }
-        _ => Err(LsmError::Format(format!("unknown entry tag: {tag:#04x}"))),
     }
 }
 
@@ -562,6 +585,44 @@ mod tests {
             SizeBytes::new(8192),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn manifest_tag_try_from_u8_accepts_known_values() {
+        assert_eq!(ManifestTag::try_from(0x01).unwrap(), ManifestTag::AddRun);
+        assert_eq!(ManifestTag::try_from(0x02).unwrap(), ManifestTag::RemoveRun);
+        assert_eq!(
+            ManifestTag::try_from(0x03).unwrap(),
+            ManifestTag::PromoteRun
+        );
+        assert_eq!(
+            ManifestTag::try_from(0x04).unwrap(),
+            ManifestTag::SetSequence
+        );
+        assert_eq!(
+            ManifestTag::try_from(0x05).unwrap(),
+            ManifestTag::AddRunAndSequence
+        );
+    }
+
+    #[test]
+    fn manifest_tag_try_from_u8_rejects_unknown_values() {
+        for byte in [0x00u8, 0x06, 0x7F, 0xFF] {
+            let err = ManifestTag::try_from(byte).unwrap_err();
+            assert!(matches!(err, LsmError::Format(_)));
+            if let LsmError::Format(msg) = err {
+                assert!(msg.contains("unknown entry tag"), "got: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_tag_as_u8_matches_discriminant() {
+        assert_eq!(ManifestTag::AddRun as u8, 0x01);
+        assert_eq!(ManifestTag::RemoveRun as u8, 0x02);
+        assert_eq!(ManifestTag::PromoteRun as u8, 0x03);
+        assert_eq!(ManifestTag::SetSequence as u8, 0x04);
+        assert_eq!(ManifestTag::AddRunAndSequence as u8, 0x05);
     }
 
     #[test]
