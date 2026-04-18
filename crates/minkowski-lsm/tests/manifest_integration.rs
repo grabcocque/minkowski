@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use minkowski::World;
 use minkowski_lsm::error::LsmError;
-use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, TAG_ADD_RUN, TAG_REMOVE_RUN};
+use minkowski_lsm::manifest_log::{ManifestEntry, ManifestLog, ManifestTag};
 use minkowski_lsm::manifest_ops::{cleanup_orphans, flush_and_record};
 use minkowski_lsm::types::{Level, SeqNo, SeqRange};
 
@@ -351,7 +351,7 @@ fn replay_truncates_log_on_unsorted_coverage() {
     // Bypass SortedRunMeta::new (can't call it — would error) by encoding
     // the bytes directly. Wire layout per manifest_log.rs::encode_entry.
     let mut payload = Vec::new();
-    payload.push(TAG_ADD_RUN);
+    payload.push(ManifestTag::AddRun as u8);
     payload.push(0); // level
     // path: "x.run"
     let path_bytes = b"x.run";
@@ -417,7 +417,7 @@ fn replay_truncates_log_on_invalid_level_byte() {
     // Craft a REMOVE_RUN frame with level=255 (invalid; NUM_LEVELS is 4).
     // REMOVE_RUN is the simplest level-bearing entry to fabricate.
     let mut payload = Vec::new();
-    payload.push(TAG_REMOVE_RUN);
+    payload.push(ManifestTag::RemoveRun as u8);
     payload.push(255); // invalid level byte
     let path_bytes = b"ghost.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -443,6 +443,56 @@ fn replay_truncates_log_on_invalid_level_byte() {
     assert_eq!(
         len_after_replay, len_after_first_frame,
         "replay truncated the invalid-level frame"
+    );
+}
+
+/// Regression: a frame with a valid CRC but an unknown tag byte must be
+/// treated as tail garbage. `ManifestTag::try_from` surfaces
+/// `LsmError::Format` for bytes outside the enum's defined range, and the
+/// replay loop must truncate at the bad frame rather than fail recovery.
+#[test]
+fn replay_truncates_log_on_unknown_tag_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
+
+    let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
+
+    // Craft a frame whose payload starts with 0x06 — the first byte past
+    // the last defined `ManifestTag` discriminant (0x05).
+    let payload = vec![0x06u8, 0x00, 0x00];
+
+    let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+    let len = payload.len() as u32;
+    let crc = crc32fast::hash(&payload);
+    f.write_all(&len.to_le_bytes()).unwrap();
+    f.write_all(&crc.to_le_bytes()).unwrap();
+    f.write_all(&payload).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the valid first flush survives"
+    );
+
+    let len_after_replay = fs::metadata(&log_path).unwrap().len();
+    assert_eq!(
+        len_after_replay, len_after_first_frame,
+        "replay truncated the unknown-tag frame"
     );
 }
 
@@ -475,7 +525,7 @@ fn replay_truncates_log_on_inverted_seq_range() {
     // makes SeqRange::new fail inside decode_entry → LsmError::Format.
     // Bypass SortedRunMeta::new by encoding the bytes directly.
     let mut payload = Vec::new();
-    payload.push(TAG_ADD_RUN);
+    payload.push(ManifestTag::AddRun as u8);
     payload.push(0); // level (L0)
     // path: "bad.run"
     let path_bytes = b"bad.run";
@@ -545,7 +595,7 @@ fn replay_truncates_log_on_zero_page_count() {
     //   [coverage_count: u16 LE][coverage: u16 × count LE]
     //   [page_count: u64 LE][size_bytes: u64 LE]
     let mut payload = Vec::new();
-    payload.push(TAG_ADD_RUN);
+    payload.push(ManifestTag::AddRun as u8);
     payload.push(0); // level = 0
     let path_bytes = b"zero.run";
     payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
