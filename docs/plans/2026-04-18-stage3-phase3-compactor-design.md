@@ -376,22 +376,24 @@ Phase 3 lands as **three sequential squash-merged PRs**, each with its own coher
 
 ### PR 1: Infrastructure (no semantics change)
 
-Pure refactor + type-system extension. Zero behavioral changes to existing callers. Estimated ~500–800 lines.
+Pure refactor + type-system extension. Zero behavioral changes to existing callers. Estimated ~400–600 lines.
 
 - Move `CrcProof` + `CodecRegistry` + `CodecError` from `minkowski-persist::codec` to `minkowski-lsm::codec`
 - Add `minkowski-lsm` dep to `minkowski-persist`; update all imports
 - Convert `LsmManifest` → `LsmManifest<const N: usize = 4>` with `DefaultManifest` alias
 - Propagate const-generic through `FlushWriter<N>` and manifest_ops call sites
 - Change `SortedRunReader::validate_page_crc` return type to `Result<CrcProof, LsmError>`
-- Add `recover_world_from_lsm` helper (new code, no callers yet; tested standalone)
 - Module-level regime doc on `manifest.rs`
 
 All existing tests pass unchanged. Easy review: if the build and tests pass, it's correct.
 
+**Deferred to PR 2**: `recover_world_from_lsm` helper. The page-to-archetype plumbing (reconstruct archetype schema from slots, spawn entities from entity-ID pages, fill columns from component pages) is non-trivial and has no value without a caller. PR 2 provides both the helper implementation and its first consumer (`LsmCheckpoint`'s recovery path).
+
 ### PR 2: LsmCheckpoint + snapshot clean cut
 
-Behavioral replacement. Estimated ~600–1000 lines, heavy deletions. Depends on PR 1.
+Behavioral replacement. Estimated ~800–1200 lines, heavy deletions + the recovery helper. Depends on PR 1.
 
+- Implement `recover_world_from_lsm<const N: usize>(run_dir, codecs) -> (World, SeqNo)` helper — reconstructs World by iterating sorted-run pages, using `CrcProof` fast path
 - Implement `LsmCheckpoint<N>` as new `CheckpointHandler` impl
 - Migrate `Durable<S>` default checkpoint handler from `AutoCheckpoint` to `LsmCheckpoint`
 - Delete `Snapshot`, `SnapshotError`, `AutoCheckpoint`, `save_to_bytes`, `load_from_bytes`
