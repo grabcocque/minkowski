@@ -598,6 +598,18 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_promote_run_at_l3_boundary() {
+        let entry = ManifestEntry::PromoteRun {
+            from_level: Level::L3,
+            to_level: Level::L0,
+            path: PathBuf::from("demoted.run"),
+        };
+        let payload = encode_entry(&entry).unwrap();
+        let decoded = decode_entry(&payload).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
     fn encode_decode_set_sequence() {
         let entry = ManifestEntry::SetSequence {
             next_sequence: SeqNo(12345),

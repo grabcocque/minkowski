@@ -17,7 +17,7 @@ pub struct LsmManifest {
 pub struct SortedRunMeta {
     path: PathBuf,
     sequence_range: SeqRange,
-    archetype_coverage: Box<[u16]>, // was: Vec<u16>
+    archetype_coverage: Box<[u16]>,
     page_count: PageCount,
     size_bytes: u64,
 }

@@ -108,12 +108,11 @@ impl fmt::Display for Level {
 pub struct PageCount(NonZeroU64);
 
 impl PageCount {
-    /// Construct a page count. Returns `None` if `value` is zero.
+    /// Returns `None` if `value` is zero.
     pub fn new(value: u64) -> Option<Self> {
         NonZeroU64::new(value).map(Self)
     }
 
-    /// Extract the underlying `u64`.
     pub fn get(self) -> u64 {
         self.0.get()
     }
@@ -130,12 +129,17 @@ mod tests {
     use super::*;
 
     // Tombstone tests: SeqNo must NOT implement Add/Sub/AddAssign/SubAssign.
-    // "sequence numbers are identities, not sizes."
-    use static_assertions::assert_not_impl_all;
+    use static_assertions::{assert_eq_size, assert_not_impl_all};
     use std::ops::{Add, AddAssign, Sub, SubAssign};
 
     assert_not_impl_all!(SeqNo: Add<SeqNo>, Sub<SeqNo>, AddAssign<SeqNo>, SubAssign<SeqNo>);
     assert_not_impl_all!(SeqNo: Add<u64>, Sub<u64>, AddAssign<u64>, SubAssign<u64>);
+
+    // Pin the PageCount layout claims documented on the type:
+    // - PageCount itself is 8 bytes (same as u64).
+    // - Option<PageCount> is 8 bytes via NonZeroU64's niche.
+    assert_eq_size!(PageCount, u64);
+    assert_eq_size!(Option<PageCount>, u64);
 
     #[test]
     fn seqno_display_matches_inner_u64() {
