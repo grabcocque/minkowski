@@ -1,3 +1,10 @@
+//! Newtype primitives for the LSM manifest subsystem.
+//!
+//! Construction idiom reflects the validity story:
+//! - `From<u64>` — total, interchangeable with `u64` (e.g., `SeqNo`).
+//! - `new(u64) -> Option<Self>` — fallible with a precondition (e.g., `PageCount::new` rejects zero, `Level::new` rejects out-of-range).
+//! - `new(u64) -> Self` without `From<u64>` — infallible but nominally distinct; `From` is deliberately omitted to block silent `.into()` conversions at adjacent-arg call sites (e.g., `SizeBytes`).
+//!
 //! Invariant-carrying newtype primitives shared across the manifest.
 
 use std::fmt;
@@ -144,7 +151,7 @@ impl fmt::Display for PageCount {
 /// Infallible newtype — zero is permitted (matches the semantics of
 /// `fs::metadata(...).len()`, which returns `0` for empty files).
 /// Type-level distinction from `PageCount` prevents arg-swap bugs at
-/// `SortedRunMeta::new`.
+/// any call site taking both.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct SizeBytes(u64);
 
@@ -168,7 +175,9 @@ impl fmt::Display for SizeBytes {
 mod tests {
     use super::*;
 
-    // Tombstone tests: SeqNo must NOT implement any arithmetic.
+    // Tombstones: sequences are identities, not sizes — arithmetic must
+    // stay unimplemented so `seq + 1` or `seq - other` fails to compile.
+    // See the SeqNo type doc comment above for the rationale.
     use static_assertions::{assert_eq_size, assert_not_impl_all};
     use std::ops::{Add, AddAssign, Div, Mul, Neg, Rem, Sub, SubAssign};
 

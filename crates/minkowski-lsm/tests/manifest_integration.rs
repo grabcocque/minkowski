@@ -514,6 +514,76 @@ fn replay_truncates_log_on_inverted_seq_range() {
     );
 }
 
+/// Regression: a frame whose decoded page_count is zero must be treated
+/// as tail garbage. PR B3 moved the `PageCount::new` validation from
+/// `SortedRunMeta::new` to the decode call sites; this test pins the
+/// decode-site rejection into the replay tail-truncation path.
+#[test]
+fn replay_truncates_log_on_zero_page_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("manifest.log");
+    let (mut manifest, mut log) = ManifestLog::recover(&log_path).unwrap();
+
+    let mut world = World::new();
+    world.spawn((Pos { x: 1.0, y: 0.0 },));
+    // One real flush — produces a valid AddRunAndSequence entry.
+    flush_and_record(
+        &world,
+        SeqRange::new(SeqNo::from(0u64), SeqNo::from(10u64)).unwrap(),
+        &mut manifest,
+        &mut log,
+        dir.path(),
+    )
+    .unwrap();
+
+    let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
+
+    // Handcraft an AddRun frame with page_count = 0.
+    // Wire layout (see manifest_log.rs::encode_entry AddRun branch):
+    //   [tag=0x01][level=0][path_len: u16 LE][path bytes]
+    //   [seq_lo: u64 LE][seq_hi: u64 LE]
+    //   [coverage_count: u16 LE][coverage: u16 × count LE]
+    //   [page_count: u64 LE][size_bytes: u64 LE]
+    let mut payload = Vec::new();
+    payload.push(TAG_ADD_RUN);
+    payload.push(0); // level = 0
+    let path_bytes = b"zero.run";
+    payload.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(path_bytes);
+    payload.extend_from_slice(&0u64.to_le_bytes()); // seq_lo
+    payload.extend_from_slice(&10u64.to_le_bytes()); // seq_hi
+    payload.extend_from_slice(&1u16.to_le_bytes()); // coverage_count
+    payload.extend_from_slice(&0u16.to_le_bytes()); // coverage[0]
+    payload.extend_from_slice(&0u64.to_le_bytes()); // page_count = 0 — invalid
+    payload.extend_from_slice(&1024u64.to_le_bytes()); // size_bytes
+
+    // Wrap in a frame with valid CRC so the frame layer accepts it.
+    let len = payload.len() as u32;
+    let crc = crc32fast::hash(&payload);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame.extend_from_slice(&payload);
+
+    let mut f = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+    f.write_all(&frame).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    // Replay must truncate at the bad frame.
+    let (recovered, _) = ManifestLog::recover(&log_path).unwrap();
+    assert_eq!(
+        recovered.total_runs(),
+        1,
+        "only the first valid flush should survive"
+    );
+    let len_after_replay = fs::metadata(&log_path).unwrap().len();
+    assert_eq!(
+        len_after_replay, len_after_first_frame,
+        "replay should have truncated the zero-page_count frame"
+    );
+}
+
 /// Regression: a RemoveRun frame referencing a path the manifest doesn't
 /// know is log corruption. apply_entry must propagate the error so replay
 /// treats the rest of the log as tail garbage — same policy as PromoteRun.
@@ -681,6 +751,8 @@ fn recover_preserves_reserved_bytes_through_append_cycle() {
 
     // Start with a valid header whose reserved bytes carry a non-zero
     // "flag" pattern.
+    // Layout: bytes 0..4 = magic ("MKMF"), byte 4 = version (0x01),
+    // bytes 5..8 = reserved (here 0xFF, 0xAA, 0x55).
     fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
 
     // Open, append one entry, close.

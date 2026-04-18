@@ -46,7 +46,7 @@ impl SortedRunMeta {
     /// Build a `SortedRunMeta` with enforced invariants.
     ///
     /// Validates:
-    /// - `archetype_coverage` is strictly sorted ascending (sorted + deduped).
+    /// - `archetype_coverage` is strictly ascending (no duplicates, no reordering).
     ///
     /// `page_count` is already non-zero (enforced by `PageCount::new` at the
     /// call site). `sequence_range` is already validated by `SeqRange::new`.
