@@ -366,9 +366,59 @@ Phase 2's `replay_converges_at_every_truncation_prefix` currently covers frame-l
 
 ## Rollout
 
-Single squash-merged PR per project convention. CI gates: fmt, clippy, test, tsan, loom, claude-review. `minkowski-lsm` test count expected to grow ~30–40 tests (from 118 current); `minkowski-persist` test count may shrink slightly as snapshot-specific tests are removed.
+Phase 3 lands as **three sequential squash-merged PRs**, each with its own coherent theme. The split avoids a single blast-radius PR that mixes pure refactor, behavioral replacement, and new feature work.
 
-**Post-merge memory updates**:
+**Dependency graph:**
+```
+  PR 1 ──┬─→ PR 2 (LsmCheckpoint + snapshot cut)
+         └─→ PR 3 (compactor)
+```
+
+### PR 1: Infrastructure (no semantics change)
+
+Pure refactor + type-system extension. Zero behavioral changes to existing callers. Estimated ~500–800 lines.
+
+- Move `CrcProof` + `CodecRegistry` + `CodecError` from `minkowski-persist::codec` to `minkowski-lsm::codec`
+- Add `minkowski-lsm` dep to `minkowski-persist`; update all imports
+- Convert `LsmManifest` → `LsmManifest<const N: usize = 4>` with `DefaultManifest` alias
+- Propagate const-generic through `FlushWriter<N>` and manifest_ops call sites
+- Change `SortedRunReader::validate_page_crc` return type to `Result<CrcProof, LsmError>`
+- Add `recover_world_from_lsm` helper (new code, no callers yet; tested standalone)
+- Module-level regime doc on `manifest.rs`
+
+All existing tests pass unchanged. Easy review: if the build and tests pass, it's correct.
+
+### PR 2: LsmCheckpoint + snapshot clean cut
+
+Behavioral replacement. Estimated ~600–1000 lines, heavy deletions. Depends on PR 1.
+
+- Implement `LsmCheckpoint<N>` as new `CheckpointHandler` impl
+- Migrate `Durable<S>` default checkpoint handler from `AutoCheckpoint` to `LsmCheckpoint`
+- Delete `Snapshot`, `SnapshotError`, `AutoCheckpoint`, `save_to_bytes`, `load_from_bytes`
+- Stub `examples/replicate.rs` with a TODO pointing to this design doc
+- Migrate benchmarks (`persist.rs`, `serialize.rs`) to use `LsmCheckpoint`
+
+Public `CheckpointHandler` trait is unchanged; the impl swap is invisible to any external user of `Durable<S>`. (No external users exist; this is belt-and-braces.)
+
+### PR 3: Compactor
+
+Pure feature addition. Estimated ~800–1200 lines. Depends on PR 1, independent of PR 2.
+
+- `ManifestTag::CompactionCommit = 0x06` + `ManifestEntry::CompactionCommit` variant
+- `CompactionCommit` encode/decode with `input_count: u32 LE`
+- `World::compact_one()` + `World::needs_compaction()` API
+- K=4 count-based trigger, stable-iteration picking
+- Tombstone elision at bottom level only
+- `FlushWriter::set_entry_observer` hook (no-op observer for Phase 3; Phase 4 installs a real one)
+- `MAX_COMPACTION_INPUTS = 1024` debug_assert at apply site
+
+PR 2 and PR 3 can land in either order (or in parallel worktrees). PR 1 is the strict prerequisite for both.
+
+**CI gates each PR**: fmt, clippy, test, tsan, loom, claude-review.
+
+### Post-phase memory updates
+
+After PR 3 lands:
 - `project_scaling_roadmap.md`: mark Phase 3 complete, update type-rating table (add `Compactor`, `LsmCheckpoint`), update next-step to Phase 4 (bloom filter).
 - `project_bloom_compaction_coupling.md`: confirm Phase 3's filter hook API landed as designed; Phase 4 can now start.
 
