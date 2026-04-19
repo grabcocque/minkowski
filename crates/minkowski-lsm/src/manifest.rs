@@ -15,19 +15,6 @@
 //! history), construct [`LsmManifest<7>`] instead. Merge logic is
 //! level-count-agnostic; only bounds checks and manifest serialization
 //! care about `N`.
-//!
-//! ## Cross-N log portability (known limitation)
-//!
-//! The manifest-log wire format does not yet carry an `N` field. A log
-//! written by an `LsmManifest<7>` replayed by an `LsmManifest<4>` will
-//! silently truncate every frame referencing level 4..=6 as tail
-//! garbage (those bytes fail the `level.as_index() < N` bounds check
-//! in `apply_entry`, which the replay loop treats as torn-tail).
-//!
-//! Practical rule: **do not move a manifest log between builds that use
-//! different `N` values.** A fix (manifest-header `max_level` byte with
-//! fatal mismatch on recover) is in scope for the Phase 3 compactor PR,
-//! where on-disk format changes are already expected.
 
 use std::path::{Path, PathBuf};
 
