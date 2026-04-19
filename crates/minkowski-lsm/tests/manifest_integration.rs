@@ -776,16 +776,16 @@ fn recover_rejects_file_with_unsupported_version() {
 // ── Forward-compat and idempotency ──────────────────────────────────────────
 
 /// Reserved bytes in the header are documented as "ignored on read" for
-/// forward-compat with future flags. Pin that behavior: a header with
-/// non-zero reserved bytes followed by a valid frame must successfully
+/// forward-compat with future flags. Pin that behavior: a v2 header with
+/// valid max_level and non-zero reserved bytes (6..8) must successfully
 /// recover.
 #[test]
 fn recover_ignores_nonzero_reserved_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("reserved.log");
 
-    // Write a v1 header with non-zero reserved bytes (bytes 5-7).
-    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+    // v2 header: magic, version=0x02, max_level=4, reserved 0xAA 0x55.
+    fs::write(&log_path, b"MKMF\x02\x04\xAA\x55").unwrap();
 
     // Recover should succeed on an otherwise-empty log.
     let (recovered, _) = ManifestLog::recover::<4>(&log_path).unwrap();
@@ -801,11 +801,9 @@ fn recover_preserves_reserved_bytes_through_append_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("reserved_append.log");
 
-    // Start with a valid header whose reserved bytes carry a non-zero
-    // "flag" pattern.
-    // Layout: bytes 0..4 = magic ("MKMF"), byte 4 = version (0x01),
-    // bytes 5..8 = reserved (here 0xFF, 0xAA, 0x55).
-    fs::write(&log_path, b"MKMF\x01\xFF\xAA\x55").unwrap();
+    // v2 layout: magic + version (0x02) + max_level (0x04) + 2 reserved
+    // bytes carrying a non-zero "flag" pattern (0xAA, 0x55).
+    fs::write(&log_path, b"MKMF\x02\x04\xAA\x55").unwrap();
 
     // Open, append one entry, close.
     let (_, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
@@ -815,15 +813,12 @@ fn recover_preserves_reserved_bytes_through_append_cycle() {
     .unwrap();
     drop(log);
 
-    // Reserved bytes at offsets 5..8 must still be intact.
+    // Header bytes must still be intact after the append cycle.
     let bytes = fs::read(&log_path).unwrap();
     assert_eq!(&bytes[0..4], b"MKMF", "magic preserved");
-    assert_eq!(bytes[4], 0x01, "version preserved");
-    assert_eq!(
-        &bytes[5..8],
-        &[0xFF, 0xAA, 0x55],
-        "reserved bytes preserved"
-    );
+    assert_eq!(bytes[4], 0x02, "version preserved");
+    assert_eq!(bytes[5], 0x04, "max_level preserved");
+    assert_eq!(&bytes[6..8], &[0xAA, 0x55], "reserved bytes preserved");
 
     // And the entry must replay.
     let (m, _) = ManifestLog::recover::<4>(&log_path).unwrap();

@@ -1,11 +1,19 @@
 //! Persistent append-only log of manifest mutations.
 //!
 //! File layout:
-//! - Bytes 0..8: file header `[magic: b"MKMF"; 4][version: u8; 1][reserved: 0u8; 3]`.
+//! - Bytes 0..8: file header `[magic: b"MKMF"; 4][version: u8; 1][max_level: u8; 1][reserved: 0u8; 2]`.
 //! - Bytes 8..: zero or more frames, each `[len: u32 LE][crc32: u32 LE][payload]`.
 //!
 //! The frame format matches the WAL's (reimplemented here to avoid a
 //! dependency on `minkowski-persist`). The file header is manifest-specific.
+//!
+//! ## Version history
+//!
+//! - v1 (PR #164): magic + version + 3 reserved bytes.
+//! - v2 (PR 3, this version): magic + version + `max_level` byte + 2 reserved
+//!   bytes. `max_level` is `N as u8` for an `LsmManifest<N>`; mismatches on
+//!   recover surface as fatal `LsmError::Format`, preventing the silent
+//!   cross-N tail truncation that v1 allowed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -20,20 +28,30 @@ use crate::types::{Level, PageCount, SeqNo, SeqRange, SizeBytes};
 /// 4-byte magic: "M", "K", "M", "F" — Minkowski Manifest.
 const MAGIC_BYTES: [u8; 4] = *b"MKMF";
 
-const CURRENT_VERSION: u8 = 0x01;
+/// Current on-disk format version. Bumped from 0x01 → 0x02 when the
+/// `max_level` byte was added at offset 5 (PR 3). v1 logs are rejected
+/// with an "unsupported manifest version" error — delete to rebuild
+/// from WAL.
+const CURRENT_VERSION: u8 = 0x02;
 
-/// Total header size in bytes: 4 magic + 1 version + 3 reserved.
+/// Total header size in bytes: 4 magic + 1 version + 1 max_level + 2 reserved.
 const HEADER_SIZE: u64 = 8;
 
 /// Write the manifest log header at offset 0.
 ///
-/// Layout: `[magic: 4][version: 1][reserved: 3]`. Reserved bytes are
+/// Layout: `[magic: 4][version: 1][max_level: 1][reserved: 2]`. `max_level`
+/// carries `N as u8` so a later `recover::<N>()` can reject
+/// manifests written for a different level count. Reserved bytes are
 /// written as zero and ignored on read.
-fn write_header(file: &mut File) -> Result<(), LsmError> {
+fn write_header<const N: usize>(file: &mut File) -> Result<(), LsmError> {
+    let max_level = u8::try_from(N).unwrap_or_else(|_| {
+        panic!("N={N} does not fit in max_level byte; MAX_LEVELS must be <= 255")
+    });
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&MAGIC_BYTES)?;
     file.write_all(&[CURRENT_VERSION])?;
-    file.write_all(&[0u8; 3])?;
+    file.write_all(&[max_level])?;
+    file.write_all(&[0u8; 2])?;
     Ok(())
 }
 
@@ -43,9 +61,10 @@ fn write_header(file: &mut File) -> Result<(), LsmError> {
 /// - File shorter than 8 bytes
 /// - Magic bytes don't match `MKMF`
 /// - Version byte doesn't match `CURRENT_VERSION`
+/// - `max_level` byte doesn't match the caller's `N`
 ///
 /// Reserved bytes are not validated (forward-compat).
-fn validate_header(file: &mut File) -> Result<(), LsmError> {
+fn validate_header<const N: usize>(file: &mut File) -> Result<(), LsmError> {
     file.seek(SeekFrom::Start(0))?;
     let mut header = [0u8; 8];
     match file.read_exact(&mut header) {
@@ -65,7 +84,14 @@ fn validate_header(file: &mut File) -> Result<(), LsmError> {
     let version = header[4];
     if version != CURRENT_VERSION {
         return Err(LsmError::Format(format!(
-            "unsupported manifest version {version}"
+            "unsupported manifest version {version} (delete manifest.log to rebuild from WAL)"
+        )));
+    }
+    let stored_max_level = header[5];
+    if (stored_max_level as usize) != N {
+        return Err(LsmError::Format(format!(
+            "manifest max_level mismatch: file recorded {stored_max_level}, requested N={N} \
+             (delete manifest.log to rebuild from WAL, or construct LsmManifest<{stored_max_level}>)"
         )));
     }
     Ok(())
@@ -542,7 +568,7 @@ impl ManifestLog {
                 .read(true)
                 .truncate(false)
                 .open(path)?;
-            write_header(&mut file)?;
+            write_header::<N>(&mut file)?;
             file.sync_all()?;
             return Ok((
                 LsmManifest::new(),
@@ -554,8 +580,8 @@ impl ManifestLog {
         }
 
         let mut file = OpenOptions::new().write(true).read(true).open(path)?;
-        validate_header(&mut file)?;
-        let (manifest, write_pos) = replay_frames(&file, path, HEADER_SIZE)?;
+        validate_header::<N>(&mut file)?;
+        let (manifest, write_pos) = replay_frames::<N>(&file, path, HEADER_SIZE)?;
         Ok((manifest, Self { file, write_pos }))
     }
 
@@ -896,14 +922,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hdr.log");
         let mut file = File::create(&path).unwrap();
-        write_header(&mut file).unwrap();
+        write_header::<4>(&mut file).unwrap();
         drop(file);
 
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 8);
         assert_eq!(&bytes[0..4], b"MKMF");
-        assert_eq!(bytes[4], 0x01);
-        assert_eq!(&bytes[5..8], &[0u8; 3]);
+        assert_eq!(bytes[4], 0x02, "version bumped to v2 for max_level");
+        assert_eq!(bytes[5], 4, "max_level carries N as u8");
+        assert_eq!(&bytes[6..8], &[0u8; 2]);
+    }
+
+    #[test]
+    fn write_header_alternate_n_emits_matching_max_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr7.log");
+        let mut file = File::create(&path).unwrap();
+        write_header::<7>(&mut file).unwrap();
+        drop(file);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes[5], 7, "max_level reflects N=7");
     }
 
     #[test]
@@ -917,21 +956,21 @@ mod tests {
             .read(true)
             .open(&path)
             .unwrap();
-        write_header(&mut file).unwrap();
-        validate_header(&mut file).unwrap();
+        write_header::<4>(&mut file).unwrap();
+        validate_header::<4>(&mut file).unwrap();
     }
 
     #[test]
     fn validate_header_rejects_bad_magic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hdr.log");
-        fs::write(&path, b"XXXX\x01\x00\x00\x00").unwrap();
+        fs::write(&path, b"XXXX\x02\x04\x00\x00").unwrap();
         let mut file = OpenOptions::new()
             .write(true)
             .read(true)
             .open(&path)
             .unwrap();
-        let err = validate_header(&mut file).unwrap_err();
+        let err = validate_header::<4>(&mut file).unwrap_err();
         assert!(matches!(err, LsmError::Format(_)));
         if let LsmError::Format(msg) = err {
             assert!(msg.contains("bad magic"), "got: {msg}");
@@ -942,16 +981,46 @@ mod tests {
     fn validate_header_rejects_unsupported_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hdr.log");
-        fs::write(&path, b"MKMF\xFF\x00\x00\x00").unwrap();
+        // v1 header (pre-PR-3) is now "unsupported"
+        fs::write(&path, b"MKMF\x01\x00\x00\x00").unwrap();
         let mut file = OpenOptions::new()
             .write(true)
             .read(true)
             .open(&path)
             .unwrap();
-        let err = validate_header(&mut file).unwrap_err();
+        let err = validate_header::<4>(&mut file).unwrap_err();
         assert!(matches!(err, LsmError::Format(_)));
         if let LsmError::Format(msg) = err {
             assert!(msg.contains("unsupported manifest version"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_header_rejects_max_level_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        // Written with N=7; opened as N=4 must fail.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        write_header::<7>(&mut file).unwrap();
+        drop(file);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let err = validate_header::<4>(&mut file).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        if let LsmError::Format(msg) = err {
+            assert!(msg.contains("max_level mismatch"), "got: {msg}");
+            assert!(msg.contains("file recorded 7"), "got: {msg}");
+            assert!(msg.contains("N=4"), "got: {msg}");
         }
     }
 
@@ -965,7 +1034,7 @@ mod tests {
             .read(true)
             .open(&path)
             .unwrap();
-        let err = validate_header(&mut file).unwrap_err();
+        let err = validate_header::<4>(&mut file).unwrap_err();
         assert!(matches!(err, LsmError::Format(_)));
         if let LsmError::Format(msg) = err {
             assert!(msg.contains("too short"), "got: {msg}");
@@ -986,7 +1055,7 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 8);
         assert_eq!(&bytes[0..4], b"MKMF");
-        assert_eq!(bytes[4], 0x01);
+        assert_eq!(bytes[4], 0x02);
     }
 
     #[test]
@@ -996,7 +1065,7 @@ mod tests {
         // Pre-create with just a header.
         {
             let mut file = File::create(&path).unwrap();
-            write_header(&mut file).unwrap();
+            write_header::<4>(&mut file).unwrap();
             file.sync_all().unwrap();
         }
         let (manifest, log) = ManifestLog::recover::<4>(&path).unwrap();
@@ -1030,7 +1099,7 @@ mod tests {
         // Write a header using the helper directly.
         {
             let mut file = File::create(&path).unwrap();
-            write_header(&mut file).unwrap();
+            write_header::<4>(&mut file).unwrap();
             file.sync_all().unwrap();
         }
 
