@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::codec::CrcProof;
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
@@ -271,23 +272,21 @@ impl SortedRunReader {
         }))
     }
 
-    /// Validate the CRC of a specific page.
+    /// Validate the CRC of a specific page and return a [`CrcProof`] on success.
     ///
-    /// The CRC covers `row_count * item_size` bytes (the actual data, not
-    /// zero-padding).
-    pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<(), LsmError> {
+    /// The returned token feeds into [`CodecRegistry::decode`]'s `raw_copy_size`
+    /// fast path (direct memcpy, skipping rkyv bytecheck). The CRC covers
+    /// `row_count * item_size` bytes — the actual data, not zero-padding.
+    pub fn validate_page_crc(&self, page: &PageRef<'_>) -> Result<CrcProof, LsmError> {
         let item_size = self.item_size_for_slot(page.header().slot)?;
         let actual_len = page.header().row_count as usize * item_size;
-        let computed = crc32fast::hash(&page.data()[..actual_len]);
+        let payload = &page.data()[..actual_len];
 
-        if computed != page.header().page_crc32 {
-            return Err(LsmError::Crc {
-                offset: page.file_offset(),
-                expected: page.header().page_crc32,
-                actual: computed,
-            });
-        }
-        Ok(())
+        CrcProof::verify(payload, page.header().page_crc32).ok_or_else(|| LsmError::Crc {
+            offset: page.file_offset(),
+            expected: page.header().page_crc32,
+            actual: crc32fast::hash(payload),
+        })
     }
 
     /// Get the schema section.
@@ -579,5 +578,23 @@ mod tests {
         // Verify entity pages are present (slot == ENTITY_SLOT).
         let has_entity_page = reader.index.iter().any(|e| e.slot == ENTITY_SLOT);
         assert!(has_entity_page, "must have at least one entity page");
+    }
+
+    #[test]
+    fn validate_page_crc_returns_proof_token() {
+        use crate::codec::CrcProof;
+
+        let (_dir, path, _world) = flush_world_with_pos(5);
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        // Find the first page and validate its CRC, extracting the proof.
+        assert!(reader.index_len() > 0);
+        let entry = &reader.index[0];
+        let page = reader
+            .get_page(entry.arch_id, entry.slot, entry.page_index)
+            .unwrap()
+            .unwrap();
+        let proof: CrcProof = reader.validate_page_crc(&page).unwrap();
+        let _ = proof;
     }
 }

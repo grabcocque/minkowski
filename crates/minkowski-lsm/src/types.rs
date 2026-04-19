@@ -11,7 +11,11 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::error::LsmError;
-use crate::manifest::NUM_LEVELS;
+/// Maximum level count accepted by [`Level::new`]. A generous upper bound:
+/// the default manifest uses 4 levels, TigerBeetle-style configurations
+/// use 7. `Level::new` rejects anything >= `MAX_LEVELS`; per-manifest
+/// bounds are enforced at the manifest boundary.
+pub const MAX_LEVELS: usize = 32;
 
 /// A WAL sequence number.
 ///
@@ -83,10 +87,14 @@ impl SeqRange {
     }
 }
 
-/// An LSM level index. Construction enforces `< NUM_LEVELS`.
+/// An LSM level index. Construction enforces `< MAX_LEVELS` as a sanity
+/// bound; per-manifest bounds (`< N`) are checked by [`LsmManifest<N>`]
+/// at each public entry point.
 ///
-/// The bounds check lives in exactly one place (`Level::new`); all
-/// other code sites trust the invariant once they hold a `Level`.
+/// A `Level` is thus a "fits in some manifest somewhere" witness, not a
+/// "fits in *this* manifest" guarantee. Constructing `Level::new(5)` for
+/// a `LsmManifest<4>` is legal; the manifest returns an error or empty
+/// result at the API boundary rather than the type boundary.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Level(u8);
 
@@ -96,21 +104,21 @@ impl Level {
     pub const L2: Level = Level(2);
     pub const L3: Level = Level(3);
 
-    /// Construct a level index. Returns `None` if `level >= NUM_LEVELS`.
+    /// Construct a level index. Returns `None` if `level >= MAX_LEVELS`.
     pub fn new(level: u8) -> Option<Self> {
-        if (level as usize) < NUM_LEVELS {
+        if (level as usize) < MAX_LEVELS {
             Some(Self(level))
         } else {
             None
         }
     }
 
-    /// The underlying level byte (always `< NUM_LEVELS`).
+    /// The underlying level byte (always `< MAX_LEVELS`).
     pub fn as_u8(self) -> u8 {
         self.0
     }
 
-    /// Convert to a `usize` for indexing `[T; NUM_LEVELS]` arrays.
+    /// Convert to a `usize` for indexing manifest level arrays.
     pub fn as_index(self) -> usize {
         self.0 as usize
     }
@@ -247,14 +255,14 @@ mod tests {
     }
 
     #[test]
-    fn level_rejects_values_at_or_above_num_levels() {
-        assert!(Level::new(NUM_LEVELS as u8).is_none());
+    fn level_rejects_values_at_or_above_max_levels() {
+        assert!(Level::new(MAX_LEVELS as u8).is_none());
         assert!(Level::new(255).is_none());
     }
 
     #[test]
-    fn level_accepts_values_below_num_levels() {
-        for i in 0..NUM_LEVELS {
+    fn level_accepts_values_below_max_levels() {
+        for i in 0..4 {
             assert!(Level::new(i as u8).is_some());
         }
     }

@@ -10,6 +10,8 @@ workspace = true
 minkowski = { path = "../minkowski" }
 crc32fast = "1"
 memmap2 = "0.9"
+rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
+thiserror = "2"
 
 [dev-dependencies]
 static_assertions = "1"

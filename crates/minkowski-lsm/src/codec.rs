@@ -10,6 +10,21 @@ use rkyv::rancor;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
+/// Schema entry describing a component type. Used in both snapshot schemas
+/// and WAL preambles. Fields are sender-local: `id` is meaningful only in
+/// the originating World's ID space.
+///
+/// Defined here (in `minkowski-lsm::codec`) so that [`CodecRegistry::build_remap`]
+/// can reference it without a dependency on `minkowski-persist`. Re-exported by
+/// `minkowski-persist::record` for WAL and snapshot consumers.
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
+pub struct ComponentSchema {
+    pub id: ComponentId,
+    pub name: String,
+    pub size: usize,
+    pub align: usize,
+}
+
 /// Type-erased serialize: reads T from raw pointer, serializes to output buffer.
 type SerializeFn = unsafe fn(*const u8, &mut Vec<u8>) -> Result<(), CodecError>;
 
@@ -310,7 +325,7 @@ impl CodecRegistry {
     ///
     /// Without a proof, falls through to [`deserialize`](Self::deserialize)
     /// which runs full rkyv validation — safe for untrusted bytes.
-    pub(crate) fn decode(
+    pub fn decode(
         &self,
         id: ComponentId,
         bytes: &[u8],
@@ -376,7 +391,7 @@ impl CodecRegistry {
     /// mapping from sender ComponentId → receiver ComponentId.
     pub fn build_remap(
         &self,
-        schema: &[crate::record::ComponentSchema],
+        schema: &[ComponentSchema],
     ) -> Result<HashMap<ComponentId, ComponentId>, CodecError> {
         let mut remap = HashMap::new();
         for def in schema {
@@ -407,17 +422,19 @@ impl Default for CodecRegistry {
     }
 }
 
-/// Zero-sized proof that a byte payload has been CRC32-verified.
+/// A proof token returned by [`CrcProof::verify`] after successful CRC32
+/// validation of a byte payload. Unforgeable: the only public constructor
+/// is [`CrcProof::verify`], which runs the actual checksum.
 ///
-/// Unforgeable: the only constructor runs the actual CRC computation
-/// and compares against the expected checksum. The `raw_copy_size` fast
-/// path in [`CodecRegistry::decode`] requires this proof — unverified
-/// bytes go through full rkyv bytecheck validation instead.
-pub(crate) struct CrcProof(());
+/// Used by [`CodecRegistry::decode`] to gate the `raw_copy_size` fast path
+/// (direct memcpy, skipping rkyv bytecheck). Producers: WAL frame reader
+/// ([`minkowski_persist::wal::read_next_frame`]), LSM page validator
+/// ([`SortedRunReader::validate_page_crc`]).
+pub struct CrcProof(());
 
 impl CrcProof {
     /// Verify a payload's CRC32 checksum. Returns proof on success, `None` on mismatch.
-    pub(crate) fn verify(payload: &[u8], expected_crc: u32) -> Option<Self> {
+    pub fn verify(payload: &[u8], expected_crc: u32) -> Option<Self> {
         if crc32fast::hash(payload) == expected_crc {
             Some(Self(()))
         } else {
@@ -571,7 +588,7 @@ mod tests {
         ));
     }
 
-    use crate::record::ComponentSchema;
+    use super::ComponentSchema;
 
     #[test]
     fn build_remap_same_order() {

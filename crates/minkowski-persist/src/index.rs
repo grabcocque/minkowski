@@ -493,9 +493,9 @@ mod tests {
 
     #[test]
     fn full_recovery_with_persistent_index() {
-        use crate::codec::CodecRegistry;
         use crate::snapshot::Snapshot;
         use crate::wal::{Wal, WalConfig};
+        use minkowski_lsm::codec::CodecRegistry;
 
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("recovery.wal");

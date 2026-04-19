@@ -5,8 +5,8 @@ use std::path::Path;
 
 use minkowski::{ComponentId, Entity, EnumChangeSet, World};
 
-use crate::codec::{CodecError, CodecRegistry, CrcProof};
 use crate::record::*;
+use minkowski_lsm::codec::{CodecError, CodecRegistry, CrcProof};
 
 /// Snapshot file magic identifying the v2 format with CRC32 checksums.
 ///
@@ -479,7 +479,7 @@ impl Default for Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::CodecRegistry;
+    use minkowski_lsm::codec::CodecRegistry;
     use rkyv::{Archive, Deserialize, Serialize};
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Debug)]

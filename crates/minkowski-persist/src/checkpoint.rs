@@ -4,10 +4,10 @@ use std::sync::Arc;
 use minkowski::World;
 use parking_lot::Mutex;
 
-use crate::codec::CodecRegistry;
 use crate::index::PersistentIndex;
 use crate::snapshot::Snapshot;
 use crate::wal::Wal;
+use minkowski_lsm::codec::CodecRegistry;
 
 /// Callback invoked when the WAL has accumulated more mutation bytes than
 /// the configured `max_bytes_between_checkpoints` threshold without a
@@ -87,9 +87,9 @@ impl CheckpointHandler for AutoCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::CodecRegistry;
     use crate::wal::{Wal, WalConfig};
     use minkowski::World;
+    use minkowski_lsm::codec::CodecRegistry;
     use rkyv::{Archive, Deserialize, Serialize};
 
     #[derive(Clone, Copy, Archive, Serialize, Deserialize)]

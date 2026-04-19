@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 minkowski = { path = "../minkowski" }
+minkowski-lsm = { path = "../minkowski-lsm" }
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 memmap2 = "0.9"
 parking_lot = "0.12"

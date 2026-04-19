@@ -2,6 +2,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use minkowski::ComponentId;
 
+pub use minkowski_lsm::codec::ComponentSchema;
+
 /// rkyv-friendly mirror of core's Mutation enum.
 /// Entity stored as raw u64 (preserving generation bits).
 /// Component data is pre-serialized through CodecRegistry.
@@ -41,17 +43,6 @@ pub enum SerializedMutation {
 pub struct WalRecord {
     pub seq: u64,
     pub mutations: Vec<SerializedMutation>,
-}
-
-/// Schema entry describing a component type. Used in both snapshot schemas
-/// and WAL preambles. Fields are sender-local: `id` is meaningful only in
-/// the originating World's ID space.
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct ComponentSchema {
-    pub id: ComponentId,
-    pub name: String,
-    pub size: usize,
-    pub align: usize,
 }
 
 /// Serializable entity allocator state.
