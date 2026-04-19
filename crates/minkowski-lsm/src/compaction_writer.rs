@@ -207,6 +207,19 @@ impl<'a> CompactionWriter<'a> {
     /// Returns `Err(LsmError::Format("cannot compact: emit list empty"))` if no
     /// rows survive dedup — the caller should not compact an empty set.
     pub(crate) fn write(self) -> Result<SortedRunMeta, LsmError> {
+        self.write_observed(None)
+    }
+
+    /// Like [`write`], but invokes `observer` once per entity ID written to an
+    /// entity-slot page. Pass `None` for no observation (identical to [`write`]).
+    ///
+    /// The observer fires *after* the entity bytes are successfully written to
+    /// the buffer, so it will not fire for pages that are skipped due to zero
+    /// `row_count`. It fires exactly once per entity in the output.
+    pub(crate) fn write_observed(
+        self,
+        mut observer: Option<&mut dyn FnMut(crate::writer::EntityKey)>,
+    ) -> Result<SortedRunMeta, LsmError> {
         // ── 1. Build and sort the emit list ──────────────────────────────────
         let mut emit_list = build_emit_list(self.inputs.as_slice(), &self.arch_ids_per_input)?;
 
@@ -414,6 +427,13 @@ impl<'a> CompactionWriter<'a> {
             };
             w.write_all(ph.as_bytes())?;
             w.write_all(&entity_bytes)?;
+
+            // Notify the observer once per successfully-written entity.
+            if let Some(ref mut obs) = observer {
+                for emit in &emit_list[row_start..row_end] {
+                    obs(crate::writer::EntityKey(emit.entity_id));
+                }
+            }
 
             // Zero-pad.
             let full_page_bytes = PAGE_SIZE * entity_item_size;

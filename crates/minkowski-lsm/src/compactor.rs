@@ -31,22 +31,17 @@ use crate::manifest_log::{ManifestEntry, ManifestLog};
 use crate::reader::SortedRunReader;
 use crate::schema_match::find_archetype_by_components;
 use crate::types::{Level, SeqNo, SeqRange};
+use crate::writer::EntityKey;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// K=4 count trigger: if any (level, archetype) has at least this many runs,
 /// compact them.
-// No production caller yet — Task 5 (World::compact_one) will use this.
-// #[cfg(test)] sees it as used, so #[expect] would be unfulfilled; use allow.
-#[allow(dead_code)]
-pub(crate) const COMPACTION_TRIGGER: usize = 4;
+pub const COMPACTION_TRIGGER: usize = 4;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A compaction job picked by the scheduler.
-// No production caller yet — Task 5 will promote this to pub. Tests use it,
-// so #[expect(dead_code)] would be unfulfilled; use allow.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionJob {
     /// The source level — all inputs live here.
@@ -62,9 +57,6 @@ pub(crate) struct CompactionJob {
 }
 
 /// Outcome of a compaction execution.
-// No production caller yet — Task 5 will promote this. Tests use it,
-// so #[expect(dead_code)] would be unfulfilled; use allow.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CompactionReport {
     pub from_level: Level,
@@ -88,9 +80,6 @@ pub struct CompactionReport {
 ///
 /// Returns `LsmError` if a sorted run file cannot be opened to discover its
 /// archetype component names.
-// No production caller yet — Task 5 will wire this up. Tests use it, so
-// #[expect(dead_code)] would be unfulfilled; use allow.
-#[allow(dead_code)]
 pub(crate) fn find_compaction_candidate<const N: usize>(
     manifest: &LsmManifest<N>,
 ) -> Result<Option<CompactionJob>, LsmError> {
@@ -191,11 +180,28 @@ pub(crate) fn find_compaction_candidate<const N: usize>(
 
 /// Execute one compaction job end-to-end.
 ///
+/// Thin wrapper around [`execute_compaction_observed`] with no observer.
+/// See that function for the full step-by-step contract.
+// Tests call this directly; no production caller yet so the lib-only
+// dead_code lint fires. #[expect] would be unfulfilled under --all-targets.
+#[allow(dead_code)]
+pub(crate) fn execute_compaction<const N: usize>(
+    job: &CompactionJob,
+    manifest: &mut LsmManifest<N>,
+    log: &mut ManifestLog,
+    run_dir: &Path,
+) -> Result<CompactionReport, LsmError> {
+    execute_compaction_observed(job, manifest, log, run_dir, None)
+}
+
+/// Execute one compaction job end-to-end, invoking `observer` once per entity
+/// ID written to the output entity-slot pages.
+///
 /// 1. Opens each input as a [`SortedRunReader`].
 /// 2. Resolves per-input arch_ids via [`find_archetype_by_components`].
 /// 3. Computes the output sequence range.
 /// 4. Generates a unique output path.
-/// 5. Runs [`CompactionWriter::write`] to produce the output file.
+/// 5. Runs [`CompactionWriter::write_observed`] to produce the output file.
 /// 6. Appends [`ManifestEntry::CompactionCommit`] to the log (atomic commit point).
 /// 7. Mirrors the commit on the in-memory manifest.
 /// 8. Returns [`CompactionReport`].
@@ -203,14 +209,12 @@ pub(crate) fn find_compaction_candidate<const N: usize>(
 /// If any step before the log append fails, no manifest state is mutated.
 /// If the log append succeeds, the in-memory mutation MUST also succeed
 /// (all pre-conditions are checked before the append).
-// No production caller yet — Task 5 will wire this up. Tests use it, so
-// #[expect(dead_code)] would be unfulfilled; use allow.
-#[allow(dead_code)]
-pub(crate) fn execute_compaction<const N: usize>(
+pub(crate) fn execute_compaction_observed<const N: usize>(
     job: &CompactionJob,
     manifest: &mut LsmManifest<N>,
     log: &mut ManifestLog,
     run_dir: &Path,
+    observer: Option<&mut dyn FnMut(EntityKey)>,
 ) -> Result<CompactionReport, LsmError> {
     // ── 1. Open input readers ─────────────────────────────────────────────────
     let readers: Vec<SortedRunReader> = job
@@ -271,7 +275,7 @@ pub(crate) fn execute_compaction<const N: usize>(
         output_seq_range,
     )?;
 
-    let output_meta: SortedRunMeta = writer.write()?;
+    let output_meta: SortedRunMeta = writer.write_observed(observer)?;
 
     // ── 6. Pre-validate in-memory state before the atomic commit point ────────
     // Verify the output level is in-range for this manifest *before* the log
@@ -345,6 +349,46 @@ pub(crate) fn execute_compaction<const N: usize>(
     })
 }
 
+// ── Public one-shot API ───────────────────────────────────────────────────────
+
+/// One-shot compaction driver. Picks a candidate via
+/// [`find_compaction_candidate`], executes it if found, returns the
+/// report or `None`. Callers loop:
+///
+/// ```ignore
+/// while manifest.needs_compaction() {
+///     compactor::compact_one(&mut manifest, &mut log, &run_dir)?;
+/// }
+/// ```
+///
+/// Returns `Ok(None)` when no `(level, archetype)` pair has
+/// `>= COMPACTION_TRIGGER` runs.
+pub fn compact_one<const N: usize>(
+    manifest: &mut LsmManifest<N>,
+    log: &mut ManifestLog,
+    run_dir: &Path,
+) -> Result<Option<CompactionReport>, LsmError> {
+    compact_one_observed(manifest, log, run_dir, None)
+}
+
+/// Observer-accepting variant of [`compact_one`] for Phase 4 bloom integration.
+///
+/// `observer` is invoked once per entity ID written to the output run's
+/// entity-slot pages. Pass `None` for no observation (identical to
+/// [`compact_one`]).
+pub fn compact_one_observed<const N: usize>(
+    manifest: &mut LsmManifest<N>,
+    log: &mut ManifestLog,
+    run_dir: &Path,
+    observer: Option<&mut dyn FnMut(EntityKey)>,
+) -> Result<Option<CompactionReport>, LsmError> {
+    let Some(job) = find_compaction_candidate(manifest)? else {
+        return Ok(None);
+    };
+    let report = execute_compaction_observed(&job, manifest, log, run_dir, observer)?;
+    Ok(Some(report))
+}
+
 // ── File helpers ──────────────────────────────────────────────────────────────
 
 /// Build an output path for a compacted run file.
@@ -352,9 +396,6 @@ pub(crate) fn execute_compaction<const N: usize>(
 /// Uses a `.compact.run` extension to distinguish compacted outputs from
 /// flush outputs (`{lo}-{hi}.run`). Both share the same directory, so
 /// the extension difference prevents collisions when the sequence spans overlap.
-// Called from execute_compaction (tested). Use allow: tests cause
-// #[expect(dead_code)] to be unfulfilled on --all-targets.
-#[allow(dead_code)]
 fn make_output_path(run_dir: &Path, seq_lo: SeqNo, seq_hi: SeqNo) -> PathBuf {
     run_dir.join(format!("{}-{}.compact.run", seq_lo.get(), seq_hi.get()))
 }
@@ -654,5 +695,243 @@ mod tests {
             output_path.as_path(),
             "recovered L1 run path must match output"
         );
+    }
+
+    // ── Test 6: compact_one returns None on empty manifest ───────────────────
+
+    #[test]
+    fn compact_one_returns_none_when_nothing_over_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Empty manifest — nothing to compact.
+        let result = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
+        assert!(result.is_none(), "empty manifest must return None");
+
+        // 3 runs at L0 — below K=4.
+        for i in 0..3u64 {
+            do_flush(&mut manifest, &mut log, dir.path(), i * 10, i * 10 + 9, 2);
+        }
+        let result = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
+        assert!(result.is_none(), "3 runs below K=4 must return None");
+
+        // Manifest must be unchanged (3 L0 runs, 0 L1 runs).
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 3);
+        assert_eq!(manifest.runs_at_level(Level::L1).len(), 0);
+    }
+
+    // ── Test 7: compact_one drives one job and returns Some(report) ──────────
+
+    #[test]
+    fn compact_one_drives_one_job_and_returns_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Seed 4 runs at L0 — exactly the trigger.
+        for i in 0..4u64 {
+            do_flush(&mut manifest, &mut log, dir.path(), i * 10, i * 10 + 9, 2);
+        }
+
+        let result = compact_one(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("K=4 runs must produce Some(report)");
+
+        assert_eq!(result.from_level, Level::L0);
+        assert_eq!(result.to_level, Level::L1);
+        assert_eq!(result.input_run_count, 4);
+        assert!(result.output_bytes > 0);
+
+        // L0 must be drained; L1 has one run.
+        assert!(manifest.runs_at_level(Level::L0).is_empty());
+        assert_eq!(manifest.runs_at_level(Level::L1).len(), 1);
+    }
+
+    // ── Test 8: driven loop drains all candidates ─────────────────────────────
+    //
+    // The picker collects ALL runs in a (level, archetype) group — not just K.
+    // With 8 homogeneous L0 runs, the first compact_one call compacts all 8
+    // into one L1 run. A second call then finds nothing over the trigger
+    // (L1 has 1 run, L0 is empty) and returns None.
+    //
+    // To get *two* compaction rounds, we use two separate archetype signatures
+    // at L0: 4 runs of (Pos,) and 4 runs of (Vel,). The picker triggers on
+    // the first group it finds; the second call triggers on the second group.
+
+    #[test]
+    fn compact_one_driven_loop_drains_all_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // 4 runs of (Pos,) at L0.
+        for i in 0..4u64 {
+            do_flush(&mut manifest, &mut log, dir.path(), i * 10, i * 10 + 9, 2);
+        }
+
+        // 4 runs of (Vel,) at L0 — different archetype signature.
+        for i in 4..8u64 {
+            let mut world = World::new();
+            for j in 0..2usize {
+                world.spawn((Vel {
+                    dx: (i * 10 + j as u64) as f32,
+                    dy: 0.0,
+                },));
+            }
+            let seq_range = SeqRange::new(SeqNo::from(i * 10), SeqNo::from(i * 10 + 9)).unwrap();
+            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
+                .unwrap()
+                .expect("world is dirty");
+        }
+
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 8);
+
+        // First call: compacts one archetype group (Pos group, 4 runs) → L1.
+        let r1 = compact_one(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("first call must produce Some");
+        assert_eq!(r1.from_level, Level::L0);
+        assert_eq!(r1.input_run_count, 4);
+
+        // After first: 4 L0 remain (Vel group), 1 L1.
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 4);
+        assert_eq!(manifest.runs_at_level(Level::L1).len(), 1);
+
+        // Second call: compacts the remaining 4 L0 runs (Vel group) → second L1 run.
+        let r2 = compact_one(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("second call must produce Some");
+        assert_eq!(r2.from_level, Level::L0);
+        assert_eq!(r2.input_run_count, 4);
+
+        // After second: 0 L0, 2 L1.
+        assert!(manifest.runs_at_level(Level::L0).is_empty());
+        assert_eq!(manifest.runs_at_level(Level::L1).len(), 2);
+
+        // Third call: nothing left at L0; L1 has 2 < 4.
+        let r3 = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
+        assert!(
+            r3.is_none(),
+            "third call must return None — nothing left to compact"
+        );
+    }
+
+    // ── Test 9: needs_compaction parity with find_compaction_candidate ────────
+
+    #[test]
+    fn needs_compaction_matches_find_compaction_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Empty — both must agree: no compaction needed.
+        let candidate = find_compaction_candidate(&manifest).unwrap();
+        assert_eq!(
+            manifest.needs_compaction(),
+            candidate.is_some(),
+            "needs_compaction must match find_compaction_candidate (empty)"
+        );
+
+        // Add 3 runs — still below trigger.
+        for i in 0..3u64 {
+            do_flush(&mut manifest, &mut log, dir.path(), i * 10, i * 10 + 9, 2);
+        }
+        let candidate = find_compaction_candidate(&manifest).unwrap();
+        assert_eq!(
+            manifest.needs_compaction(),
+            candidate.is_some(),
+            "needs_compaction must match find_compaction_candidate (3 runs)"
+        );
+
+        // Add a 4th run — now at trigger.
+        do_flush(&mut manifest, &mut log, dir.path(), 30, 39, 2);
+        let candidate = find_compaction_candidate(&manifest).unwrap();
+        assert_eq!(
+            manifest.needs_compaction(),
+            candidate.is_some(),
+            "needs_compaction must match find_compaction_candidate (4 runs)"
+        );
+        assert!(manifest.needs_compaction(), "must be true at K=4");
+    }
+
+    // ── Test 10: compact_one_observed fires for every output entity ───────────
+
+    #[test]
+    fn compact_one_observed_fires_for_every_output_entity() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // Seed 4 runs, each with 3 distinct entities (advance allocator per run).
+        let entities_per_run = 3usize;
+        let n_runs = 4usize;
+        let mut all_entity_bits: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        for run_i in 0..n_runs {
+            let mut world = World::new();
+            let skip = run_i * entities_per_run;
+            let phs: Vec<_> = (0..skip)
+                .map(|_| world.spawn((Pos { x: 0.0, y: 0.0 },)))
+                .collect();
+            for ph in phs {
+                world.despawn(ph);
+            }
+            for j in 0..entities_per_run {
+                let e = world.spawn((Pos {
+                    x: (run_i * 10 + j) as f32,
+                    y: 0.0,
+                },));
+                all_entity_bits.insert(e.to_bits());
+            }
+            let lo = (run_i as u64) * 10;
+            let hi = lo + 9;
+            let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
+            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
+                .unwrap()
+                .expect("world is dirty");
+        }
+
+        assert_eq!(
+            manifest.runs_at_level(Level::L0).len(),
+            n_runs,
+            "all runs must be at L0"
+        );
+
+        // Run compact_one_observed and collect observed entity bits.
+        let observed: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed_clone = Rc::clone(&observed);
+
+        let report = compact_one_observed(
+            &mut manifest,
+            &mut log,
+            dir.path(),
+            Some(&mut |key: EntityKey| {
+                observed_clone.borrow_mut().push(key.0);
+            }),
+        )
+        .unwrap()
+        .expect("K=4 runs must produce Some(report)");
+
+        assert_eq!(report.from_level, Level::L0);
+
+        let seen = observed.borrow();
+        let expected_count = n_runs * entities_per_run;
+        assert_eq!(
+            seen.len(),
+            expected_count,
+            "observer must fire exactly once per output entity"
+        );
+
+        // Every entity from the input runs must have been observed.
+        for bits in &all_entity_bits {
+            assert!(
+                seen.contains(bits),
+                "entity {bits:#x} was not observed by compact_one_observed"
+            );
+        }
     }
 }

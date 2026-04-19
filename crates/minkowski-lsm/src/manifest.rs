@@ -198,6 +198,18 @@ impl<const N: usize> LsmManifest<N> {
     pub fn total_runs(&self) -> usize {
         self.levels.iter().map(Vec::len).sum()
     }
+
+    /// Returns `true` if any `(level, archetype)` pair has at least
+    /// [`COMPACTION_TRIGGER`] runs at a non-bottom level — i.e., there is
+    /// work the compactor would pick up.
+    ///
+    /// Delegates to [`compactor::find_compaction_candidate`] so there is one
+    /// source of truth for the trigger policy.
+    ///
+    /// [`COMPACTION_TRIGGER`]: crate::compactor::COMPACTION_TRIGGER
+    pub fn needs_compaction(&self) -> bool {
+        crate::compactor::find_compaction_candidate(self).is_ok_and(|opt| opt.is_some())
+    }
 }
 
 impl<const N: usize> Default for LsmManifest<N> {
