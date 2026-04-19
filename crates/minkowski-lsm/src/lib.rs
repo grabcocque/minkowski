@@ -1,5 +1,6 @@
 pub mod codec;
 pub(crate) mod compaction_writer;
+pub(crate) mod compactor;
 pub mod error;
 pub mod format;
 pub mod manifest;
