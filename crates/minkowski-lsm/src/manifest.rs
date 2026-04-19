@@ -15,6 +15,19 @@
 //! history), construct [`LsmManifest<7>`] instead. Merge logic is
 //! level-count-agnostic; only bounds checks and manifest serialization
 //! care about `N`.
+//!
+//! ## Cross-N log portability (known limitation)
+//!
+//! The manifest-log wire format does not yet carry an `N` field. A log
+//! written by an `LsmManifest<7>` replayed by an `LsmManifest<4>` will
+//! silently truncate every frame referencing level 4..=6 as tail
+//! garbage (those bytes fail the `level.as_index() < N` bounds check
+//! in `apply_entry`, which the replay loop treats as torn-tail).
+//!
+//! Practical rule: **do not move a manifest log between builds that use
+//! different `N` values.** A fix (manifest-header `max_level` byte with
+//! fatal mismatch on recover) is in scope for the Phase 3 compactor PR,
+//! where on-disk format changes are already expected.
 
 use std::path::{Path, PathBuf};
 
@@ -358,5 +371,66 @@ mod tests {
         // DefaultManifest alias resolves to N=4.
         let md: DefaultManifest = LsmManifest::new();
         assert_eq!(md.total_runs(), 0);
+    }
+
+    #[test]
+    fn lsm_manifest_n7_exercises_level_beyond_default() {
+        // Confirm that LsmManifest<7>'s extra levels (4..=6) actually work
+        // for add/query. This guards against a hypothetical future
+        // regression where the fixed-size [Vec<_>; N] array is indexed by
+        // a hardcoded 4.
+        let mut m7: LsmManifest<7> = LsmManifest::new();
+        let level_6 = Level::new(6).unwrap();
+
+        m7.add_run(level_6, test_meta("l6.run")).unwrap();
+        assert_eq!(m7.runs_at_level(level_6).len(), 1);
+        assert_eq!(m7.total_runs(), 1);
+
+        // Same level on LsmManifest<4> returns the OOR signals.
+        let mut m4: DefaultManifest = LsmManifest::new();
+        let err = m4.add_run(level_6, test_meta("l6.run")).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        assert!(m4.runs_at_level(level_6).is_empty());
+    }
+
+    #[test]
+    fn add_run_rejects_out_of_range_level() {
+        let mut m: DefaultManifest = LsmManifest::new();
+        let oor = Level::new(4).unwrap(); // valid Level, but OOR for N=4.
+        let err = m.add_run(oor, test_meta("oor.run")).unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+        assert_eq!(m.total_runs(), 0, "failed add_run must not mutate state");
+    }
+
+    #[test]
+    fn remove_run_returns_none_for_out_of_range_level() {
+        let mut m: DefaultManifest = LsmManifest::new();
+        let oor = Level::new(4).unwrap();
+        assert!(m.remove_run(oor, Path::new("anything.run")).is_none());
+    }
+
+    #[test]
+    fn promote_run_rejects_out_of_range_levels() {
+        let mut m: DefaultManifest = LsmManifest::new();
+        let oor = Level::new(4).unwrap();
+
+        // OOR as destination.
+        let err = m
+            .promote_run(Level::L0, oor, Path::new("x.run"))
+            .unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+
+        // OOR as source.
+        let err = m
+            .promote_run(oor, Level::L0, Path::new("x.run"))
+            .unwrap_err();
+        assert!(matches!(err, LsmError::Format(_)));
+    }
+
+    #[test]
+    fn runs_at_level_returns_empty_for_out_of_range_level() {
+        let m: DefaultManifest = LsmManifest::new();
+        let oor = Level::new(4).unwrap();
+        assert!(m.runs_at_level(oor).is_empty());
     }
 }

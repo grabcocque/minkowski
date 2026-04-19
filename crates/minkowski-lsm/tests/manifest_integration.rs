@@ -392,9 +392,10 @@ fn replay_truncates_log_on_unsorted_coverage() {
 }
 
 /// Regression: a frame with a valid CRC but an invalid level byte
-/// (>= NUM_LEVELS) must be treated as tail garbage. Level::new returns
-/// None on invalid input, decode_entry surfaces LsmError::Format, and
-/// the replay loop must truncate.
+/// (>= MAX_LEVELS, or >= N for the target manifest) must be treated as
+/// tail garbage. Level::new returns None for bytes >= MAX_LEVELS (32),
+/// decode_entry surfaces LsmError::Format, and the replay loop must
+/// truncate.
 #[test]
 fn replay_truncates_log_on_invalid_level_byte() {
     let dir = tempfile::tempdir().unwrap();
@@ -414,8 +415,9 @@ fn replay_truncates_log_on_invalid_level_byte() {
 
     let len_after_first_frame = fs::metadata(&log_path).unwrap().len();
 
-    // Craft a REMOVE_RUN frame with level=255 (invalid; NUM_LEVELS is 4).
-    // REMOVE_RUN is the simplest level-bearing entry to fabricate.
+    // Craft a REMOVE_RUN frame with level=255 (invalid; Level::new rejects
+    // >= MAX_LEVELS = 32). REMOVE_RUN is the simplest level-bearing entry
+    // to fabricate.
     let mut payload = Vec::new();
     payload.push(ManifestTag::RemoveRun as u8);
     payload.push(255); // invalid level byte

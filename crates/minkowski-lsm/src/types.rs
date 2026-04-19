@@ -87,10 +87,14 @@ impl SeqRange {
     }
 }
 
-/// An LSM level index. Construction enforces `< NUM_LEVELS`.
+/// An LSM level index. Construction enforces `< MAX_LEVELS` as a sanity
+/// bound; per-manifest bounds (`< N`) are checked by [`LsmManifest<N>`]
+/// at each public entry point.
 ///
-/// The bounds check lives in exactly one place (`Level::new`); all
-/// other code sites trust the invariant once they hold a `Level`.
+/// A `Level` is thus a "fits in some manifest somewhere" witness, not a
+/// "fits in *this* manifest" guarantee. Constructing `Level::new(5)` for
+/// a `LsmManifest<4>` is legal; the manifest returns an error or empty
+/// result at the API boundary rather than the type boundary.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Level(u8);
 
