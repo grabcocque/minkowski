@@ -73,7 +73,7 @@ cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
 ```
 
-CI runs fmt, clippy, test (including minkowski-lsm), TSan, Loom, and Miri on every PR. A `ci-pass` aggregator job is the single required status check for branch protection.
+CI runs fmt, clippy, test, TSan, and Loom on every PR. Miri runs nightly and on release tags. A `ci-pass` aggregator job is the single required status check for branch protection.
 
 ## Design Principles
 
@@ -187,13 +187,20 @@ durable.transact_with(&mut world, access, |scope| { /* TxScope: no world param n
 The `minkowski-lsm` crate adds incremental persistence via an LSM tree over archetype pages. Only dirty pages are written to disk — persistence cost is proportional to the mutation rate, not the world size. This replaces the O(world size) full-snapshot approach for large worlds.
 
 ```rust
-use minkowski_lsm::{flush_and_record, LsmManifest, compact_one};
+use minkowski_lsm::manifest_ops::flush_and_record;
+use minkowski_lsm::{compact_one, CompactionReport};
+use minkowski_lsm::manifest::LsmManifest;
+use minkowski_lsm::manifest_log::ManifestLog;
+use minkowski_lsm::types::SeqRange;
+
+let mut manifest: LsmManifest = /* recovered from ManifestLog */;
+let mut log: ManifestLog = /* opened on disk */;
 
 // Flush dirty pages to a new sorted run, record in manifest
-let report = flush_and_record(&manifest_log, &mut world, &codec, dir)?;
+let path = flush_and_record(&world, seq_range, &mut manifest, &mut log, &dir)?;
 
 // Compact when L1 accumulates too many runs
-if let Some(report) = compact_one(&manifest_log, &dir)? {
+if let Some(report) = compact_one(&mut manifest, &mut log, &dir)? {
     println!("Compacted {} input runs → {} output run",
              report.input_count, report.output_count);
 }

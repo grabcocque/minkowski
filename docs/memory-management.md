@@ -70,10 +70,11 @@ The `minkowski-lsm` crate adds a fourth dimension to memory management: **increm
 
 ```rust
 use minkowski_lsm::manifest_ops::flush_and_record;
+use minkowski_lsm::types::SeqRange;
 
 // Write only the pages that changed since last flush
-let report = flush_and_record(&manifest_log, &mut world, &codec, dir)?;
-// report.page_count reflects only dirty pages, not total world size
+let path = flush_and_record(&world, seq_range, &mut manifest, &mut log, &dir)?;
+// path is Some if dirty pages were written, None if the world was clean
 ```
 
 ### Compaction
@@ -84,7 +85,7 @@ Each flush creates a new L1 sorted run. Over time, L1 accumulates overlapping ru
 use minkowski_lsm::{compact_one, COMPACTION_TRIGGER};
 
 // Compact when L1 exceeds the trigger threshold
-if let Some(report) = compact_one(&manifest_log, &dir)? {
+if let Some(report) = compact_one(&mut manifest, &mut log, &dir)? {
     println!("Merged {} runs → {} (freed {} bytes)",
              report.input_count, report.output_count, report.bytes_freed);
 }
