@@ -10,6 +10,10 @@ use crate::world::{EntityLocation, World, get_pair_mut};
 
 /// Error returned by [`EnumChangeSet::apply`] when a mutation targets
 /// an invalid entity.
+///
+/// **Important:** `apply` is not atomic. When any error is returned,
+/// the World may be in a partially-mutated state due to fast-lane writes
+/// that cannot be rolled back. Callers must discard the World on error.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyError {
@@ -17,6 +21,14 @@ pub enum ApplyError {
     DeadEntity(Entity),
     /// Spawn targeted an entity already placed in an archetype.
     AlreadyPlaced(Entity),
+    /// Fast-lane writes were already committed when a later mutation failed.
+    /// The World is in a partially-mutated state and must be discarded.
+    PartialApply {
+        /// The index of the mutation that failed.
+        failed_index: usize,
+        /// The error that caused the failure.
+        source: Box<ApplyError>,
+    },
 }
 
 impl std::fmt::Display for ApplyError {
@@ -24,6 +36,9 @@ impl std::fmt::Display for ApplyError {
         match self {
             Self::DeadEntity(e) => write!(f, "entity {:?} is not alive", e),
             Self::AlreadyPlaced(e) => write!(f, "entity {:?} is already placed", e),
+            Self::PartialApply { failed_index, source } => {
+                write!(f, "partial apply at mutation {}: {}", failed_index, source)
+            }
         }
     }
 }
@@ -740,6 +755,19 @@ impl EnumChangeSet {
     ///
     /// Returns `Ok(())` on success or `Err(ApplyError)` if a mutation targets
     /// an invalid entity. A single tick is allocated for the entire batch.
+    ///
+    /// # Partial application
+    ///
+    /// `apply` is **not atomic**. Internally, "fast-lane" overwrites (mutations
+    /// whose target archetype and column are already known) are applied *before*
+    /// the sequential mutation loop. If a later mutation fails, those fast-lane
+    /// writes are already committed to `world` and cannot be rolled back.
+    ///
+    /// After a failed `apply`, the World is in a **partially-mutated** state:
+    /// some columns have been overwritten with new values while the failing
+    /// mutation (and all subsequent ones) were never applied. Callers must
+    /// **discard** the World on error — there is no way to determine exactly
+    /// which fast-lane writes took effect.
     pub fn apply(mut self, world: &mut World) -> Result<(), ApplyError> {
         let tick = world.next_tick();
 
@@ -760,7 +788,17 @@ impl EnumChangeSet {
                 self.drop_entries.retain(|entry| {
                     entry.mutation_idx >= failed_idx && entry.mutation_idx != usize::MAX
                 });
-                Err(err)
+                // If fast-lane batches were applied before the failure, the World
+                // is partially mutated — wrap in PartialApply so callers know.
+                let had_fast_lane = !self.archetype_batches.is_empty();
+                if had_fast_lane {
+                    Err(ApplyError::PartialApply {
+                        failed_index: failed_idx,
+                        source: Box::new(err),
+                    })
+                } else {
+                    Err(err)
+                }
             }
         }
     }
@@ -1083,7 +1121,10 @@ fn changeset_insert_raw(
         return Err(ApplyError::DeadEntity(entity));
     }
     let index = entity.index() as usize;
-    let location = world.entity_locations[index].unwrap();
+    let Some(location) = world.entity_locations[index] else {
+        // Alive but unplaced (alloc_entity without spawn) — treat as dead.
+        return Err(ApplyError::DeadEntity(entity));
+    };
 
     let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
 
@@ -1182,7 +1223,10 @@ fn changeset_remove_raw(
         return Err(ApplyError::DeadEntity(entity));
     }
     let index = entity.index() as usize;
-    let location = world.entity_locations[index].unwrap();
+    let Some(location) = world.entity_locations[index] else {
+        // Alive but unplaced (alloc_entity without spawn) — treat as dead.
+        return Err(ApplyError::DeadEntity(entity));
+    };
     let src_arch = &world.archetypes.archetypes[location.archetype_id.0];
 
     if !src_arch.component_ids.contains(comp_id) {

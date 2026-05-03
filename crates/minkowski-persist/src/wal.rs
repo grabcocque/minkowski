@@ -697,6 +697,10 @@ impl Wal {
             let mut writer = BufWriter::new(&self.active_file);
             write_frame(&mut writer, &payload)?
         };
+        // Durability: flush kernel buffers to stable storage so that a
+        // process crash or power loss cannot lose the frame we just wrote.
+        // Without this, BufWriter::flush only pushes to the page cache.
+        self.active_file.sync_all()?;
         self.active_bytes += frame_bytes;
         self.bytes_since_checkpoint += frame_bytes;
         self.next_seq += 1;
