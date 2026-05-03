@@ -362,7 +362,7 @@ fn needs_compaction_parity_with_compact_one() {
 
     // Empty — needs_compaction false, compact_one returns None.
     assert!(
-        !manifest.needs_compaction(),
+        !manifest.needs_compaction().unwrap(),
         "empty: needs_compaction must be false"
     );
     let result = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
@@ -385,7 +385,7 @@ fn needs_compaction_parity_with_compact_one() {
         );
     }
     assert!(
-        !manifest.needs_compaction(),
+        !manifest.needs_compaction().unwrap(),
         "3 runs: needs_compaction must be false"
     );
     let result = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
@@ -398,7 +398,7 @@ fn needs_compaction_parity_with_compact_one() {
         do_flush(&world, &mut manifest, &mut log, dir.path(), 30, 39);
     }
     assert!(
-        manifest.needs_compaction(),
+        manifest.needs_compaction().unwrap(),
         "4 runs: needs_compaction must be true"
     );
     let result = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
@@ -406,7 +406,7 @@ fn needs_compaction_parity_with_compact_one() {
 
     // Post-compact — L0 empty, L1 has 1 run; needs_compaction false again.
     assert!(
-        !manifest.needs_compaction(),
+        !manifest.needs_compaction().unwrap(),
         "post-compact: needs_compaction must be false"
     );
     let result = compact_one(&mut manifest, &mut log, dir.path()).unwrap();
@@ -481,7 +481,7 @@ fn compact_then_recover_roundtrips_state() {
         "recovered L1 run path must match the compacted output"
     );
     assert!(
-        !recovered.needs_compaction(),
+        !recovered.needs_compaction().unwrap(),
         "recovered manifest must not need compaction"
     );
 

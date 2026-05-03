@@ -83,20 +83,20 @@ pub(crate) fn build_emit_list(
             continue;
         };
 
-        // Walk entity-slot pages for this archetype from page 0 upward.
-        let mut page_index: u16 = 0;
-        loop {
-            let page = input.get_page(arch_id, ENTITY_SLOT, page_index)?;
-            let Some(page) = page else {
-                break;
-            };
+        // Walk entity-slot pages for this archetype via the sparse index.
+        // Using entity_pages (not sequential get_page probing) correctly
+        // handles non-contiguous page indices — e.g. pages 0 and 5 flushed
+        // with gaps in between. Sequential probing would break at the first
+        // gap and silently drop entities in higher pages.
+        for result in input.entity_pages(arch_id) {
+            let (page_index, page) = result?;
 
             let row_count = page.header().row_count as usize;
             let data = page.data();
 
             for row_within_page in 0..row_count {
                 let byte_offset = row_within_page * 8;
-                // SAFETY (invariant): get_page guarantees data.len() ==
+                // SAFETY (invariant): entity_pages guarantees data.len() ==
                 // PAGE_SIZE * item_size (8 for ENTITY_SLOT), so any row index
                 // < row_count is within bounds.
                 let entity_id = u64::from_le_bytes(
@@ -114,13 +114,6 @@ pub(crate) fn build_emit_list(
                         source_row: row_in_arch,
                     });
                 }
-            }
-
-            // Overflow is impossible in practice (would require 2^16 pages *
-            // PAGE_SIZE rows per archetype), but handle it gracefully.
-            match page_index.checked_add(1) {
-                Some(next) => page_index = next,
-                None => break,
             }
         }
     }

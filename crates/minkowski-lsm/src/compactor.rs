@@ -374,7 +374,7 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
 /// report or `None`. Callers loop:
 ///
 /// ```ignore
-/// while manifest.needs_compaction() {
+/// while manifest.needs_compaction()? {
 ///     compactor::compact_one(&mut manifest, &mut log, &run_dir)?;
 /// }
 /// ```
@@ -846,7 +846,7 @@ mod tests {
         // Empty — both must agree: no compaction needed.
         let candidate = find_compaction_candidate(&manifest).unwrap();
         assert_eq!(
-            manifest.needs_compaction(),
+            manifest.needs_compaction().unwrap(),
             candidate.is_some(),
             "needs_compaction must match find_compaction_candidate (empty)"
         );
@@ -857,7 +857,7 @@ mod tests {
         }
         let candidate = find_compaction_candidate(&manifest).unwrap();
         assert_eq!(
-            manifest.needs_compaction(),
+            manifest.needs_compaction().unwrap(),
             candidate.is_some(),
             "needs_compaction must match find_compaction_candidate (3 runs)"
         );
@@ -866,11 +866,11 @@ mod tests {
         do_flush(&mut manifest, &mut log, dir.path(), 30, 39, 2);
         let candidate = find_compaction_candidate(&manifest).unwrap();
         assert_eq!(
-            manifest.needs_compaction(),
+            manifest.needs_compaction().unwrap(),
             candidate.is_some(),
             "needs_compaction must match find_compaction_candidate (4 runs)"
         );
-        assert!(manifest.needs_compaction(), "must be true at K=4");
+        assert!(manifest.needs_compaction().unwrap(), "must be true at K=4");
     }
 
     // ── Test 10: compact_one_observed fires for every output entity ───────────

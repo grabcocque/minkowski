@@ -304,6 +304,84 @@ impl SortedRunReader {
         self.page_count
     }
 
+    /// Iterate entity-slot pages for a given archetype, yielding
+    /// `(page_index, PageRef)` pairs in ascending page_index order.
+    ///
+    /// Unlike sequential `get_page` probing (which breaks on the first gap),
+    /// this scans the sparse index directly and visits every entity page
+    /// present — even when pages are non-contiguous (e.g. only pages 0 and 5
+    /// were dirty and flushed).
+    pub fn entity_pages(
+        &self,
+        arch_id: u16,
+    ) -> impl Iterator<Item = Result<(u16, PageRef<'_>), LsmError>> + '_ {
+        let key = (arch_id, ENTITY_SLOT, 0u16);
+        let start = self
+            .index
+            .partition_point(|e| (e.arch_id, e.slot, e.page_index) < key);
+
+        self.index[start..]
+            .iter()
+            .take_while(move |e| e.arch_id == arch_id && e.slot == ENTITY_SLOT)
+            .map(move |entry| {
+                let page_index = entry.page_index;
+                let buf = self.data.as_slice();
+                let offset = entry.file_offset as usize;
+                let header_size = std::mem::size_of::<PageHeader>();
+
+                let header_end = offset.checked_add(header_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {}, {page_index}): header offset overflow",
+                        ENTITY_SLOT
+                    ))
+                })?;
+                if header_end > buf.len() {
+                    return Err(LsmError::Format(format!(
+                        "page ({arch_id}, {}, {page_index}): header at offset {offset} extends beyond file",
+                        ENTITY_SLOT
+                    )));
+                }
+                let header_bytes: &[u8; 16] = buf[offset..header_end].try_into().expect("16 bytes");
+                let header = PageHeader::from_bytes(header_bytes);
+
+                let item_size = self.item_size_for_slot(ENTITY_SLOT)?;
+                let data_len = PAGE_SIZE.checked_mul(item_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {}, {page_index}): data length overflow",
+                        ENTITY_SLOT
+                    ))
+                })?;
+                let data_start = offset.checked_add(header_size).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {}, {page_index}): data start overflow",
+                        ENTITY_SLOT
+                    ))
+                })?;
+                let data_end = data_start.checked_add(data_len).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "page ({arch_id}, {}, {page_index}): data end overflow",
+                        ENTITY_SLOT
+                    ))
+                })?;
+                if data_end > buf.len() {
+                    return Err(LsmError::Format(format!(
+                        "page ({arch_id}, {}, {page_index}): data region [{data_start}..{data_end}] extends beyond file",
+                        ENTITY_SLOT
+                    )));
+                }
+                let data = &buf[data_start..data_end];
+
+                Ok((
+                    page_index,
+                    PageRef {
+                        header,
+                        data,
+                        file_offset: entry.file_offset,
+                    },
+                ))
+            })
+    }
+
     /// Number of entries in the sparse index.
     pub fn index_len(&self) -> usize {
         self.index.len()
@@ -377,6 +455,7 @@ mod tests {
     use super::*;
     use crate::writer::flush;
     use minkowski::World;
+    use std::path::PathBuf;
 
     #[derive(Clone, Copy)]
     #[expect(dead_code)]
@@ -617,5 +696,231 @@ mod tests {
             .unwrap();
         let proof: CrcProof = reader.validate_page_crc(&page).unwrap();
         let _ = proof;
+    }
+
+    /// Build a minimal sorted-run file with entity pages at non-contiguous
+    /// indices (0 and 3, but not 1 or 2). This simulates a flush that only
+    /// writes dirty pages — entity-slot pages can be sparse when only some
+    /// pages of an archetype's entity column were modified.
+    ///
+    /// Before the `entity_pages` method, `build_emit_list` used sequential
+    /// `get_page(arch_id, ENTITY_SLOT, page_index++)` probing which breaks
+    /// at the first gap and silently drops entities in higher pages.
+    fn build_sparse_entity_page_file(dir: &Path) -> PathBuf {
+        use crate::format::{Footer, Header, IndexEntry, MAGIC, PageHeader, VERSION};
+
+        let path = dir.join("sparse.run");
+        let arch_id: u16 = 0;
+
+        let entity_data_page = |page_index: u16, entity_ids: &[u64]| -> Vec<u8> {
+            let row_count = entity_ids.len() as u16;
+            let mut page_bytes = Vec::new();
+            let mut data_bytes = Vec::new();
+            for &id in entity_ids {
+                data_bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            let data_crc = crc32fast::hash(&data_bytes);
+            let ph = PageHeader {
+                arch_id,
+                slot: ENTITY_SLOT,
+                page_index,
+                row_count,
+                page_crc32: data_crc,
+                _padding: 0,
+            };
+            page_bytes.extend_from_slice(ph.as_bytes());
+            page_bytes.extend_from_slice(&data_bytes);
+            let item_size = 8usize;
+            let pad_len = PAGE_SIZE * item_size - data_bytes.len();
+            page_bytes.extend(std::iter::repeat_n(0u8, pad_len));
+            page_bytes
+        };
+
+        let e0: u64 = 100;
+        let e1: u64 = 200;
+        let e2: u64 = 300;
+        let e3: u64 = 400;
+
+        let page0 = entity_data_page(0, &[e0, e1]);
+        let page3 = entity_data_page(3, &[e2, e3]);
+
+        let page0_offset: u64 = 64;
+        let page3_offset: u64 = page0_offset + page0.len() as u64;
+
+        let mut index = vec![
+            IndexEntry {
+                arch_id,
+                slot: ENTITY_SLOT,
+                page_index: 0,
+                _pad: 0,
+                file_offset: page0_offset,
+            },
+            IndexEntry {
+                arch_id,
+                slot: ENTITY_SLOT,
+                page_index: 3,
+                _pad: 0,
+                file_offset: page3_offset,
+            },
+        ];
+        index.sort();
+
+        let index_offset = page3_offset + page3.len() as u64;
+
+        let schema_count: u32 = 0;
+        let schema_offset = index_offset + (index.len() as u64) * 16;
+        let schema_bytes: Vec<u8> = Vec::new();
+
+        let total_page_count: u64 = 2;
+
+        let _footer_offset = schema_offset + schema_bytes.len() as u64;
+        let footer = Footer {
+            sparse_index_offset: index_offset,
+            sparse_index_count: index.len() as u64,
+            schema_offset,
+            bloom_filter_offset: 0,
+            total_crc32: 0,
+            reserved: [0u8; 28],
+        };
+
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        let header = Header {
+            magic: MAGIC,
+            version: VERSION,
+            schema_count,
+            page_count: total_page_count,
+            sequence_lo: 1,
+            sequence_hi: 10,
+            header_crc32: 0,
+            reserved: [0u8; 20],
+        };
+
+        let mut header_bytes = header.as_bytes().to_vec();
+        let header_crc = crc32fast::hash(&header_bytes[..40]);
+        header_bytes[40..44].copy_from_slice(&header_crc.to_le_bytes());
+
+        use std::io::Write;
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&page0).unwrap();
+        file.write_all(&page3).unwrap();
+        for entry in &index {
+            file.write_all(entry.as_bytes()).unwrap();
+        }
+        file.write_all(&schema_bytes).unwrap();
+
+        let mut footer_bytes = footer.as_bytes().to_vec();
+        let total_crc = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&header_bytes);
+            buf.extend_from_slice(&page0);
+            buf.extend_from_slice(&page3);
+            for entry in &index {
+                buf.extend_from_slice(entry.as_bytes());
+            }
+            buf.extend_from_slice(&schema_bytes);
+            buf.extend_from_slice(&footer_bytes);
+            let total_crc32_offset = buf.len() - 64 + 32;
+            buf[total_crc32_offset..total_crc32_offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+            crc32fast::hash(&buf)
+        };
+        footer_bytes[32..36].copy_from_slice(&total_crc.to_le_bytes());
+        file.write_all(&footer_bytes).unwrap();
+
+        path
+    }
+
+    #[test]
+    fn entity_pages_iterates_sparse_entity_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_sparse_entity_page_file(dir.path());
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        // Sequential get_page probing stops at the first gap (page 1 missing)
+        // and misses page 3 entirely — this was the bug.
+        assert!(
+            reader.get_page(0, ENTITY_SLOT, 0).unwrap().is_some(),
+            "page 0 must exist"
+        );
+        assert!(
+            reader.get_page(0, ENTITY_SLOT, 1).unwrap().is_none(),
+            "page 1 must be absent (sparse gap)"
+        );
+        assert!(
+            reader.get_page(0, ENTITY_SLOT, 3).unwrap().is_some(),
+            "page 3 must exist despite gap at page 1"
+        );
+
+        // entity_pages must iterate both pages 0 and 3, skipping the gap.
+        let pages: Vec<(u16, u64)> = reader
+            .entity_pages(0)
+            .map(|r| {
+                let (page_index, page) = r.unwrap();
+                let row_count = page.header().row_count as usize;
+                let data = page.data();
+                let first_entity = u64::from_le_bytes(data[..8].try_into().unwrap());
+                assert_eq!(row_count, 2, "each page has 2 entities");
+                (page_index, first_entity)
+            })
+            .collect();
+
+        assert_eq!(pages.len(), 2, "must find both sparse pages");
+        assert_eq!(pages[0].0, 0, "first page index is 0");
+        assert_eq!(pages[1].0, 3, "second page index is 3 (skipping gap)");
+        assert_eq!(pages[0].1, 100, "first entity in page 0");
+        assert_eq!(pages[1].1, 300, "first entity in page 3");
+    }
+
+    #[test]
+    fn sequential_get_page_probing_misses_sparse_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_sparse_entity_page_file(dir.path());
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        // Demonstrate the old sequential probing approach would stop
+        // at the first gap and miss page 3 entirely.
+        let mut found_via_sequential = Vec::new();
+        let mut page_index: u16 = 0;
+        loop {
+            match reader.get_page(0, ENTITY_SLOT, page_index) {
+                Ok(Some(page)) => {
+                    let row_count = page.header().row_count as usize;
+                    let data = page.data();
+                    for r in 0..row_count {
+                        let off = r * 8;
+                        let id = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+                        found_via_sequential.push(id);
+                    }
+                    page_index += 1;
+                }
+                Ok(None) => break, // stops here — misses page 3!
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        // Sequential probing finds page 0's entities but not page 3's.
+        assert_eq!(
+            found_via_sequential,
+            &[100, 200],
+            "sequential probing stops at gap, missing page 3"
+        );
+
+        // entity_pages finds all entities including page 3.
+        let mut found_via_entity_pages = Vec::new();
+        for result in reader.entity_pages(0) {
+            let (_page_index, page) = result.unwrap();
+            let row_count = page.header().row_count as usize;
+            let data = page.data();
+            for r in 0..row_count {
+                let off = r * 8;
+                let id = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+                found_via_entity_pages.push(id);
+            }
+        }
+        assert_eq!(
+            found_via_entity_pages,
+            &[100, 200, 300, 400],
+            "entity_pages must find all entities across sparse pages"
+        );
     }
 }
