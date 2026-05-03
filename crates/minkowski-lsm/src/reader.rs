@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::bloom::BloomView;
 use crate::codec::CrcProof;
 use crate::error::LsmError;
 use crate::format::*;
@@ -59,6 +60,7 @@ pub struct SortedRunReader {
     data: MappedData,
     schema: SchemaSection,
     index: Vec<IndexEntry>,
+    bloom: Option<BloomView>,
     sequence_range: SeqRange,
     page_count: u64,
 }
@@ -70,6 +72,7 @@ const MIN_FILE_SIZE: usize = 128;
 struct ParsedMetadata {
     schema: SchemaSection,
     index: Vec<IndexEntry>,
+    bloom: Option<BloomView>,
     sequence_range: SeqRange,
     page_count: u64,
 }
@@ -180,9 +183,17 @@ fn validate_and_parse(buf: &[u8]) -> Result<ParsedMetadata, LsmError> {
         index.push(IndexEntry::from_bytes(entry_bytes));
     }
 
+    let bloom = if footer.bloom_filter_offset != 0 {
+        let offset = footer.bloom_filter_offset as usize;
+        Some(BloomView::from_bytes(buf, offset)?)
+    } else {
+        None
+    };
+
     Ok(ParsedMetadata {
         schema,
         index,
+        bloom,
         sequence_range,
         page_count,
     })
@@ -198,6 +209,7 @@ impl SortedRunReader {
             data,
             schema: parsed.schema,
             index: parsed.index,
+            bloom: parsed.bloom,
             sequence_range: parsed.sequence_range,
             page_count: parsed.page_count,
         })
@@ -385,6 +397,21 @@ impl SortedRunReader {
     /// Number of entries in the sparse index.
     pub fn index_len(&self) -> usize {
         self.index.len()
+    }
+
+    /// Check if a page *might* be present in this sorted run.
+    ///
+    /// Returns `true` if the page might exist (could be a false positive).
+    /// Returns `false` if the page is definitely not present (no false negatives).
+    ///
+    /// When no bloom filter exists (old files without one), returns `true`
+    /// conservatively — the caller should fall through to `get_page` or
+    /// binary search.
+    pub fn contains_page(&self, arch_id: u16, slot: u16, page_index: u16) -> bool {
+        match &self.bloom {
+            Some(view) => view.contains(crate::bloom::pack_page_key(arch_id, slot, page_index)),
+            None => true,
+        }
     }
 
     /// Returns the sorted, deduplicated list of archetype IDs present in this sorted run.
@@ -921,6 +948,57 @@ mod tests {
             found_via_entity_pages,
             &[100, 200, 300, 400],
             "entity_pages must find all entities across sparse pages"
+        );
+    }
+
+    #[test]
+    fn bloom_filter_matches_index() {
+        let (_dir, path, _world) = flush_world_with_pos(10);
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        for entry in &reader.index {
+            assert!(
+                reader.contains_page(entry.arch_id, entry.slot, entry.page_index),
+                "bloom filter must return true for indexed page ({}, {}, {})",
+                entry.arch_id,
+                entry.slot,
+                entry.page_index
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_filter_rejects_absent_pages() {
+        let (_dir, path, _world) = flush_world_with_pos(5);
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        let mut rejected = 0;
+        for arch_id in 200u16..210 {
+            for page_index in 0u16..10 {
+                if !reader.contains_page(arch_id, 0, page_index) {
+                    rejected += 1;
+                }
+            }
+        }
+        assert!(
+            rejected > 0,
+            "bloom filter must reject some absent page keys"
+        );
+    }
+
+    #[test]
+    fn old_run_without_bloom_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_sparse_entity_page_file(dir.path());
+        let reader = SortedRunReader::open(&path).unwrap();
+
+        assert!(
+            reader.contains_page(0, ENTITY_SLOT, 0),
+            "contains_page must return true when no bloom filter is present"
+        );
+        assert!(
+            reader.contains_page(255, 255, 255),
+            "contains_page must return true when no bloom filter is present"
         );
     }
 }
