@@ -28,6 +28,7 @@ use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::bloom::{BlockedBloomFilter, pack_page_key};
 use crate::error::LsmError;
 use crate::format::{
     ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, PAGE_SIZE, PageHeader, VERSION,
@@ -510,12 +511,34 @@ impl<'a> CompactionWriter<'a> {
             w.write_all(entry.as_bytes())?;
         }
 
+        // ── 9b. Bloom filter — built from all page keys in the index.
+        let bloom_filter_offset = if index_entries.is_empty() {
+            0u64
+        } else {
+            let bloom_seed = seq_lo;
+            let mut bloom = BlockedBloomFilter::new(index_entries.len(), bloom_seed);
+            for entry in &index_entries {
+                bloom.insert(pack_page_key(entry.arch_id, entry.slot, entry.page_index));
+            }
+            let mut offset = w.stream_position()?;
+            if offset % 64 != 0 {
+                write_zeros(&mut w, 64 - (offset as usize % 64))?;
+                offset = w.stream_position()?;
+            }
+            assert!(
+                offset % 64 == 0,
+                "bloom filter section must be 64-byte aligned"
+            );
+            bloom.write_to(&mut w)?;
+            offset
+        };
+
         // ── 10. Write footer (CRCs patched later) ─────────────────────────────
         let footer = Footer {
             sparse_index_offset,
             sparse_index_count: index_entries.len() as u64,
             schema_offset,
-            bloom_filter_offset: 0,
+            bloom_filter_offset,
             total_crc32: 0,
             reserved: [0u8; 28],
         };
@@ -1163,6 +1186,49 @@ mod tests {
         assert!(
             (x - 2.0_f32).abs() < f32::EPSILON,
             "expected Pos.x == 2.0 from newer run, got {x}"
+        );
+    }
+
+    // ── Task 4 test: compaction rebuilds bloom filter ─────────────────────────
+
+    #[test]
+    fn compaction_rebuilds_bloom_filter() {
+        let mut world = World::new();
+        let _e1 = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let _e2 = world.spawn((Pos { x: 2.0, y: 0.0 },));
+
+        let (_dir_a, reader_a) = flush_to_reader(&world, 1, 5);
+        let (_dir_b, reader_b) = flush_to_reader(&world, 6, 10);
+
+        let arch_info = arch_component_names(&reader_a);
+        assert_eq!(arch_info.len(), 1);
+        let (arch_a, comp_names) = &arch_info[0];
+        let arch_b = find_archetype_by_components(&reader_b, &[comp_names[0].as_str()])
+            .expect("run B must have the Pos archetype");
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("1-10.compact.run");
+        let seq_range = SeqRange::new(SeqNo::from(1u64), SeqNo::from(10u64)).unwrap();
+
+        let writer = CompactionWriter::new(
+            vec![&reader_b, &reader_a],
+            vec![vec![Some(arch_b), Some(*arch_a)]],
+            vec![comp_names.clone()],
+            out_path.clone(),
+            seq_range,
+        )
+        .unwrap();
+
+        writer.write().unwrap();
+
+        let data = std::fs::read(&out_path).unwrap();
+        let footer_start = data.len() - 64;
+        let footer = crate::format::Footer::from_bytes(
+            data[footer_start..footer_start + 64].try_into().unwrap(),
+        );
+        assert!(
+            footer.bloom_filter_offset > 0,
+            "compacted run must have a bloom filter"
         );
     }
 }
