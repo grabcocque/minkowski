@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use minkowski::World;
 
+use crate::bloom::{BlockedBloomFilter, pack_page_key};
 use crate::error::LsmError;
 use crate::format::*;
 use crate::schema::SchemaSection;
@@ -336,12 +337,34 @@ pub fn flush_observed(
         w.write_all(entry.as_bytes())?;
     }
 
+    // (e2) Bloom filter — built from all page keys in the index.
+    let bloom_filter_offset = if index_entries.is_empty() {
+        0u64
+    } else {
+        let bloom_seed = seq_lo;
+        let mut bloom = BlockedBloomFilter::new(index_entries.len(), bloom_seed);
+        for entry in &index_entries {
+            bloom.insert(pack_page_key(entry.arch_id, entry.slot, entry.page_index));
+        }
+        let mut offset = w.stream_position()?;
+        if offset % 64 != 0 {
+            write_zeros(&mut w, 64 - (offset as usize % 64))?;
+            offset = w.stream_position()?;
+        }
+        assert!(
+            offset % 64 == 0,
+            "bloom filter section must be 64-byte aligned"
+        );
+        bloom.write_to(&mut w)?;
+        offset
+    };
+
     // (f) Footer
     let footer = Footer {
         sparse_index_offset,
         sparse_index_count: index_entries.len() as u64,
         schema_offset,
-        bloom_filter_offset: 0,
+        bloom_filter_offset,
         total_crc32: 0,
         reserved: [0u8; 28],
     };
@@ -565,5 +588,32 @@ mod tests {
         assert!(seen.contains(&e1.to_bits()), "e1 not observed");
         assert!(seen.contains(&e2.to_bits()), "e2 not observed");
         assert!(seen.contains(&e3.to_bits()), "e3 not observed");
+    }
+
+    #[test]
+    fn flush_produces_run_with_bloom_filter() {
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 2.0 },));
+        world.spawn((Pos { x: 3.0, y: 4.0 },));
+        world.spawn((Pos { x: 5.0, y: 6.0 },));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = flush(
+            &world,
+            SeqRange::new(SeqNo::from(0u64), SeqNo::from(0u64)).unwrap(),
+            dir.path(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        let footer_start = data.len() - 64;
+        let footer = crate::format::Footer::from_bytes(
+            data[footer_start..footer_start + 64].try_into().unwrap(),
+        );
+        assert!(
+            footer.bloom_filter_offset > 0,
+            "bloom_filter_offset must be non-zero for dirty flush"
+        );
     }
 }
