@@ -1075,4 +1075,147 @@ mod tests {
             expected_total
         );
     }
+
+    // ── Test 12: heterogeneous runs — some single-archetype, some multi ──────
+    //
+    // Regression test for the claim that compaction loses data when some runs
+    // have one archetype and others have both. The picker groups by single
+    // signature but the job's `all_component_signatures` is the union of ALL
+    // archetypes across the group's runs, so no data is lost.
+    //
+    // Scenario:
+    //   Runs 0, 1: only (Pos,)
+    //   Runs 2, 3: both (Pos,) and (Pos, Vel)
+    //   (Pos,) group has 4 runs → triggers; (Pos, Vel) group has 2 → doesn't.
+    //   The compaction output must still contain (Pos, Vel) entities from
+    //   runs 2 and 3.
+
+    #[test]
+    fn compaction_preserves_data_from_heterogeneous_runs() {
+        use crate::format::ENTITY_SLOT;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        let mut all_pos_bits: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut all_posvel_bits: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        // Runs 0, 1: only (Pos,)
+        for run_i in 0..2usize {
+            let mut world = World::new();
+            let skip = run_i * 2;
+            let phs: Vec<_> = (0..skip)
+                .map(|_| world.spawn((Pos { x: 0.0, y: 0.0 },)))
+                .collect();
+            for ph in phs {
+                world.despawn(ph);
+            }
+            for j in 0..2usize {
+                let e = world.spawn((Pos {
+                    x: (run_i * 10 + j) as f32,
+                    y: 0.0,
+                },));
+                all_pos_bits.insert(e.to_bits());
+            }
+            let lo = (run_i as u64) * 10;
+            let hi = lo + 9;
+            let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
+            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
+                .unwrap()
+                .expect("world is dirty");
+        }
+
+        // Runs 2, 3: both (Pos,) and (Pos, Vel)
+        for run_i in 2..4usize {
+            let mut world = World::new();
+            let skip = run_i * 4; // 2 pos + 2 posvel per run
+            let phs: Vec<_> = (0..skip)
+                .map(|_| world.spawn((Pos { x: 0.0, y: 0.0 },)))
+                .collect();
+            for ph in phs {
+                world.despawn(ph);
+            }
+            for j in 0..2usize {
+                let e = world.spawn((Pos {
+                    x: (run_i * 10 + j) as f32,
+                    y: 0.0,
+                },));
+                all_pos_bits.insert(e.to_bits());
+            }
+            for j in 0..2usize {
+                let e = world.spawn((
+                    Pos {
+                        x: (run_i * 20 + j) as f32,
+                        y: 0.0,
+                    },
+                    Vel {
+                        dx: (run_i * 20 + j) as f32,
+                        dy: 0.0,
+                    },
+                ));
+                all_posvel_bits.insert(e.to_bits());
+            }
+            let lo = (run_i as u64) * 10;
+            let hi = lo + 9;
+            let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
+            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
+                .unwrap()
+                .expect("world is dirty");
+        }
+
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), 4);
+
+        // Run compaction
+        let report = compact_one(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("K=4 runs must produce Some(report)");
+
+        assert!(manifest.runs_at_level(Level::L0).is_empty());
+        assert_eq!(manifest.runs_at_level(Level::L1).len(), 1);
+
+        // Verify all entities from BOTH archetypes are in the output
+        let output_path = &report.output_path;
+        let out_reader = SortedRunReader::open(output_path).unwrap();
+
+        let arch_ids = out_reader.archetype_ids();
+        assert_eq!(
+            arch_ids.len(),
+            2,
+            "output must have 2 archetypes, got {}",
+            arch_ids.len()
+        );
+
+        let mut found: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &arch_id in &arch_ids {
+            let mut page_idx: u16 = 0;
+            while let Ok(Some(page)) = out_reader.get_page(arch_id, ENTITY_SLOT, page_idx) {
+                let row_count = page.header().row_count as usize;
+                let data = page.data();
+                for r in 0..row_count {
+                    let off = r * 8;
+                    let id = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+                    found.insert(id);
+                }
+                page_idx += 1;
+            }
+        }
+
+        let expected_total = all_pos_bits.len() + all_posvel_bits.len();
+        assert_eq!(
+            found.len(),
+            expected_total,
+            "output must contain all entities from both archetypes: got {}, expected {}",
+            found.len(),
+            expected_total
+        );
+
+        // Specifically verify Pos+Vel entities from runs 2, 3 are present
+        for bits in &all_posvel_bits {
+            assert!(
+                found.contains(bits),
+                "Pos+Vel entity {bits:#x} missing from output — data loss!"
+            );
+        }
+    }
 }

@@ -27,3 +27,4 @@ dist/
 crates/minkowski-py/**/*.so
 crates/minkowski-py/**/*.dylib
 .ipynb_checkpoints/
+.env.local
