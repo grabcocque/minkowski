@@ -1,6 +1,6 @@
 # Memory Management
 
-RAM is fast, expensive, and limited. Minkowski provides three complementary features to help you do more with less.
+RAM is fast, expensive, and limited. Minkowski provides four complementary features to help you do more with less.
 
 ## Pre-allocated Memory Pool
 
@@ -58,7 +58,47 @@ world.spawn((data, Expiry::after(5)));
 registry.run(&mut world, retention_id, ());
 ```
 
-Together, these three features let a Minkowski deployment run indefinitely within a fixed memory envelope: the pool caps total memory, blob offloading keeps large assets external, and retention prevents unbounded entity growth.
+Together, these four features let a Minkowski deployment run indefinitely within a fixed memory envelope: the pool caps total RAM, blob offloading keeps large assets external, retention prevents unbounded entity growth, and LSM compaction bounds disk-space amplification to ≤ 2×.
+
+## LSM Disk-Space Management
+
+The `minkowski-lsm` crate adds a fourth dimension to memory management: **incremental disk persistence with bounded space amplification**. Where the pool caps in-memory RAM, blob offloading keeps large assets external, and retention prevents unbounded entity growth, LSM compaction prevents unbounded disk usage.
+
+### Dirty-Page Tracking
+
+`storage::dirty_pages` (in the core crate) provides per-column page-level dirty bitsets (256 rows/page). Every `BlobVec` mutation path marks affected pages dirty. On flush, only dirty pages are written to a new sorted-run file — persistence cost is proportional to the mutation rate, not the world size.
+
+```rust
+use minkowski_lsm::manifest_ops::flush_and_record;
+
+// Write only the pages that changed since last flush
+let report = flush_and_record(&manifest_log, &mut world, &codec, dir)?;
+// report.page_count reflects only dirty pages, not total world size
+```
+
+### Compaction
+
+Each flush creates a new L1 sorted run. Over time, L1 accumulates overlapping runs for the same archetypes. `compact_one` merges runs atomically — either all input runs are replaced by the output, or none are (via the `CompactionCommit` manifest log entry).
+
+```rust
+use minkowski_lsm::{compact_one, COMPACTION_TRIGGER};
+
+// Compact when L1 exceeds the trigger threshold
+if let Some(report) = compact_one(&manifest_log, &dir)? {
+    println!("Merged {} runs → {} (freed {} bytes)",
+             report.input_count, report.output_count, report.bytes_freed);
+}
+```
+
+Space amplification is bounded at ≤ 2× during compaction (old and new runs coexist briefly). After compaction completes, orphaned files are cleaned up via `cleanup_orphans`.
+
+### Crash Safety
+
+Sorted-run files are immutable once written. A partial flush produces an orphan file not referenced by the manifest — `cleanup_orphans` removes it on the next startup. The manifest log uses CRC32 frames with atomic `CompactionCommit` entries, so recovery replays a consistent prefix of the log.
+
+### What's Next
+
+Phase 5 (pending) will add `LsmRecovery` (restore World from sorted runs + WAL tail) and `Durable<S>` integration (automatic LSM flush instead of full snapshots on checkpoint). Until then, the LSM crate provides flush and compaction primitives that can be called manually.
 
 <!-- Link definitions -->
 [mmap]: https://en.wikipedia.org/wiki/Mmap

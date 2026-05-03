@@ -67,13 +67,13 @@ registry.run(&mut world, move_id, ());
 ### Building & testing
 
 ```
-cargo test -p minkowski                # 869 tests
+cargo test -p minkowski                # 903 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p minkowski               # criterion benchmarks vs hecs
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p minkowski --lib   # UB check
 ```
 
-CI runs fmt, clippy, test, and Miri sequentially on every PR. A `ci-pass` aggregator job is the single required status check for branch protection.
+CI runs fmt, clippy, test (including minkowski-lsm), TSan, Loom, and Miri on every PR. A `ci-pass` aggregator job is the single required status check for branch protection.
 
 ## Design Principles
 
@@ -114,7 +114,7 @@ Minkowski uses `unsafe` for type-erased column storage and raw pointer iteration
 | Layer | What it catches | When it runs |
 |---|---|---|
 | **Type system + borrow checker** | Aliased `&mut T`, lifetime violations, `Send`/`Sync` misuse. `ReadOnlyWorldQuery` prevents `&mut T` through `&World`. | Every build |
-| **869 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries, query planner execution | Every PR (CI) |
+| **903 unit tests** | Semantic bugs: entity lifecycle, archetype migration, change detection, transaction abort cleanup, reducer access boundaries, query planner execution | Every PR (CI) |
 | **[Miri][miri] + [Tree Borrows][tree-borrows]** | Undefined behavior: use-after-free, uninitialized reads, aliasing violations in `unsafe` blocks. Full test suite passes under the strict Tree Borrows model. | Every PR (CI) |
 | **[ThreadSanitizer][tsan]** | Data races: unsynchronized concurrent memory accesses. Full test suite including rayon `par_for_each` passes under TSan instrumentation. | Every PR (CI) |
 | **[Loom][loom]** | Concurrency invariant violations: exhaustive thread interleaving enumeration over OrphanQueue push/drain, column lock acquire/upgrade/deadlock-freedom, and entity ID reservation contention. | Every PR (CI) |
@@ -182,6 +182,25 @@ durable.transact_with(&mut world, access, |scope| { /* TxScope: no world param n
 
 **Persistence vs. the memory pool**: `Durable<S>` and `WorldBuilder`'s mmap pool solve different problems. The pool pre-allocates volatile RAM — anonymous `MAP_ANONYMOUS` pages that vanish when the process exits. It controls memory *layout and budget*, not durability. `Durable<S>` writes committed mutations to a WAL on *disk* before they're visible, giving crash safety. They compose naturally: a pooled World with `Durable<Optimistic>` gives crash-safe transactions within a fixed memory envelope. Use `memory_budget()` for bounded workloads with pre-faulted pages. Use `Durable` for crash safety. Use both when you want both guarantees.
 
+### Incremental Persistence (LSM)
+
+The `minkowski-lsm` crate adds incremental persistence via an LSM tree over archetype pages. Only dirty pages are written to disk — persistence cost is proportional to the mutation rate, not the world size. This replaces the O(world size) full-snapshot approach for large worlds.
+
+```rust
+use minkowski_lsm::{flush_and_record, LsmManifest, compact_one};
+
+// Flush dirty pages to a new sorted run, record in manifest
+let report = flush_and_record(&manifest_log, &mut world, &codec, dir)?;
+
+// Compact when L1 accumulates too many runs
+if let Some(report) = compact_one(&manifest_log, &dir)? {
+    println!("Compacted {} input runs → {} output run",
+             report.input_count, report.output_count);
+}
+```
+
+Sorted runs are immutable files containing archetype page images sorted by `(arch_id, slot, page_index)`, with a binary-searchable sparse index and a cache-line-blocked bloom filter for recovery-time page lookups. Compaction merges runs atomically — either all input runs are replaced by the output, or none are.
+
 ## Schema & Mutation
 
 `#[derive(Table)]` declares a named schema with typed row accessors — queries against a table skip archetype matching entirely. Fields can be annotated with `#[index(btree)]` or `#[index(hash)]` to declare compile-time index requirements:
@@ -248,6 +267,7 @@ Three complementary features let a Minkowski deployment run indefinitely within 
 - **Pre-allocated memory pool** — `WorldBuilder` creates a World backed by a single mmap region with a fixed budget. `try_spawn` returns `Err(PoolExhausted)` instead of crashing.
 - **Blob offloading** — `BlobRef` stores external keys (S3 paths, URLs) instead of large assets. `BlobStore` provides cleanup hooks for orphaned references.
 - **Retention** — `Expiry` is a countdown component that despawns entities after a configurable number of retention cycles.
+- **LSM compaction** — `compact_one` merges sorted runs to bound disk-space amplification (≤ 2× during compaction). `cleanup_orphans` removes files not tracked by the manifest for crash safety. Compaction is on-demand; background scheduling is planned for Phase 5.
 
 [Full documentation →](docs/memory-management.md)
 
