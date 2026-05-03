@@ -1,7 +1,7 @@
 # Stage 3: LSM Tree Storage — Phased Implementation Plan
 
 *Parent document: [Scaling Roadmap](./2026-03-20-scaling-roadmap.md), Stage 3.*
-*Status: Draft. Prerequisites: Stage 2.5 (SlabPool-only allocation).*
+*Status: Phases 1-4 complete. Phase 5 pending.*
 
 ---
 
@@ -20,18 +20,26 @@ artifact. No phase requires the next to be useful.
 
 ---
 
-## Prerequisites (Stage 2.5)
+## Prerequisites (Stage 2.5) — Deferred
 
-The following must be complete before Phase 1 begins:
+Stage 2.5 (SlabPool-only allocation) was deferred. The LSM crate operates on a
+separate I/O path that reads page data from World's existing allocator via
+`storage::dirty_pages` per-column bitsets. The LSM sorted-run format is
+allocator-agnostic — page bytes are copied into the sorted run during flush
+regardless of whether the source column is SlabPool-backed or malloc-backed.
 
-- [ ] `SystemAllocator` removed — all `BlobVec` columns mmap-backed via `SlabPool`
-- [ ] `World::new()` creates a default `SlabPool` (256 MB budget)
-- [ ] `cfg(miri)` fallback allocator for the test suite
-- [ ] All existing tests and examples pass under SlabPool-only allocation
+Stage 2.5 remains a prerequisite for:
+- O_DIRECT / io_uring I/O (Stage 4 RSM)
+- Zero-copy page flush (avoiding the memcpy from column → sorted run)
+- Page-aligned dirty tracking without per-column bitset overhead
+
+These are Stage 4+ concerns, not Stage 3.
 
 ---
 
 ## Phase 1: SortedRun Format and FlushWriter
+
+> **Status: Complete.** Implemented in PR #159. 159 unit + 38 integration tests passing.
 
 **Goal**: Define the on-disk format and write dirty pages from L0 → L1.
 
@@ -116,6 +124,8 @@ Get the format right first; optimize later.
 
 ## Phase 2: LsmManifest and Multi-Level Structure
 
+> **Status: Complete.** Implemented in PRs #160, #163–#166. Manifest with type-safe operations, CRC32 frames, crash recovery, compaction commit atomicity.
+
 **Goal**: Track sorted runs across levels (L1, L2, L3) with a persistent manifest.
 
 ### Deliverables
@@ -176,6 +186,8 @@ Each entry is length-prefixed with CRC32, same frame format as the WAL.
 ---
 
 ## Phase 3: Compactor
+
+> **Status: Complete.** Implemented in PRs #167–#170. Merge kernel with emit-list construction, entity-level dedup, observer hooks, compact_one public API.
 
 **Goal**: Merge sorted runs within and across levels to bound read amplification
 and disk usage.
@@ -253,6 +265,8 @@ pub enum CompactionMode {
 
 ## Phase 4: BlockedBloomFilter
 
+> **Status: Complete.** Implemented in PR #174. Cache-line-blocked bloom filter, zero-copy BloomView, write_bloom_section dedup, checked_mul overflow protection.
+
 **Goal**: Accelerate recovery-time page lookups across LSM levels.
 
 ### Deliverables
@@ -316,6 +330,8 @@ pub struct BlockedBloomFilter {
 ---
 
 ## Phase 5: LsmRecovery and Durable Integration
+
+> **Status: Not started.** This is the remaining Stage 3 work.
 
 **Goal**: Replace full-world snapshot recovery with incremental LSM recovery.
 Wire the LSM into the existing `Durable<S>` strategy.

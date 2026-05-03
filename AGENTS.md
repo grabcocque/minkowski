@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo test -p minkowski --lib          # Unit tests (644 tests, fast)
+cargo test -p minkowski --lib          # Unit tests (903 tests, fast)
 cargo test -p minkowski                # All tests including doc tests
 cargo test -p minkowski -- entity      # Run tests matching a filter
 
@@ -39,6 +39,10 @@ cargo run -p minkowski-examples --example planner --release   # Compiled push-ba
 cargo run -p minkowski-examples --example materialized_view --release   # Materialized views: cached debounced subscription queries, change detection, invalidation (200 entities, 7 demos)
 
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri nextest run -p minkowski --lib  # UB check (full suite ~860 tests, parallel via nextest)
+
+cargo test -p minkowski-lsm                # LSM sorted-run storage (159 unit + 38 integration)
+cargo test -p minkowski-lsm --lib          # LSM unit tests only
+cargo test -p minkowski-lsm -- bloom       # Bloom filter tests only
 
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu -- --skip par_for_each  # TSan (data race detection)
 RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p minkowski --lib --tests -Z build-std --target x86_64-unknown-linux-gnu par_for_each  # TSan rayon tests
@@ -86,7 +90,7 @@ cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warni
 
 ## Architecture
 
-Minkowski is a **column-oriented archetype ECS**. Five crates: `minkowski` (core), `minkowski-derive` (`#[derive(Table)]` proc macro), `minkowski-persist` (WAL, snapshots, durable transactions), `minkowski-observe` (metrics capture and display), and `minkowski-examples` (examples as external API consumers).
+Minkowski is a **column-oriented archetype ECS**. Seven crates: `minkowski` (core), `minkowski-derive` (`#[derive(Table)]` proc macro), `minkowski-persist` (WAL, snapshots, durable transactions), `minkowski-observe` (metrics capture and display), `minkowski-lsm` (LSM sorted-run storage, compaction, bloom filters), `minkowski-py` (Python/PyO3 bindings), and `minkowski-examples` (examples as external API consumers).
 
 ```
                           ┌─────────────────────────────────────────────┐
@@ -130,13 +134,21 @@ Minkowski is a **column-oriented archetype ECS**. Five crates: `minkowski` (core
   │ call()/run() │  │ cost-based    │  │ BTreeIndex       │  │ Sequential   │
   │ Access bitsets│  │ plans, joins  │  │ HashIndex        │  │ Optimistic   │
   │              │  │ aggregates    │  │ grids, quadtrees │  │ Pessimistic  │
-  └──────────────┘  └───────────────┘  └──────────────────┘  └──────────────┘
-                                                                    │
-                                                             ┌──────▼──────┐
-                                                             │ Durable<S>  │
-                                                             │ WAL+snapshot│
-                                                             │ (persist)   │
-                                                             └─────────────┘
+   └──────────────┘  └───────────────┘  └──────────────────┘  └──────────────┘
+                                                                     │
+                                                              ┌──────▼──────┐
+                                                              │ Durable<S>  │
+                                                              │ WAL+snapshot│
+                                                              │ (persist)   │
+                                                              └─────────────┘
+   ┌────▼────────────────────────────────────────────────────────┐
+   │ minkowski-lsm (external composition, not inside World)      │
+   │  ┌──────────────┐ ┌───────────────┐ ┌──────────────────┐   │
+   │  │FlushWriter   │ │ Compactor     │ │ LsmManifest      │   │
+   │  │ SortedRunReader│ │ compact_one  │ │ ManifestLog      │   │
+   │  │ BloomView    │ │ CompactionWriter│ │ manifest_ops    │   │
+   │  └──────────────┘ └───────────────┘ └──────────────────┘   │
+   └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Storage Model
@@ -323,9 +335,33 @@ Typed reducers narrow what a closure *can* touch so that conflict freedom is pro
 
 **EntityAllocator::reserve(&self)** provides lock-free entity ID allocation via `AtomicU32` — enables `Spawner` to work inside transactional closures where only `&World` is available.
 
+### LSM Sorted-Run Storage
+
+The `minkowski-lsm` crate implements incremental persistence via an LSM tree over archetype pages. Only dirty pages are written to disk — persistence cost is proportional to the mutation rate, not the world size.
+
+**On-disk format** (per sorted run): `[Header][Schema][Pages][Sparse Index][Bloom Filter][Footer]`. Each sorted run is an immutable file containing archetype page images sorted by `(arch_id, slot, page_index)`, a binary-searchable sparse index, and a cache-line-blocked bloom filter for recovery-time page membership tests.
+
+**Key components**:
+- `FlushWriter`: iterates dirty pages across all archetypes, writes a new L1 sorted run. `flush_observed` variant accepts an `EntryObserver` closure fired once per entity written to an entity-slot page.
+- `SortedRunReader`: memory-mapped reader with `get_page(arch_id, slot, page_index)` and `contains_page(arch_id, slot, page_index)` (bloom filter probe). `entity_pages(arch_id)` iterates sparse entity pages via binary search.
+- `CompactionWriter`: merge-kernel for compaction. `build_emit_list` determines which entity rows to copy (latest sequence wins). `CompactionWriter::write_observed` merges source runs into a single output run with bloom filter rebuild.
+- `LsmManifest`: tracks sorted runs per level (L0–L3) with sequence ranges and archetype coverage. `ManifestLog` is an append-only log of manifest changes with CRC32 frame integrity. Recovery replays the log to reconstruct manifest state.
+- `compact_one` / `compact_one_observed`: public API that finds a compaction candidate, merges runs, records the compaction in the manifest log atomically, and cleans up orphaned files.
+- `BlockedBloomFilter`: cache-line-blocked bloom filter (8 hashes per 64-byte block, ~1% FPR at 10 bits/key). `BloomView` provides zero-copy reads from mmap'd sorted runs with heap fallback for alignment. `pack_page_key(arch_id, slot, page_index)` packs the lookup key as u64.
+
+**Page keys**: bloom filter and sparse index use `(arch_id, slot, page_index)` packed as u64, where `slot` is the component column slot (from `SchemaSection`) or `ENTITY_SLOT` (0xFFFF) for entity pages. This matches `get_page`/recovery lookups exactly.
+
+**Bloom filter lifecycle**: built from `index_entries` after the sparse index during flush/compaction. Serialized in the sorted run file with 64-byte alignment padding. `BloomView` is parsed on open via `validate_and_parse`. `bloom_filter_offset == 0` in the footer means no filter (backward compat with pre-bloom files). Empty runs (no pages) skip bloom serialization.
+
+**Compaction semantics**: `CompactionCommit` manifest log entry records input run paths and the output level atomically — either all input runs are removed and the output is added, or none are. `manifest_ops::cleanup_orphans` removes sorted-run files not tracked by the manifest (crash safety: partial flush produces an orphan file, not referenced by the manifest).
+
+**Dirty page tracking** (in core crate): `storage::dirty_pages` provides per-column page-level dirty bitsets (256 rows/page). Wired into all BlobVec mutation paths. `flush_and_record` (in `manifest_ops`) reads dirty pages, calls `flush_observed`, records the new run in the manifest, and clears the dirty bits.
+
+**What doesn't exist yet** (Phase 5): `LsmRecovery` (restore World from L2/L3 baseline + L1 delta + WAL tail), `Durable<S>` integration (flush dirty pages instead of full snapshots), migration path from v2 snapshots. These are the remaining Stage 3 work.
+
 ## Key Conventions
 
-- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `HasBTreeIndex`, `HasHashIndex`, `Transact`, `Tx`, `TxScope`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `TransactError`, `WorldMismatch`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`, `WorldStats`, `Expiry`, `WorldBuilder`, `PoolExhausted`, `HugePages`, `DeadEntity`, `InsertError`, `QueryPlanner`, `TablePlanner`, `Indexed`, `PlanNode`, `Predicate`, `Cost`, `IndexKind`, `JoinKind`, `AsEntityRef`, `QueryPlanResult`, `PlannerError`, `SubscriptionBuilder`, `SubscriptionError`, `CardinalityConstraint`, `PlanWarning`, `AggregateExpr`, `AggregateOp`, `AggregateResult`, `PlanExecError`, `MaterializedView`, `DebouncePolicy`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
+- `pub` for user-facing API (`World`, `Entity`, `CommandBuffer`, `Bundle`, `WorldQuery`, `Table`, `EnumChangeSet`, `Changed`, `ChangeTick`, `ComponentId`, `SpatialIndex`, `Access`, `BTreeIndex`, `HashIndex`, `HasBTreeIndex`, `HasHashIndex`, `Transact`, `Tx`, `TxScope`, `Sequential`, `SequentialTx`, `Optimistic`, `Pessimistic`, `Conflict`, `TransactError`, `WorldMismatch`, `ReducerRegistry`, `ReducerId`, `QueryReducerId`, `DynamicReducerId`, `DynamicReducerBuilder`, `DynamicCtx`, `ComponentSet`, `Contains`, `EntityRef`, `EntityMut`, `QueryRef`, `QueryMut`, `QueryWriter`, `WritableRef`, `WriterQuery`, `Spawner`, `WorldStats`, `Expiry`, `WorldBuilder`, `PoolExhausted`, `HugePages`, `DeadEntity`, `InsertError`, `QueryPlanner`, `TablePlanner`, `Indexed`, `PlanNode`, `Predicate`, `Cost`, `IndexKind`, `JoinKind`, `AsEntityRef`, `QueryPlanResult`, `PlannerError`, `SubscriptionBuilder`, `SubscriptionError`, `CardinalityConstraint`, `PlanWarning`, `AggregateExpr`, `AggregateOp`, `AggregateResult`, `PlanExecError`, `MaterializedView`, `DebouncePolicy`, `BlockedBloomFilter`, `pack_page_key`, `compact_one`, `compact_one_observed`, `CompactionReport`, `COMPACTION_TRIGGER`, `LsmManifest`, `SortedRunMeta`, `ManifestLog`, `LsmError`, `SeqRange`, `Level`, `MaxLevels`). `pub(crate)` for internals (`BlobVec`, `Archetype`, `EntityAllocator`, `QueryCacheEntry`, `Tick`, `ColumnLockTable`, `OrphanQueue`, `TxCleanup`, `ResolvedComponents`, `DynamicResolved`, `BloomView`, `write_bloom_section`, `CompactionWriter`, `FlushWriter`, `SchemaSection`, `IndexEntry`, `ENTITY_SLOT`). `ComponentRegistry` is `#[doc(hidden)] pub` — exposed only for derive macro codegen, not user code.
 - `extern crate self as minkowski;` at crate root — allows `#[derive(Table)]` generated code (which references `::minkowski::*`) to resolve when used inside this crate's own tests.
 - `#![allow(private_interfaces)]` at crate root — pub traits reference pub(crate) types in signatures. Intentional; fix when building public API facade.
 - Every module has `#[cfg(test)] mod tests` with inline tests.
@@ -392,6 +428,18 @@ The corollary is that forging an ID — constructing one from a raw integer with
 | `fixedbitset` | 0.5 | — | Archetype bitmask serialization in snapshots. |
 | `thiserror` | 2 | — | Derive macros for `std::error::Error` impls. v2 uses `core::error::Error` (edition 2024). |
 | `crc32fast` | 1 | — | CRC32 checksums for WAL frame integrity. |
+
+### LSM Storage (`minkowski-lsm`)
+
+| Crate | Version | Features | Why |
+|---|---|---|---|
+| `minkowski` | path | — | Core ECS types (World, Entity, ComponentId, BlobVec, DirtyPageTracker, SchemaSection). |
+| `fixedbitset` | 0.5 | — | Archetype coverage bitsets in SortedRunMeta and SchemaSection. |
+| `memmap2` | 0.9 | — | Memory-mapped sorted-run file reading (zero-copy page access). |
+| `crc32fast` | 1 | — | CRC32 checksums for page integrity and manifest log frames. |
+| `parking_lot` | 0.12 | — | Mutex for manifest log writes. |
+| `thiserror` | 2 | — | Derive macros for `std::error::Error` impls (`LsmError`). |
+| `tempfile` | 3 | dev | Temporary directories for integration tests. |
 
 ### Dev / Bench / Examples
 

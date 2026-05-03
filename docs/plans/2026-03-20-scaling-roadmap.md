@@ -1,7 +1,7 @@
 # Minkowski Scaling Roadmap: Seven Stages
 
 *Inspired by TigerBeetle's "Seven Stages of Database Scaling."*
-*Status: Minkowski is at Stage 2. This document is the roadmap to Stage 7.*
+*Status: Minkowski is at Stage 3 (in progress). Phases 1-4 complete, Phase 5 pending. This document is the roadmap to Stage 7.*
 
 ---
 
@@ -10,7 +10,7 @@
 1. [Stage 1: The Log](#stage-1-the-log) ✅
 2. [Stage 2: Snapshots](#stage-2-snapshots) ✅ (current)
 3. [Stage 2.5: SlabPool as the Only Allocator](#stage-25-slabpool-as-the-only-allocator)
-4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage)
+4. [Stage 3: LSM Tree Storage](#stage-3-lsm-tree-storage) 🔄 (Phases 1-4 done, Phase 5 pending)
 5. [Stage 4: Replicated State Machine](#stage-4-replicated-state-machine)
 6. [Stage 5: Horizontal Scaling (Sharding)](#stage-5-horizontal-scaling-sharding)
 7. [Stage 6: Separate Storage and Compute](#stage-6-separate-storage-and-compute)
@@ -154,7 +154,9 @@ memory. The `SlabPool` path is opt-in, not default.
 
 ## Stage 3: LSM Tree Storage
 
-**Status: Not started. Prerequisites: Stage 2.5 (SlabPool-only allocation).**
+**Status: In progress. Phases 1-4 complete (sorted-run format, manifest, compaction, bloom filter). Phase 5 (LsmRecovery + Durable integration) pending.**
+
+**Note**: Stage 2.5 (SlabPool-only allocation) was deferred — the LSM crate operates on a separate I/O path that reads page data from World's existing allocator. Dirty page tracking uses `storage::dirty_pages` per-column bitsets without requiring mmap-backed columns.
 
 **Goal**: Incremental persistence. Only write what changed, not the entire world.
 
@@ -208,6 +210,32 @@ column-oriented access patterns and SIMD alignment.
  │  - Input for snapshot restore                   │
  └─────────────────────────────────────────────────┘
 ```
+
+### What exists
+
+The `minkowski-lsm` crate implements Phases 1-4 of the Stage 3 implementation plan:
+
+| Component | Phase | Status |
+|---|---|---|
+| `SortedRunReader` | 1 | ✅ Memory-mapped reader with page lookup, CRC validation, entity page iteration |
+| `FlushWriter` | 1 | ✅ Writes dirty pages from L0 → L1 as a new sorted run |
+| `SchemaSection` | 1 | ✅ Component type metadata in sorted run files for schema validation |
+| `LsmManifest` | 2 | ✅ Tracks sorted runs per level with sequence ranges and archetype coverage |
+| `ManifestLog` | 2 | ✅ Append-only log of manifest changes with CRC32 frames and crash recovery |
+| `manifest_ops` | 2 | ✅ `flush_and_record`, `cleanup_orphans` integration helpers |
+| `CompactionWriter` | 3 | ✅ Merge kernel with emit-list construction and entity-level dedup |
+| `compact_one` / `compact_one_observed` | 3 | ✅ Public compaction API with atomic manifest updates |
+| `CompactionCommit` | 3 | ✅ Atomic manifest log entry (all-or-nothing run replacement) |
+| `BlockedBloomFilter` | 4 | ✅ Cache-line-blocked bloom filter with ~1% FPR |
+| `BloomView` | 4 | ✅ Zero-copy bloom filter reads from mmap'd sorted runs |
+| `write_bloom_section` | 4 | ✅ Shared bloom filter serialization with alignment padding |
+
+### What's missing (Phase 5)
+
+- **LsmRecovery**: restore World from L2/L3 baseline + L1 delta + WAL tail. This is the read-path integration that makes sorted runs useful for crash recovery.
+- **Durable<S> integration**: flush dirty pages instead of (or in addition to) full snapshots. `AutoCheckpoint` should default to LSM flush.
+- **Migration path**: support loading old v2 snapshots for upgrade from Stage 2 → Stage 3.
+- **Background compaction**: currently compaction is on-demand via `compact_one`. A background thread or cooperative polling mode is needed for production use.
 
 ### Key design decisions
 
