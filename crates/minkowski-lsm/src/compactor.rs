@@ -48,9 +48,11 @@ pub(crate) struct CompactionJob {
     pub from_level: Level,
     /// The destination level — output lands here.
     pub to_level: Level,
-    /// The archetype's component stable-names (sorted) — used to identify the
-    /// archetype across input runs whose run-local arch_ids may differ.
-    pub target_components: Vec<String>,
+    /// All unique archetype signatures (sorted component-name lists) across
+    /// every input run. The compaction output preserves **all** archetypes,
+    /// not just the one that triggered the job — this prevents data loss when
+    /// a multi-archetype run is removed from the manifest.
+    pub all_component_signatures: Vec<Vec<String>>,
     /// The full set of input run paths at `from_level` that compact together.
     /// Passed to `CompactionCommit` as the atomic inputs list.
     pub input_paths: Vec<PathBuf>,
@@ -83,15 +85,10 @@ pub struct CompactionReport {
 pub(crate) fn find_compaction_candidate<const N: usize>(
     manifest: &LsmManifest<N>,
 ) -> Result<Option<CompactionJob>, LsmError> {
-    // We need to iterate levels 0..N-1 (excluding bottom level N-1).
-    // For each level, group runs by their sorted component-name signature.
-    // Use an ordered map to preserve stable iteration within a level.
-
     let bottom_level = N.saturating_sub(1);
 
     for level_idx in 0..N {
         if level_idx == bottom_level {
-            // Cannot compact bottom level upward — skip.
             continue;
         }
         let level = Level::new(level_idx as u8).ok_or_else(|| {
@@ -100,26 +97,21 @@ pub(crate) fn find_compaction_candidate<const N: usize>(
 
         let runs = manifest.runs_at_level(level);
         if runs.len() < COMPACTION_TRIGGER {
-            // Fast path: not enough runs at this level to trigger even if all
-            // belong to the same archetype.
             continue;
         }
 
-        // Group runs by their sorted component-name signature.
-        // We open each reader to discover the archetype. Use an insertion-order
-        // preserving structure: Vec<(signature, Vec<meta>)>.
-        let mut groups: Vec<(Vec<String>, Vec<&SortedRunMeta>)> = Vec::new();
+        // Collect all archetype signatures per run up front so we can build
+        // the full signature union when a group triggers.
+        struct RunArchInfo<'a> {
+            meta: &'a SortedRunMeta,
+            all_signatures: Vec<Vec<String>>,
+        }
+        let mut run_infos: Vec<RunArchInfo> = Vec::with_capacity(runs.len());
 
         for meta in runs {
             let reader = SortedRunReader::open(meta.path())?;
-            // A run may contain multiple archetypes. We pick the first archetype
-            // that matches a group already present, or start a new group.
-            // For the compactor's purposes, each "job" targets ONE archetype
-            // across multiple runs. A run with multiple archetypes contributes
-            // to multiple potential jobs — we do one at a time.
-
-            // Collect all archetypes in this run as sorted-name signatures.
             let arch_ids = reader.archetype_ids();
+            let mut all_sigs: Vec<Vec<String>> = Vec::new();
             for arch_id in arch_ids {
                 let slots = reader.component_slots_for_arch(arch_id);
                 let mut comp_names: Vec<String> = slots
@@ -132,27 +124,35 @@ pub(crate) fn find_compaction_candidate<const N: usize>(
                     })
                     .collect();
                 comp_names.sort_unstable();
-
-                if comp_names.is_empty() {
-                    continue;
+                if !comp_names.is_empty() {
+                    all_sigs.push(comp_names);
                 }
+            }
+            run_infos.push(RunArchInfo {
+                meta,
+                all_signatures: all_sigs,
+            });
+        }
 
-                // Find or create the group for this signature.
-                if let Some(group) = groups.iter_mut().find(|(sig, _)| *sig == comp_names) {
-                    group.1.push(meta);
+        // Group runs by single archetype signature (one run may appear in
+        // multiple groups if it contains multiple archetypes).
+        let mut groups: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
+        for (run_idx, info) in run_infos.iter().enumerate() {
+            for sig in &info.all_signatures {
+                if let Some(group) = groups.iter_mut().find(|(s, _)| *s == *sig) {
+                    group.1.push(run_idx);
                 } else {
-                    groups.push((comp_names, vec![meta]));
+                    groups.push((sig.clone(), vec![run_idx]));
                 }
             }
         }
 
         // Find the first group with >= COMPACTION_TRIGGER runs.
-        for (comp_names, group_runs) in groups {
-            if group_runs.len() < COMPACTION_TRIGGER {
+        for (_, group_run_indices) in groups {
+            if group_run_indices.len() < COMPACTION_TRIGGER {
                 continue;
             }
 
-            // Found a candidate. Build the job.
             let to_level_idx = level_idx + 1;
             let to_level = Level::new(to_level_idx as u8).ok_or_else(|| {
                 LsmError::Format(format!(
@@ -161,13 +161,33 @@ pub(crate) fn find_compaction_candidate<const N: usize>(
                 ))
             })?;
 
-            let input_paths: Vec<PathBuf> =
-                group_runs.iter().map(|m| m.path().to_path_buf()).collect();
+            // Deduplicated input paths (a multi-archetype run may appear in
+            // the group only once, but guard against it).
+            let mut input_paths: Vec<PathBuf> = Vec::new();
+            for &idx in &group_run_indices {
+                let path = run_infos[idx].meta.path().to_path_buf();
+                if !input_paths.iter().any(|p| p == &path) {
+                    input_paths.push(path);
+                }
+            }
+
+            // Collect the union of ALL archetype signatures across the
+            // group's runs — the compaction output must preserve every
+            // archetype so that removing the input runs doesn't orphan data.
+            let mut all_sigs: Vec<Vec<String>> = Vec::new();
+            for &idx in &group_run_indices {
+                for sig in &run_infos[idx].all_signatures {
+                    if !all_sigs.iter().any(|s| s == sig) {
+                        all_sigs.push(sig.clone());
+                    }
+                }
+            }
+            all_sigs.sort();
 
             return Ok(Some(CompactionJob {
                 from_level: level,
                 to_level,
-                target_components: comp_names,
+                all_component_signatures: all_sigs,
                 input_paths,
             }));
         }
@@ -223,11 +243,17 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
         .map(|p| SortedRunReader::open(p))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // ── 2. Resolve per-input arch_ids ─────────────────────────────────────────
-    let comp_name_strs: Vec<&str> = job.target_components.iter().map(String::as_str).collect();
-    let arch_ids_per_input: Vec<Option<u16>> = readers
+    // ── 2. Resolve per-input arch_ids for every archetype signature ────────────
+    let arch_ids_per_signature_per_input: Vec<Vec<Option<u16>>> = job
+        .all_component_signatures
         .iter()
-        .map(|r| find_archetype_by_components(r, &comp_name_strs))
+        .map(|sig| {
+            let sig_strs: Vec<&str> = sig.iter().map(String::as_str).collect();
+            readers
+                .iter()
+                .map(|r| find_archetype_by_components(r, &sig_strs))
+                .collect()
+        })
         .collect();
 
     // Collect refs for CompactionWriter (borrows readers).
@@ -249,10 +275,6 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
     let output_seq_range = SeqRange::new(seq_lo, seq_hi)?;
 
     // ── 4. Generate output path ───────────────────────────────────────────────
-    // Mirror the naming convention from writer.rs: `{lo}-{hi}.run`.
-    // Add a `.compact` infix to distinguish from flush-output files, which
-    // also use `{lo}-{hi}.run`. Without this, two runs at different levels
-    // with the same sequence span would collide on disk.
     let output_path = make_output_path(run_dir, seq_lo, seq_hi);
 
     // ── 5. Run CompactionWriter ────────────────────────────────────────────────
@@ -262,15 +284,21 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
         reader_refs.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| std::cmp::Reverse(r.sequence_range().hi()));
     let sorted_reader_refs: Vec<&SortedRunReader> = indexed.iter().map(|(_, r)| *r).collect();
-    let sorted_arch_ids: Vec<Option<u16>> = indexed
-        .iter()
-        .map(|(i, _)| arch_ids_per_input[*i])
-        .collect();
+    // Reorder arch_ids to match the sorted reader order.
+    let sorted_arch_ids_per_signature: Vec<Vec<Option<u16>>> =
+        (0..job.all_component_signatures.len())
+            .map(|sig_idx| {
+                indexed
+                    .iter()
+                    .map(|(i, _)| arch_ids_per_signature_per_input[sig_idx][*i])
+                    .collect()
+            })
+            .collect();
 
     let writer = CompactionWriter::new(
         sorted_reader_refs,
-        sorted_arch_ids,
-        job.target_components.clone(),
+        sorted_arch_ids_per_signature,
+        job.all_component_signatures.clone(),
         output_path.clone(),
         output_seq_range,
     )?;
@@ -278,9 +306,6 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
     let output_meta: SortedRunMeta = writer.write_observed(observer)?;
 
     // ── 6. Pre-validate in-memory state before the atomic commit point ────────
-    // Verify the output level is in-range for this manifest *before* the log
-    // append. If we appended and then discovered the level was OOR, the log
-    // would be ahead of what apply_entry can accept — a log-vs-manifest split.
     if job.to_level.as_index() >= N {
         return Err(LsmError::Format(format!(
             "execute_compaction: to_level {} out of range for {N}-level manifest",
@@ -288,9 +313,6 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
         )));
     }
 
-    // Build the CompactionCommit entry. All inputs must exist in the manifest.
-    // apply_entry pre-validates this too, but we check early so the output
-    // file can be cleaned up if the manifest state is wrong.
     for input_path in &job.input_paths {
         let exists = manifest
             .runs_at_level(job.from_level)
@@ -318,13 +340,9 @@ pub(crate) fn execute_compaction_observed<const N: usize>(
     };
 
     // ── 7. Log append — atomic commit point ──────────────────────────────────
-    // From this point on, all mutations MUST succeed. All fallible checks are
-    // done above. The log append is the commit point (mirrors flush_and_record).
     log.append(&entry)?;
 
     // ── 8. Mirror on in-memory manifest ───────────────────────────────────────
-    // add_run first so the output exists, then remove inputs.
-    // This mirrors apply_entry's order in manifest_log.rs.
     manifest
         .add_run(job.to_level, output_meta.clone())
         .expect("to_level pre-validated < N");
@@ -496,8 +514,8 @@ mod tests {
         assert_eq!(job.to_level, Level::L1);
         assert_eq!(job.input_paths.len(), 4);
         assert!(
-            !job.target_components.is_empty(),
-            "must carry component names"
+            !job.all_component_signatures.is_empty(),
+            "must carry component signatures"
         );
     }
 
@@ -933,5 +951,128 @@ mod tests {
                 "entity {bits:#x} was not observed by compact_one_observed"
             );
         }
+    }
+
+    // ── Test 11: multi-archetype compaction preserves all data ───────────────
+    //
+    // This is the regression test for the "multi-archetype data loss on
+    // compaction" bug. When a sorted run file contains multiple archetypes
+    // (e.g., `(Pos,)` and `(Pos, Vel)`) and a compaction job triggers on one
+    // archetype group, the old code only compacted that one archetype and
+    // then removed the entire input run from the manifest — orphaning the
+    // non-target archetype data. The fix preserves ALL archetypes in the
+    // compaction output.
+
+    #[test]
+    fn compaction_preserves_multi_archetype_data() {
+        use crate::format::ENTITY_SLOT;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("manifest.log");
+        let (mut manifest, mut log) = ManifestLog::recover::<4>(&log_path).unwrap();
+
+        // 4 flushes, each producing a run with (Pos,) AND (Pos, Vel) archetypes.
+        let n_runs = 4usize;
+        let pos_per_run = 2usize;
+        let posvel_per_run = 2usize;
+
+        for run_i in 0..n_runs {
+            let mut world = World::new();
+            // Advance entity allocator for distinct IDs across runs.
+            let skip = run_i * (pos_per_run + posvel_per_run);
+            let phs: Vec<_> = (0..skip)
+                .map(|_| world.spawn((Pos { x: 0.0, y: 0.0 },)))
+                .collect();
+            for ph in phs {
+                world.despawn(ph);
+            }
+            // Spawn Pos-only entities
+            for j in 0..pos_per_run {
+                world.spawn((Pos {
+                    x: (run_i * 10 + j) as f32,
+                    y: 0.0,
+                },));
+            }
+            // Spawn Pos+Vel entities
+            for j in 0..posvel_per_run {
+                world.spawn((
+                    Pos {
+                        x: (run_i * 20 + j) as f32,
+                        y: 0.0,
+                    },
+                    Vel {
+                        dx: (run_i * 20 + j) as f32,
+                        dy: 0.0,
+                    },
+                ));
+            }
+            let lo = (run_i as u64) * 10;
+            let hi = lo + 9;
+            let seq_range = SeqRange::new(SeqNo::from(lo), SeqNo::from(hi)).unwrap();
+            flush_and_record(&world, seq_range, &mut manifest, &mut log, dir.path())
+                .unwrap()
+                .expect("world is dirty");
+        }
+
+        // All 4 runs at L0
+        assert_eq!(manifest.runs_at_level(Level::L0).len(), n_runs);
+
+        // Run compaction
+        let report = compact_one(&mut manifest, &mut log, dir.path())
+            .unwrap()
+            .expect("K=4 runs must produce Some(report)");
+
+        // L0 must be empty; L1 has one run.
+        assert!(
+            manifest.runs_at_level(Level::L0).is_empty(),
+            "all L0 inputs must be removed"
+        );
+        assert_eq!(
+            manifest.runs_at_level(Level::L1).len(),
+            1,
+            "one L1 output must be added"
+        );
+
+        // Verify all entities from BOTH archetypes are in the output
+        let output_path = &report.output_path;
+        assert!(
+            output_path.exists(),
+            "output run file must exist on disk: {output_path:?}"
+        );
+        let out_reader = SortedRunReader::open(output_path).unwrap();
+
+        // The output must have 2 archetypes
+        let arch_ids = out_reader.archetype_ids();
+        assert_eq!(
+            arch_ids.len(),
+            2,
+            "output must have 2 archetypes, got {}",
+            arch_ids.len()
+        );
+
+        // Collect all entity IDs from both archetypes
+        let mut found: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &arch_id in &arch_ids {
+            let mut page_idx: u16 = 0;
+            while let Ok(Some(page)) = out_reader.get_page(arch_id, ENTITY_SLOT, page_idx) {
+                let row_count = page.header().row_count as usize;
+                let data = page.data();
+                for r in 0..row_count {
+                    let off = r * 8;
+                    let id = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+                    found.insert(id);
+                }
+                page_idx += 1;
+            }
+        }
+
+        let expected_total = n_runs * (pos_per_run + posvel_per_run);
+        assert_eq!(
+            found.len(),
+            expected_total,
+            "output must contain all entities from both archetypes: got {}, expected {}",
+            found.len(),
+            expected_total
+        );
     }
 }

@@ -135,8 +135,15 @@ pub(crate) fn build_emit_list(
 /// ## Format contract
 ///
 /// The output file is byte-compatible with `SortedRunReader::open`. It uses
-/// `arch_id = 0` for the single output archetype regardless of the source
-/// `arch_id` values in the input runs.
+/// sequential `arch_id`s (0, 1, 2, …) for the output archetypes, one per
+/// entry in `all_signatures`, regardless of the source `arch_id` values in
+/// the input runs.
+///
+/// ## Multi-archetype support
+///
+/// When input runs contain multiple archetypes, the writer preserves **all**
+/// of them in the output. This prevents data loss when the input runs are
+/// removed from the manifest after compaction.
 ///
 /// ## Per-input slot translation
 ///
@@ -144,14 +151,13 @@ pub(crate) fn build_emit_list(
 /// component (each run is independent). `CompactionWriter` computes a
 /// per-input `(input_slot) -> output_slot` table up front from the schema
 /// section of each input, keyed on the component's stable name.
-// `CompactionWriter` is constructed by the compactor (Task 3d / 4). The
-// dead_code lint fires now because no caller outside cfg(test) exists yet.
 #[allow(dead_code)]
 pub(crate) struct CompactionWriter<'a> {
     inputs: Vec<&'a SortedRunReader>,
-    arch_ids_per_input: Vec<Option<u16>>,
-    /// Sorted stable component names for the target archetype.
-    target_components: Vec<String>,
+    /// For each signature, for each input, the arch_id in that input (or None).
+    arch_ids_per_signature_per_input: Vec<Vec<Option<u16>>>,
+    /// All archetype signatures (sorted component names) in the output.
+    all_signatures: Vec<Vec<String>>,
     output_path: PathBuf,
     /// WAL sequence range for the output run: `(min(input.lo), max(input.hi))`.
     output_seq_range: SeqRange,
@@ -164,31 +170,40 @@ impl<'a> CompactionWriter<'a> {
     /// Create a new `CompactionWriter`.
     ///
     /// Returns `Err(LsmError::Format)` if:
-    /// - `inputs.len() != arch_ids_per_input.len()`
-    /// - `target_components` is empty
+    /// - `inputs.len() != arch_ids_per_signature_per_input[i].len()` for any signature
+    /// - `all_signatures` is empty
     pub(crate) fn new(
         inputs: Vec<&'a SortedRunReader>,
-        arch_ids_per_input: Vec<Option<u16>>,
-        target_components: Vec<String>,
+        arch_ids_per_signature_per_input: Vec<Vec<Option<u16>>>,
+        all_signatures: Vec<Vec<String>>,
         output_path: PathBuf,
         output_seq_range: SeqRange,
     ) -> Result<Self, LsmError> {
-        if inputs.len() != arch_ids_per_input.len() {
-            return Err(LsmError::Format(format!(
-                "CompactionWriter: inputs length {} != arch_ids_per_input length {}",
-                inputs.len(),
-                arch_ids_per_input.len(),
-            )));
-        }
-        if target_components.is_empty() {
+        if all_signatures.is_empty() {
             return Err(LsmError::Format(
-                "CompactionWriter: target_components is empty".to_owned(),
+                "CompactionWriter: all_signatures is empty".to_owned(),
             ));
+        }
+        for (sig_idx, per_input) in arch_ids_per_signature_per_input.iter().enumerate() {
+            if per_input.len() != inputs.len() {
+                return Err(LsmError::Format(format!(
+                    "CompactionWriter: signature {sig_idx} has {} arch_ids but {} inputs",
+                    per_input.len(),
+                    inputs.len(),
+                )));
+            }
+        }
+        if arch_ids_per_signature_per_input.len() != all_signatures.len() {
+            return Err(LsmError::Format(format!(
+                "CompactionWriter: {} signature arch-id vectors but {} signatures",
+                arch_ids_per_signature_per_input.len(),
+                all_signatures.len(),
+            )));
         }
         Ok(Self {
             inputs,
-            arch_ids_per_input,
-            target_components,
+            arch_ids_per_signature_per_input,
+            all_signatures,
             output_path,
             output_seq_range,
         })
@@ -197,14 +212,15 @@ impl<'a> CompactionWriter<'a> {
     /// Run the full compaction pipeline and write the output sorted-run file.
     ///
     /// Steps:
-    /// 1. Build the emit list (dedup by entity ID, newest-first wins).
-    /// 2. Sort the emit list by `entity_id` for deterministic output.
-    /// 3. Compute the output schema (same stable names, sequential slots).
-    /// 4. Write header + schema + component pages + entity pages + index + footer.
-    /// 5. Patch CRCs, fsync, rename atomically, fsync directory.
-    /// 6. Return `SortedRunMeta` for the caller to record.
+    /// 1. Build the emit list for each archetype (dedup by entity ID, newest-first wins).
+    /// 2. Sort each emit list by `entity_id` for deterministic output.
+    /// 3. Compute the output schema (union of all components across all signatures).
+    /// 4. Build per-archetype slot translation tables.
+    /// 5. Write header + schema + component pages + entity pages + index + footer.
+    /// 6. Patch CRCs, fsync, rename atomically, fsync directory.
+    /// 7. Return `SortedRunMeta` for the caller to record.
     ///
-    /// Returns `Err(LsmError::Format("cannot compact: emit list empty"))` if no
+    /// Returns `Err(LsmError::Format("cannot compact: all emit lists empty"))` if no
     /// rows survive dedup — the caller should not compact an empty set.
     pub(crate) fn write(self) -> Result<SortedRunMeta, LsmError> {
         self.write_observed(None)
@@ -220,35 +236,61 @@ impl<'a> CompactionWriter<'a> {
         self,
         mut observer: Option<&mut dyn FnMut(crate::writer::EntityKey)>,
     ) -> Result<SortedRunMeta, LsmError> {
-        // ── 1. Build and sort the emit list ──────────────────────────────────
-        let mut emit_list = build_emit_list(self.inputs.as_slice(), &self.arch_ids_per_input)?;
+        // ── 1. Build and sort emit lists for each archetype ──────────────────
+        let emit_lists: Vec<Vec<EmitRow>> = self
+            .all_signatures
+            .iter()
+            .enumerate()
+            .map(|(sig_idx, _)| {
+                build_emit_list(
+                    self.inputs.as_slice(),
+                    &self.arch_ids_per_signature_per_input[sig_idx],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        if emit_list.is_empty() {
+        if emit_lists.iter().all(Vec::is_empty) {
             return Err(LsmError::Format(
-                "cannot compact: emit list empty".to_owned(),
+                "cannot compact: all emit lists empty".to_owned(),
             ));
         }
 
-        emit_list.sort_by_key(|r| r.entity_id);
+        let mut emit_lists = emit_lists;
+        for list in &mut emit_lists {
+            list.sort_by_key(|r| r.entity_id);
+        }
 
-        let row_count = emit_list.len();
+        // ── 2. Build output schema (union of all components) ─────────────────
+        let all_components = self.collect_all_components();
+        let output_schema = self.build_output_schema(&all_components)?;
 
-        // ── 2. Build output schema ────────────────────────────────────────────
-        // We need an item_size and item_align for each target component. Retrieve
-        // these from the first input that has the archetype and the component.
-        let output_schema = self.build_output_schema()?;
+        // ── 3. Build per-archetype slot translation tables ───────────────────
+        let slot_translations_per_sig: Vec<Vec<Vec<SlotTranslation>>> = self
+            .all_signatures
+            .iter()
+            .map(|sig| self.build_slot_translations_for_sig(sig, &output_schema))
+            .collect();
 
-        // ── 3. Build per-input slot translation tables ────────────────────────
-        // For each input, map output_slot -> input_slot (for reading source bytes).
-        // `slot_translations[input_idx][output_slot]` = input_slot (or None if the
-        // input doesn't carry that component for this archetype).
-        let slot_translations = self.build_slot_translations(&output_schema);
+        // ── 4. Compute page counts ────────────────────────────────────────────
+        let mut total_pages: usize = 0;
+        let mut row_counts: Vec<usize> = Vec::with_capacity(emit_lists.len());
+        let mut pages_per_column_per_sig: Vec<usize> = Vec::with_capacity(emit_lists.len());
+        for (sig_idx, emit_list) in emit_lists.iter().enumerate() {
+            let row_count = emit_list.len();
+            row_counts.push(row_count);
+            if row_count == 0 {
+                pages_per_column_per_sig.push(0);
+                continue;
+            }
+            let column_count = self.all_signatures[sig_idx].len();
+            let pages_per_column = row_count.div_ceil(PAGE_SIZE);
+            pages_per_column_per_sig.push(pages_per_column);
+            total_pages += column_count * pages_per_column + pages_per_column;
+        }
 
-        // ── 4. Compute page count: component pages + entity pages ─────────────
-        let pages_per_column = row_count.div_ceil(PAGE_SIZE);
-        let column_count = output_schema.len(); // entity-slot is separate
-        let total_pages = column_count * pages_per_column + pages_per_column;
-        // ^^ component columns × pages + entity column pages
+        if total_pages == 0 {
+            return Err(LsmError::Format("cannot compact: zero pages".to_owned()));
+        }
 
         // ── 5. Open temp file ─────────────────────────────────────────────────
         let seq_lo = self.output_seq_range.lo().get();
@@ -262,7 +304,6 @@ impl<'a> CompactionWriter<'a> {
             .truncate(true)
             .open(&tmp_path)?;
 
-        // Drop guard — cleans up tmp on error.
         struct TmpGuard<'p> {
             path: &'p Path,
             disarmed: bool,
@@ -298,15 +339,123 @@ impl<'a> CompactionWriter<'a> {
         let schema_offset = std::mem::size_of::<Header>() as u64;
         output_schema.write_to(&mut w)?;
 
-        // ── 8. Write component pages (arch_id=0, slot, page_index) ───────────
+        // ── 8. Write component + entity pages per archetype ──────────────────
         let mut index_entries: Vec<IndexEntry> = Vec::with_capacity(total_pages);
 
-        // One output archetype: arch_id = 0.
-        const OUTPUT_ARCH_ID: u16 = 0;
+        for (sig_idx, emit_list) in emit_lists.iter().enumerate() {
+            let row_count = emit_list.len();
+            if row_count == 0 {
+                continue;
+            }
+            let output_arch_id = u16::try_from(sig_idx).map_err(|_| {
+                LsmError::Format(format!(
+                    "signature index {sig_idx} exceeds u16 — too many archetypes"
+                ))
+            })?;
+            let pages_per_column = pages_per_column_per_sig[sig_idx];
+            let sig = &self.all_signatures[sig_idx];
+            let slot_translations = &slot_translations_per_sig[sig_idx];
 
-        for entry in output_schema.entries() {
-            let output_slot = entry.slot();
-            let item_size = entry.item_size() as usize;
+            // Resolve output slots for this signature's components.
+            let sig_output_slots: Vec<u16> = sig
+                .iter()
+                .filter_map(|name| output_schema.slot_for(name))
+                .collect();
+
+            // ── Component pages ──────────────────────────────────────────────
+            for &output_slot in &sig_output_slots {
+                let entry = output_schema.entry_for_slot(output_slot).ok_or_else(|| {
+                    LsmError::Format(format!(
+                        "output slot {output_slot} not in schema (arch {output_arch_id})"
+                    ))
+                })?;
+                let item_size = entry.item_size() as usize;
+
+                for page_idx_usize in 0..pages_per_column {
+                    let page_idx = u16::try_from(page_idx_usize).map_err(|_| {
+                        LsmError::Format(format!(
+                            "page_index {page_idx_usize} exceeds u16 — too many rows"
+                        ))
+                    })?;
+
+                    let row_start = page_idx_usize * PAGE_SIZE;
+                    let row_end = (row_start + PAGE_SIZE).min(row_count);
+                    let rows_in_page = row_end - row_start;
+                    let row_count_u16 = u16::try_from(rows_in_page).map_err(|_| {
+                        LsmError::Format("row count per page exceeds u16".to_owned())
+                    })?;
+
+                    let mut page_bytes: Vec<u8> = Vec::with_capacity(PAGE_SIZE * item_size);
+
+                    for emit in &emit_list[row_start..row_end] {
+                        let input_idx = emit.source_input_idx;
+                        let source_row = emit.source_row;
+
+                        let input_slot_opt = slot_translations[input_idx]
+                            .iter()
+                            .find(|t| t.output_slot == output_slot)
+                            .map(|t| t.input_slot);
+
+                        let Some(input_slot) = input_slot_opt else {
+                            page_bytes.extend(std::iter::repeat_n(0u8, item_size));
+                            continue;
+                        };
+
+                        let source_page_idx =
+                            u16::try_from(source_row / PAGE_SIZE).map_err(|_| {
+                                LsmError::Format("source page index exceeds u16".to_owned())
+                            })?;
+                        let row_within_page = source_row % PAGE_SIZE;
+
+                        let arch_id_in_input = self.arch_ids_per_signature_per_input[sig_idx]
+                            [input_idx]
+                            .expect("emit row references input with no arch_id");
+
+                        let page_ref = self.inputs[input_idx]
+                            .get_page(arch_id_in_input, input_slot, source_page_idx)?
+                            .ok_or_else(|| {
+                                LsmError::Format(format!(
+                                    "source page ({arch_id_in_input}, {input_slot}, \
+                                     {source_page_idx}) not found in input {input_idx}"
+                                ))
+                            })?;
+
+                        let data = page_ref.data();
+                        let byte_offset = row_within_page * item_size;
+                        page_bytes.extend_from_slice(&data[byte_offset..byte_offset + item_size]);
+                    }
+
+                    let page_crc = crc32fast::hash(&page_bytes);
+                    let file_offset = w.stream_position()?;
+
+                    let ph = PageHeader {
+                        arch_id: output_arch_id,
+                        slot: output_slot,
+                        page_index: page_idx,
+                        row_count: row_count_u16,
+                        page_crc32: page_crc,
+                        _padding: 0,
+                    };
+                    w.write_all(ph.as_bytes())?;
+                    w.write_all(&page_bytes)?;
+
+                    let full_page_bytes = PAGE_SIZE * item_size;
+                    if page_bytes.len() < full_page_bytes {
+                        write_zeros(&mut w, full_page_bytes - page_bytes.len())?;
+                    }
+
+                    index_entries.push(IndexEntry {
+                        arch_id: output_arch_id,
+                        slot: output_slot,
+                        page_index: page_idx,
+                        _pad: 0,
+                        file_offset,
+                    });
+                }
+            }
+
+            // ── Entity pages ──────────────────────────────────────────────────
+            let entity_item_size = std::mem::size_of::<u64>();
 
             for page_idx_usize in 0..pages_per_column {
                 let page_idx = u16::try_from(page_idx_usize).map_err(|_| {
@@ -321,71 +470,39 @@ impl<'a> CompactionWriter<'a> {
                 let row_count_u16 = u16::try_from(rows_in_page)
                     .map_err(|_| LsmError::Format("row count per page exceeds u16".to_owned()))?;
 
-                // Assemble page bytes by copying from source inputs.
-                let mut page_bytes: Vec<u8> = Vec::with_capacity(PAGE_SIZE * item_size);
-
+                let mut entity_bytes: Vec<u8> = Vec::with_capacity(rows_in_page * entity_item_size);
                 for emit in &emit_list[row_start..row_end] {
-                    let input_idx = emit.source_input_idx;
-                    let source_row = emit.source_row;
-
-                    // Find the input slot for this output_slot in this input.
-                    let input_slot_opt = slot_translations[input_idx]
-                        .iter()
-                        .find(|t| t.output_slot == output_slot)
-                        .map(|t| t.input_slot);
-
-                    let Some(input_slot) = input_slot_opt else {
-                        // Component absent in this input — emit zeros.
-                        page_bytes.extend(std::iter::repeat_n(0u8, item_size));
-                        continue;
-                    };
-
-                    let source_page_idx = u16::try_from(source_row / PAGE_SIZE).map_err(|_| {
-                        LsmError::Format("source page index exceeds u16".to_owned())
-                    })?;
-                    let row_within_page = source_row % PAGE_SIZE;
-
-                    let arch_id_in_input = self.arch_ids_per_input[input_idx]
-                        .expect("emit row references input with no arch_id");
-
-                    let page_ref = self.inputs[input_idx]
-                        .get_page(arch_id_in_input, input_slot, source_page_idx)?
-                        .ok_or_else(|| {
-                            LsmError::Format(format!(
-                                "source page ({arch_id_in_input}, {input_slot}, \
-                                 {source_page_idx}) not found in input {input_idx}"
-                            ))
-                        })?;
-
-                    let data = page_ref.data();
-                    let byte_offset = row_within_page * item_size;
-                    page_bytes.extend_from_slice(&data[byte_offset..byte_offset + item_size]);
+                    entity_bytes.extend_from_slice(&emit.entity_id.to_le_bytes());
                 }
 
-                // CRC covers the actual data bytes (not zero-padding).
-                let page_crc = crc32fast::hash(&page_bytes);
+                let page_crc = crc32fast::hash(&entity_bytes);
                 let file_offset = w.stream_position()?;
 
                 let ph = PageHeader {
-                    arch_id: OUTPUT_ARCH_ID,
-                    slot: output_slot,
+                    arch_id: output_arch_id,
+                    slot: ENTITY_SLOT,
                     page_index: page_idx,
                     row_count: row_count_u16,
                     page_crc32: page_crc,
                     _padding: 0,
                 };
                 w.write_all(ph.as_bytes())?;
-                w.write_all(&page_bytes)?;
+                w.write_all(&entity_bytes)?;
 
-                // Zero-pad to full page.
-                let full_page_bytes = PAGE_SIZE * item_size;
-                if page_bytes.len() < full_page_bytes {
-                    write_zeros(&mut w, full_page_bytes - page_bytes.len())?;
+                if let Some(ref mut obs) = observer {
+                    for emit in &emit_list[row_start..row_end] {
+                        obs(crate::writer::EntityKey(emit.entity_id));
+                    }
+                }
+
+                let full_page_bytes = PAGE_SIZE * entity_item_size;
+                if entity_bytes.len() < full_page_bytes {
+                    write_zeros(&mut w, full_page_bytes - entity_bytes.len())?;
                 }
 
                 index_entries.push(IndexEntry {
-                    arch_id: OUTPUT_ARCH_ID,
-                    slot: output_slot,
+                    arch_id: output_arch_id,
+                    slot: ENTITY_SLOT,
                     page_index: page_idx,
                     _pad: 0,
                     file_offset,
@@ -393,71 +510,14 @@ impl<'a> CompactionWriter<'a> {
             }
         }
 
-        // ── 9. Write entity pages (arch_id=0, ENTITY_SLOT, page_index) ────────
-        let entity_item_size = std::mem::size_of::<u64>();
-
-        for page_idx_usize in 0..pages_per_column {
-            let page_idx = u16::try_from(page_idx_usize).map_err(|_| {
-                LsmError::Format(format!(
-                    "page_index {page_idx_usize} exceeds u16 — too many rows"
-                ))
-            })?;
-
-            let row_start = page_idx_usize * PAGE_SIZE;
-            let row_end = (row_start + PAGE_SIZE).min(row_count);
-            let rows_in_page = row_end - row_start;
-            let row_count_u16 = u16::try_from(rows_in_page)
-                .map_err(|_| LsmError::Format("row count per page exceeds u16".to_owned()))?;
-
-            let mut entity_bytes: Vec<u8> = Vec::with_capacity(rows_in_page * entity_item_size);
-            for emit in &emit_list[row_start..row_end] {
-                entity_bytes.extend_from_slice(&emit.entity_id.to_le_bytes());
-            }
-
-            let page_crc = crc32fast::hash(&entity_bytes);
-            let file_offset = w.stream_position()?;
-
-            let ph = PageHeader {
-                arch_id: OUTPUT_ARCH_ID,
-                slot: ENTITY_SLOT,
-                page_index: page_idx,
-                row_count: row_count_u16,
-                page_crc32: page_crc,
-                _padding: 0,
-            };
-            w.write_all(ph.as_bytes())?;
-            w.write_all(&entity_bytes)?;
-
-            // Notify the observer once per successfully-written entity.
-            if let Some(ref mut obs) = observer {
-                for emit in &emit_list[row_start..row_end] {
-                    obs(crate::writer::EntityKey(emit.entity_id));
-                }
-            }
-
-            // Zero-pad.
-            let full_page_bytes = PAGE_SIZE * entity_item_size;
-            if entity_bytes.len() < full_page_bytes {
-                write_zeros(&mut w, full_page_bytes - entity_bytes.len())?;
-            }
-
-            index_entries.push(IndexEntry {
-                arch_id: OUTPUT_ARCH_ID,
-                slot: ENTITY_SLOT,
-                page_index: page_idx,
-                _pad: 0,
-                file_offset,
-            });
-        }
-
-        // ── 10. Write sparse index (sorted) ──────────────────────────────────
+        // ── 9. Write sparse index (sorted) ──────────────────────────────────
         index_entries.sort();
         let sparse_index_offset = w.stream_position()?;
         for entry in &index_entries {
             w.write_all(entry.as_bytes())?;
         }
 
-        // ── 11. Write footer (CRCs patched later) ─────────────────────────────
+        // ── 10. Write footer (CRCs patched later) ─────────────────────────────
         let footer = Footer {
             sparse_index_offset,
             sparse_index_count: index_entries.len() as u64,
@@ -469,7 +529,7 @@ impl<'a> CompactionWriter<'a> {
         w.write_all(footer.as_bytes())?;
         w.flush()?;
 
-        // ── 12. Patch CRCs ────────────────────────────────────────────────────
+        // ── 11. Patch CRCs ────────────────────────────────────────────────────
         let mut file = w
             .into_inner()
             .map_err(std::io::IntoInnerError::into_error)?;
@@ -486,7 +546,6 @@ impl<'a> CompactionWriter<'a> {
         file.write_all(&header_crc.to_le_bytes())?;
 
         // Total CRC: covers entire file with total_crc32 field zeroed.
-        // total_crc32 is at footer_offset + 32 (4 × u64 = 32 bytes into footer).
         let file_len = file.seek(SeekFrom::End(0))?;
         let footer_offset = file_len - 64;
         let total_crc32_file_offset = footer_offset + 32;
@@ -506,7 +565,7 @@ impl<'a> CompactionWriter<'a> {
         file.sync_all()?;
         drop(file);
 
-        // ── 13. Atomic rename + dir fsync ─────────────────────────────────────
+        // ── 12. Atomic rename + dir fsync ─────────────────────────────────────
         fs::rename(&tmp_path, &self.output_path)?;
 
         let parent = self
@@ -518,17 +577,25 @@ impl<'a> CompactionWriter<'a> {
 
         guard.disarmed = true;
 
-        // ── 14. Build and return SortedRunMeta ────────────────────────────────
+        // ── 13. Build and return SortedRunMeta ────────────────────────────────
         let size_bytes = fs::metadata(&self.output_path).map_or(0, |m| m.len());
 
         let page_count_val = u64::try_from(total_pages).unwrap_or(u64::MAX);
         let page_count = PageCount::new(page_count_val)
             .ok_or_else(|| LsmError::Format("compaction produced zero pages".to_owned()))?;
 
+        // archetype_coverage: sequential arch_ids 0..num_sigs_with_data
+        let archetype_coverage: Vec<u16> = emit_lists
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.is_empty())
+            .map(|(idx, _)| idx as u16)
+            .collect();
+
         SortedRunMeta::new(
             self.output_path.clone(),
             self.output_seq_range,
-            vec![OUTPUT_ARCH_ID],
+            archetype_coverage,
             page_count,
             SizeBytes::new(size_bytes),
         )
@@ -536,38 +603,48 @@ impl<'a> CompactionWriter<'a> {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Build the output schema from the target component names + layout info
-    /// sourced from the first input that carries each component.
-    fn build_output_schema(&self) -> Result<SchemaSection, LsmError> {
-        let mut components: Vec<(String, std::alloc::Layout)> =
-            Vec::with_capacity(self.target_components.len());
+    /// Collect all unique component names across all signatures, sorted.
+    fn collect_all_components(&self) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut result: Vec<String> = Vec::new();
+        for sig in &self.all_signatures {
+            for name in sig {
+                if seen.insert(name.clone()) {
+                    result.push(name.clone());
+                }
+            }
+        }
+        result.sort();
+        result
+    }
 
-        'outer: for comp_name in &self.target_components {
-            // Find item_size and item_align from the first input that has
-            // this component (via the schema section of inputs with the arch).
-            for (input_idx, &input) in self.inputs.iter().enumerate() {
-                if self.arch_ids_per_input[input_idx].is_none() {
-                    continue;
-                }
-                let schema = input.schema();
-                if let Some(entry) = schema
+    /// Build the output schema from the given component names + layout info
+    /// sourced from the first input that carries each component.
+    fn build_output_schema(&self, all_components: &[String]) -> Result<SchemaSection, LsmError> {
+        let mut components: Vec<(String, std::alloc::Layout)> =
+            Vec::with_capacity(all_components.len());
+
+        'outer: for comp_name in all_components {
+            for &input in &self.inputs {
+                let Some(entry) = input
+                    .schema()
                     .slot_for(comp_name)
-                    .and_then(|s| schema.entry_for_slot(s))
-                {
-                    let size = entry.item_size() as usize;
-                    let align = entry.item_align() as usize;
-                    // Treat align == 0 as 1 (ZST convention).
-                    let align_safe = if align == 0 { 1 } else { align };
-                    let layout =
-                        std::alloc::Layout::from_size_align(size, align_safe).map_err(|_| {
-                            LsmError::Format(format!(
-                                "invalid layout for component {comp_name}: \
-                                 size={size} align={align}"
-                            ))
-                        })?;
-                    components.push((comp_name.clone(), layout));
-                    continue 'outer;
-                }
+                    .and_then(|s| input.schema().entry_for_slot(s))
+                else {
+                    continue;
+                };
+                let size = entry.item_size() as usize;
+                let align = entry.item_align() as usize;
+                let align_safe = if align == 0 { 1 } else { align };
+                let layout =
+                    std::alloc::Layout::from_size_align(size, align_safe).map_err(|_| {
+                        LsmError::Format(format!(
+                            "invalid layout for component {comp_name}: \
+                             size={size} align={align}"
+                        ))
+                    })?;
+                components.push((comp_name.clone(), layout));
+                continue 'outer;
             }
             return Err(LsmError::Format(format!(
                 "component {comp_name} not found in any input schema"
@@ -577,31 +654,31 @@ impl<'a> CompactionWriter<'a> {
         SchemaSection::from_components(&components)
     }
 
-    /// Build per-input slot translation tables.
+    /// Build per-input slot translation tables for one signature.
     ///
     /// Returns `slot_translations[input_idx]` = a `Vec<SlotTranslation>` mapping
     /// output_slot → input_slot for that input run.
-    fn build_slot_translations(&self, output_schema: &SchemaSection) -> Vec<Vec<SlotTranslation>> {
+    fn build_slot_translations_for_sig(
+        &self,
+        sig: &[String],
+        output_schema: &SchemaSection,
+    ) -> Vec<Vec<SlotTranslation>> {
         let mut result: Vec<Vec<SlotTranslation>> = Vec::with_capacity(self.inputs.len());
 
-        for (input_idx, &input) in self.inputs.iter().enumerate() {
+        for &input in &self.inputs {
             let mut translations: Vec<SlotTranslation> = Vec::new();
-
-            if self.arch_ids_per_input[input_idx].is_some() {
-                let input_schema = input.schema();
-                for output_entry in output_schema.entries() {
-                    let comp_name = output_entry.name();
-                    if let Some(input_slot) = input_schema.slot_for(comp_name) {
-                        translations.push(SlotTranslation {
-                            output_slot: output_entry.slot(),
-                            input_slot,
-                        });
-                    }
-                    // If the input doesn't have this component, no translation
-                    // entry — the write loop emits zeros for missing components.
+            let input_schema = input.schema();
+            for comp_name in sig {
+                if let (Some(input_slot), Some(output_slot)) = (
+                    input_schema.slot_for(comp_name),
+                    output_schema.slot_for(comp_name),
+                ) {
+                    translations.push(SlotTranslation {
+                        output_slot,
+                        input_slot,
+                    });
                 }
             }
-
             result.push(translations);
         }
 
@@ -910,8 +987,8 @@ mod tests {
 
         let writer = CompactionWriter::new(
             vec![&reader_b, &reader_a],
-            vec![Some(arch_b), Some(*arch_a)],
-            vec![comp_name.clone()],
+            vec![vec![Some(arch_b), Some(*arch_a)]],
+            vec![comp_names_a.clone()],
             out_path.clone(),
             seq_range,
         )
@@ -992,12 +1069,6 @@ mod tests {
 
         // ── Run NEW: same entity bits (re-created in a new world at index 0)
         //    but with Pos.x = 2.0 to represent the updated value.
-        //
-        //    We construct a world where the entity ID matches e.to_bits() by
-        //    spawning at the same index (first spawn) and same generation (1).
-        //    Since World::new() always starts at generation 1, the first spawn
-        //    in world_new will produce the same bits as the first spawn in
-        //    world_old.
         let mut world_new = World::new();
         let e_new = world_new.spawn((Pos { x: 2.0, y: 0.0 },));
         // Verify the IDs match (same index 0, generation 1).
@@ -1024,8 +1095,8 @@ mod tests {
 
         let writer = CompactionWriter::new(
             vec![&reader_new, &reader_old],
-            vec![Some(arch_new), Some(*arch_old)],
-            vec![comp_name.clone()],
+            vec![vec![Some(arch_new), Some(*arch_old)]],
+            vec![comp_names.clone()],
             out_path.clone(),
             seq_range,
         )
