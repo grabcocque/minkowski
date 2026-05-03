@@ -13,4 +13,5 @@ pub(crate) mod schema_match;
 pub mod types;
 pub mod writer;
 
+pub use bloom::{BlockedBloomFilter, BloomView, pack_page_key};
 pub use compactor::{COMPACTION_TRIGGER, CompactionReport, compact_one, compact_one_observed};
