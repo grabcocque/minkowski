@@ -1,3 +1,4 @@
+pub mod bloom;
 pub mod codec;
 pub(crate) mod compaction_writer;
 pub mod compactor;
