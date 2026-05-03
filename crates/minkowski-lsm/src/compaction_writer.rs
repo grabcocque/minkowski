@@ -28,7 +28,7 @@ use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::bloom::{BlockedBloomFilter, pack_page_key};
+use crate::bloom;
 use crate::error::LsmError;
 use crate::format::{
     ENTITY_SLOT, Footer, Header, IndexEntry, MAGIC, PAGE_SIZE, PageHeader, VERSION,
@@ -512,26 +512,7 @@ impl<'a> CompactionWriter<'a> {
         }
 
         // ── 9b. Bloom filter — built from all page keys in the index.
-        let bloom_filter_offset = if index_entries.is_empty() {
-            0u64
-        } else {
-            let bloom_seed = seq_lo;
-            let mut bloom = BlockedBloomFilter::new(index_entries.len(), bloom_seed);
-            for entry in &index_entries {
-                bloom.insert(pack_page_key(entry.arch_id, entry.slot, entry.page_index));
-            }
-            let mut offset = w.stream_position()?;
-            if offset % 64 != 0 {
-                write_zeros(&mut w, 64 - (offset as usize % 64))?;
-                offset = w.stream_position()?;
-            }
-            assert!(
-                offset % 64 == 0,
-                "bloom filter section must be 64-byte aligned"
-            );
-            bloom.write_to(&mut w)?;
-            offset
-        };
+        let bloom_filter_offset = bloom::write_bloom_section(&mut w, &index_entries, seq_lo)?;
 
         // ── 10. Write footer (CRCs patched later) ─────────────────────────────
         let footer = Footer {

@@ -5,7 +5,8 @@
 //! exactly one cache line regardless of the number of hash functions.
 
 use crate::error::LsmError;
-use std::io::Write;
+use crate::format::IndexEntry;
+use std::io::{Seek, Write};
 
 const BITS_PER_KEY: usize = 10;
 const BLOCK_BITS: usize = 512;
@@ -133,7 +134,11 @@ impl BlockedBloomFilter {
     }
 
     pub fn write_to(&self, w: &mut impl Write) -> Result<(), LsmError> {
-        assert!(self.num_blocks > 0, "should not serialize empty filter");
+        if self.num_blocks == 0 {
+            return Err(LsmError::Format(
+                "cannot serialize empty bloom filter".to_owned(),
+            ));
+        }
         let header = BloomHeader {
             num_blocks: self.num_blocks.to_le_bytes(),
             seed: self.seed.to_le_bytes(),
@@ -149,7 +154,7 @@ impl BlockedBloomFilter {
     }
 }
 
-pub struct BloomView {
+pub(crate) struct BloomView {
     blocks_ptr: *const Block,
     num_blocks: u32,
     seed: u64,
@@ -163,7 +168,7 @@ unsafe impl Send for BloomView {}
 unsafe impl Sync for BloomView {}
 
 impl BloomView {
-    pub fn from_bytes(buf: &[u8], offset: usize) -> Result<Self, LsmError> {
+    pub(crate) fn from_bytes(buf: &[u8], offset: usize) -> Result<Self, LsmError> {
         let header_size = 16;
         let header_end = offset
             .checked_add(header_size)
@@ -189,7 +194,9 @@ impl BloomView {
         }
 
         let blocks_offset = header_end;
-        let blocks_len = (num_blocks as usize) * BLOCK_BYTES;
+        let blocks_len = (num_blocks as usize)
+            .checked_mul(BLOCK_BYTES)
+            .ok_or_else(|| LsmError::Format("bloom blocks length overflow".to_owned()))?;
         let blocks_end = blocks_offset
             .checked_add(blocks_len)
             .ok_or_else(|| LsmError::Format("bloom blocks offset overflow".to_owned()))?;
@@ -203,6 +210,10 @@ impl BloomView {
         let aligned = (blocks_ptr as usize).is_multiple_of(64);
 
         if aligned {
+            // NOTE: zero-copy path reads Block words as native-endian u64.
+            // `write_to` serializes words in little-endian, so this is
+            // correct only on LE targets (x86-64, AArch64 in LE mode).
+            // The unaligned fallback below does explicit LE decoding.
             Ok(Self {
                 blocks_ptr,
                 num_blocks,
@@ -253,6 +264,33 @@ impl BloomView {
         }
         true
     }
+}
+
+pub(crate) fn write_bloom_section(
+    w: &mut (impl Write + Seek),
+    index_entries: &[IndexEntry],
+    seed: u64,
+) -> Result<u64, LsmError> {
+    if index_entries.is_empty() {
+        return Ok(0);
+    }
+    let mut bloom = BlockedBloomFilter::new(index_entries.len(), seed);
+    for entry in index_entries {
+        bloom.insert(pack_page_key(entry.arch_id, entry.slot, entry.page_index));
+    }
+    let mut offset = w.stream_position()?;
+    if offset % 64 != 0 {
+        let pad = 64 - (offset as usize % 64);
+        const ZEROS: [u8; 64] = [0u8; 64];
+        w.write_all(&ZEROS[..pad])?;
+        offset = w.stream_position()?;
+    }
+    assert!(
+        offset % 64 == 0,
+        "bloom filter section must be 64-byte aligned"
+    );
+    bloom.write_to(w)?;
+    Ok(offset)
 }
 
 #[cfg(test)]
